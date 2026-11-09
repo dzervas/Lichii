@@ -82,6 +82,9 @@ enum class Zone : u32 {
     DmaFetch,     ///< DMA pusher: fetching and translating command headers from guest memory
     DmaDispatch,  ///< DMA pusher: command stream decoding and dispatch
     ChannelSwitch,///< Scheduler: channel binding and resuming suspended channels
+    WorkerRecord,     ///< VulkanWorker: recording a chunk's commands
+    WorkerSubmitLock, ///< VulkanWorker: taking Scheduler::submit_mutex to submit
+    WorkerAllocate,   ///< VulkanWorker: a new command buffer after a submission
     Count,
 };
 
@@ -100,6 +103,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "bind geometry buffers",
     "split call", "update vertex buffers", "update uniform buffers", "cache lock wait",
     "dma fetch", "dma dispatch", "channel switch",
+    "worker record", "worker submit lock", "worker allocate",
 };
 
 static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
