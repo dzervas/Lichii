@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -402,6 +404,18 @@ void PresentManager::DiscardFrame(Frame* frame) {
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
+    // Lab only (unattended benchmarks on Xvfb): EDEN_NX2_LAB_SKIP_PRESENT=1 drops each frame
+    // after its rendering instead of presenting it. NVIDIA's X11 present is a ~21 ms CPU copy
+    // that holds Scheduler::submit_mutex and stalls every submission, which a real display
+    // doesn't have. No vsync pacing; screenshots don't use the swapchain.
+    static const bool skip_present = [] {
+        const char* value = std::getenv("EDEN_NX2_LAB_SKIP_PRESENT");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (skip_present) {
+        DiscardFrame(frame);
+        return;
+    }
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
