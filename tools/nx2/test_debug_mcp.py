@@ -116,6 +116,7 @@ class AdapterTest(unittest.TestCase):
         self.assertFalse(self.call("frame_times", {})["isError"])
         self.assertEqual(debug_mcp.default_timeout("frame_times", {}), 6)
         self.assertEqual(debug_mcp.default_timeout("frame_times", {"seconds": 59.5}), 61)
+        self.assertEqual(debug_mcp.default_timeout("frame_times", {"last": 2100}), 5)
         self.assertEqual(debug_mcp.default_timeout("capture_frame", {}), 120)
 
     def test_status_is_forwarded(self):
