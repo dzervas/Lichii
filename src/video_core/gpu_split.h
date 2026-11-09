@@ -39,6 +39,7 @@ enum class DrainSite : u32 {
     SemaphoreFlush, ///< The acquired semaphore is in the buffer cache
     FenceRelease,   ///< The puller's acquires release the pending fences
     ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
+    ListReadWriters, ///< The same, before reading a GPU-written list's copy (ReadGpuWrittenCommands)
     ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
     ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
     MacroDmaRead,   ///< The front's macros read memory (MME DMA) the caches may still write
@@ -93,7 +94,7 @@ inline void Count(std::atomic<u64>& counter, u64 amount = 1) {
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",           "fetch drain",   "acquire",    "semaphore flush", "fence release",
-    "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
+    "list writers",    "list read writers", "list sync", "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
     "ring full",       "back register", "back code",
 };
