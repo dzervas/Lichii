@@ -586,10 +586,16 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            {
+                const VideoCommon::Nx2Profile::Scope scope{
+                    VideoCommon::Nx2Profile::Zone::WorkerRecord};
+                work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            }
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
+                const VideoCommon::Nx2Profile::Scope scope{
+                    VideoCommon::Nx2Profile::Zone::WorkerAllocate};
                 AllocateWorkerCommandBuffer();
             }
         }
@@ -864,7 +870,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             on_submit();
         }
 
-        std::scoped_lock lock{submit_mutex};
+        std::unique_lock lock{submit_mutex, std::defer_lock};
+        {
+            const VideoCommon::Nx2Profile::Scope scope{
+                VideoCommon::Nx2Profile::Zone::WorkerSubmitLock};
+            lock.lock();
+        }
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
