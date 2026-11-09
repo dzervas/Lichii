@@ -74,6 +74,14 @@ enum class Zone : u32 {
     WorkerIdle,           ///< VulkanWorker waiting for work
     PresentWait,          ///< Present waits for the Vulkan worker or a free presentation frame
     QueueSubmit,          ///< vkQueueSubmit
+    BindGeometry, ///< Host vertex/index/indirect buffer binds (split out of update buffers)
+    SplitCall,    ///< Split GPU thread: back thread running deferred function calls
+    UpdateVertex, ///< Buffer cache: resolving and tracking vertex buffers
+    UpdateUniform,///< Buffer cache: resolving and tracking uniform buffers
+    CacheLockWait,///< Waiting for buffer_cache and texture_cache mutexes before drawing
+    DmaFetch,     ///< DMA pusher: fetching and translating command headers from guest memory
+    DmaDispatch,  ///< DMA pusher: command stream decoding and dispatch
+    ChannelSwitch,///< Scheduler: channel binding and resuming suspended channels
     Count,
 };
 
@@ -89,6 +97,9 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "compute pipeline miss", "pipeline wait", "shader capture", "texture cache", "GPU wait",
     "present", "worker idle",
     "present wait", "queue submit",
+    "bind geometry buffers",
+    "split call", "update vertex buffers", "update uniform buffers", "cache lock wait",
+    "dma fetch", "dma dispatch", "channel switch",
 };
 
 static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
