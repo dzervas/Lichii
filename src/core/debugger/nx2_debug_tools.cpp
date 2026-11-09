@@ -216,6 +216,17 @@ json FrameTimes(ToolState& state, const json& params) {
         !std::isfinite(refresh_hz) || refresh_hz <= 0.0) {
         throw std::runtime_error{"seconds must be > 0 and <= 60; refresh_hz must be > 0"};
     }
+    // "last": the newest that many presents, already recorded, without waiting. Lets a client
+    // measure a span it spent in a blocking call (an input step holds the server meanwhile).
+    if (params.contains("last")) {
+        const u64 last = Param<u64>(params, "last", 1, 1, g_nx2_present_times_ns.size() - 1);
+        const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
+        const u64 end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        return ReadFrameTimes(after > last ? after - last - 1 : 0, after, 1, end_ns,
+                              refresh_hz);
+    }
     const u64 before = g_nx2_present_count.load(std::memory_order_relaxed);
     const auto begin = std::chrono::steady_clock::now();
     while (std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() <
@@ -258,9 +269,9 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
     }
 
     std::ranges::reverse(intervals);
-    json recent = json::array();
-    for (size_t i = intervals.size() > 120 ? intervals.size() - 120 : 0; i < intervals.size(); ++i) {
-        recent.push_back(std::round(intervals[i] * 10.0) / 10.0);
+    json all = json::array();
+    for (const double interval : intervals) {
+        all.push_back(std::round(interval * 100.0) / 100.0);
     }
     std::ranges::sort(intervals);
     const size_t frames = intervals.size();
@@ -297,7 +308,7 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
             {"min_ms", frames == 0 ? 0.0 : intervals.front()},
             {"vsync_buckets", {{"1", share(0)}, {"2", share(1)}, {"3", share(2)}, {"4+", share(3)}}},
             {"stutters", stutters},
-            {"intervals_ms", std::move(recent)},
+            {"intervals_ms", std::move(all)},
             {"truncated", truncated}};
 }
 

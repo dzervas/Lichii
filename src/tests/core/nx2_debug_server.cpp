@@ -113,7 +113,7 @@ TEST_CASE("Debug frame times measure intervals and retain the ring tail", "[core
     REQUIRE(mixed["fps"] == 40.0);
     REQUIRE(mixed["vsync_buckets"]["1"] == 0.5);
     REQUIRE(mixed["vsync_buckets"]["2"] == 0.5);
-    REQUIRE(mixed["intervals_ms"] == json::array({16.7, 33.3}));
+    REQUIRE(mixed["intervals_ms"] == json::array({16.67, 33.33}));
     REQUIRE(mixed["stutters"] == 0);
     REQUIRE(mixed["truncated"] == false);
     ring[4] = 150'000'001;
@@ -129,7 +129,7 @@ TEST_CASE("Debug frame times measure intervals and retain the ring tail", "[core
     REQUIRE(overflow["frames"] == ring.size() - 1);
     REQUIRE(overflow["mean_ms"] == 1.0);
     REQUIRE(overflow["truncated"] == true);
-    REQUIRE(overflow["intervals_ms"].size() == 120);
+    REQUIRE(overflow["intervals_ms"].size() == ring.size() - 1);
     // A counted present whose timestamp store is pending still holds the previous lap's value.
     ring[5000 % ring.size()] = (5000 - ring.size()) * 1'000'000;
     const auto pending = read(5000, 5'000'000'000);

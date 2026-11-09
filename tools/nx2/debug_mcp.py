@@ -44,11 +44,13 @@ TOOLS = [
         "name": "frame_times",
         "description": "Guest-present frame intervals over seconds (default 5, max 60): mean, "
                        "fps, percentiles, VSync interval shares (refresh_hz defaults to 60), "
-                       "stutters and the last 120 intervals. Reports ring overflow as truncated.",
+                       "stutters and every interval. Reports ring overflow as truncated. "
+                       "With 'last', the newest that many presents already recorded, at once.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 60, "default": 5},
+                "last": {"type": "integer", "minimum": 1, "maximum": 4095},
                 "refresh_hz": {"type": "number", "exclusiveMinimum": 0, "default": 60},
             },
         },
@@ -318,7 +320,7 @@ def default_timeout(name, params):
     if name == "capture_frame":
         return 120
     if name == "frame_times":
-        return math.ceil(params.get("seconds", 5)) + 1
+        return 5 if "last" in params else math.ceil(params.get("seconds", 5)) + 1
     if name == "sample":
         return int(params.get("seconds", 10)) + 90
     if name in ("input", "input_sequence"):
