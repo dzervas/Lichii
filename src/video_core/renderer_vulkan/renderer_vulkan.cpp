@@ -22,6 +22,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
@@ -224,6 +225,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         render_window.OnFrameDisplayed();
     };
 
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::Present);
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {

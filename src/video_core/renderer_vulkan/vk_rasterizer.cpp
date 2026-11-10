@@ -75,6 +75,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -2156,6 +2157,11 @@ void RasterizerVulkan::DispatchCompute() {
         });
         scheduler.NoteComputeWrites();
     };
+    const auto trace_list_producer = [this] {
+        if (VideoCommon::IdleTrace::g_enabled && buffer_cache.Nx2HasListCopyRequests()) {
+            scheduler.TraceListMark(Scheduler::ListTraceMark::Producer);
+        }
+    };
     if (frame_dump.CapturingBuffers()) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
@@ -2175,6 +2181,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        trace_list_producer();
         record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
@@ -2197,6 +2204,7 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
+    trace_list_producer();
     record_read_barrier();
     if (marking_effects) {
         const auto written = pipeline->WrittenImages();
@@ -2292,8 +2300,13 @@ void RasterizerVulkan::FlushAll() {}
 void RasterizerVulkan::SubmitNx2ListCopies() {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval (#161).
+    if (VideoCommon::IdleTrace::g_enabled && buffer_cache.Nx2HasListCopyRequests()) {
+        scheduler.TraceListMark(Scheduler::ListTraceMark::Copy);
+    }
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        const u64 tick = scheduler.Flush();
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListCopyFlush, 0,
+                                     static_cast<u32>(tick));
     }
 }
 
@@ -3521,7 +3534,13 @@ void RasterizerVulkan::FlushWork() {
         }();
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
-    switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
+    auto action = SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget);
+    if (action != SubmissionPolicy::Action::Flush && native && !android &&
+        scheduler.IdleGpuAwaitsWork()) {
+        draw_counter = 0;
+        action = SubmissionPolicy::Action::Flush;
+    }
+    switch (action) {
     case SubmissionPolicy::Action::None:
         break;
     case SubmissionPolicy::Action::Dispatch:
@@ -3550,8 +3569,13 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+    if (VideoCommon::IdleTrace::g_enabled && buffer_cache.Nx2HasListCopyRequests()) {
+        scheduler.TraceListMark(Scheduler::ListTraceMark::Copy);
+    }
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        const u64 tick = scheduler.Flush();
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListCopyFlush, 1,
+                                     static_cast<u32>(tick));
     }
     buffer_cache.Nx2CollectListCopies(false);
     return copied;

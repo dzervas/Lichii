@@ -31,6 +31,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -62,7 +63,10 @@ DmaPusher::~DmaPusher() = default;
 bool DmaPusher::CanResumeAcquire() {
     if (pending_list_tick) {
         VideoCommon::Count(VideoCommon::g_acquire_stats.list_polls);
-        return rasterizer->IsGpuTickDone(*pending_list_tick);
+        const bool done = rasterizer->IsGpuTickDone(*pending_list_tick);
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListPoll,
+                                     static_cast<u32>(channel_state.bind_id), done ? 1 : 0);
+        return done;
     }
     VideoCommon::Count(VideoCommon::g_acquire_stats.acquire_polls);
     return puller.CanResumeAcquire(*this);
@@ -148,6 +152,8 @@ bool DmaPusher::Step() {
         }
         pending_list_tick.reset();
         resumed_list_read = true;
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListResume,
+                                     static_cast<u32>(channel_state.bind_id));
     }
     // Only for the entry that suspended: an acquire still waiting, the safe-read path or a stopped
     // split must not leave it set for a later list (which would then skip its writer wait).
@@ -826,6 +832,9 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
                 // others (Step parses this entry again once IsGpuTickDone).
                 pending_list_tick = tick;
                 *pending = true;
+                VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListSuspend,
+                                             static_cast<u32>(channel_state.bind_id),
+                                             static_cast<u32>(tick));
                 return false;
             }
             if (Nx2CmdPageDiag::g_enabled) {

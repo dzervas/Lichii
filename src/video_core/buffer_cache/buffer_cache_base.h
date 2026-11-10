@@ -431,6 +431,10 @@ public:
             nx2_list_copy_requests.clear();
         }
     }
+    /// Whether the work being recorded wrote command list pages (Nx2CopyListPages copies them).
+    [[nodiscard]] bool Nx2HasListCopyRequests() const {
+        return !nx2_list_copy_requests.empty();
+    }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };

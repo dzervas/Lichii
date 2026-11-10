@@ -25,6 +25,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -146,6 +147,25 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                      trace_timestamp_bits, trace_timestamp_period);
         }
     }
+    if (VideoCommon::IdleTrace::g_enabled) {
+        const auto physical = device.GetPhysical();
+        const u32 bits =
+            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+        trace_timestamp_period = physical.GetProperties().limits.timestampPeriod;
+        if (bits != 0 && bits <= 64 && trace_timestamp_period > 0) {
+            list_trace_mask = bits == 64 ? ~u64{0} : (u64{1} << bits) - 1;
+            list_trace_pool = device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = ListTraceSlots * ListTraceSlotQueries,
+                .pipelineStatistics = 0,
+            });
+        } else {
+            LOG_WARNING(Render_Vulkan, "Idle trace: no GPU timestamps on the graphics queue");
+        }
+    }
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
@@ -153,12 +173,15 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 }
 
 Scheduler::~Scheduler() {
-    if (trace_query_pool) {
+    if (trace_query_pool || list_trace_pool) {
         WaitWorker();
         worker_thread.request_stop();
         worker_thread.join();
         if (trace_gpu_tick != 0) {
             master_semaphore->Wait(trace_gpu_tick);
+        }
+        if (!list_trace_pending.empty()) {
+            master_semaphore->Wait(list_trace_pending.back().tick);
         }
     }
 }
@@ -204,6 +227,29 @@ void Scheduler::FlushDeferred() {
     if (flush_pending) {
         Flush();
     }
+}
+
+bool Scheduler::IdleGpuAwaitsWork() {
+    // Mario Kart World: the back records ~1 ms of draws per 128-draw submission while the GPU
+    // sits idle, then the command list copy right after waits for the GPU to run all of them
+    // (~300 us). 100 us left the least of that wait among 50, 100 and 200 us.
+    static constexpr auto age = std::chrono::microseconds{100};
+    // Not inside a render pass: ending passes early tripled the submissions and cost the back
+    // about as much as the wait saved.
+    if (state.renderpass) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_flush < age || now < next_idle_gpu_check) {
+        return false;
+    }
+    // At most one semaphore read per bound while the GPU stays busy.
+    next_idle_gpu_check = now + age;
+    const u64 last_submitted = CurrentTick() - 1;
+    if (!IsFree(last_submitted)) {
+        master_semaphore->Refresh();
+    }
+    return IsFree(last_submitted);
 }
 
 bool Scheduler::WaitSubmitted(u64 tick) {
@@ -278,6 +324,77 @@ void Scheduler::MarkFrameEnd(u64 frame) {
     if (Common::DkbFrameTrace::Enabled()) {
         Record([this, frame](vk::CommandBuffer) { trace_frame_end = frame; });
     }
+}
+
+void Scheduler::TraceListMark(ListTraceMark mark) {
+    if (!list_trace_pool) {
+        return;
+    }
+    Record([this, mark](vk::CommandBuffer cmdbuf) {
+        const u32 query = static_cast<u32>(mark);
+        if (!list_trace_current || (list_trace_current->marks & (1U << query)) != 0) {
+            return;
+        }
+        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *list_trace_pool,
+                              list_trace_current->slot * ListTraceSlotQueries + query);
+        list_trace_current->marks |= 1U << query;
+    });
+}
+
+void Scheduler::BeginListTraceSubmission() {
+    namespace IdleTrace = VideoCommon::IdleTrace;
+    // Submissions the GPU is done with: their timestamps go to the trace.
+    master_semaphore->Refresh();
+    while (!list_trace_pending.empty() && IsFree(list_trace_pending.front().tick)) {
+        const ListTraceSubmission done = list_trace_pending.front();
+        list_trace_pending.pop();
+        struct Result {
+            u64 timestamp;
+            u64 available;
+        };
+        std::array<Result, ListTraceSlotQueries> results{};
+        // VK_NOT_READY: a mark this submission did not write.
+        (void)device.GetLogical().GetQueryResults(
+            *list_trace_pool, done.slot * ListTraceSlotQueries, ListTraceSlotQueries,
+            sizeof(results), results.data(), sizeof(Result),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        static constexpr std::array events{
+            IdleTrace::Event::GpuSubmitStart, IdleTrace::Event::GpuProducer,
+            IdleTrace::Event::GpuCopy, IdleTrace::Event::GpuSubmitEnd};
+        for (u32 query = 0; query < ListTraceSlotQueries; ++query) {
+            if ((done.marks & (1U << query)) == 0 || results[query].available == 0) {
+                continue;
+            }
+            const double ns = static_cast<double>(results[query].timestamp & list_trace_mask) *
+                              trace_timestamp_period;
+            IdleTrace::WriteAt(static_cast<u64>(ns), events[query], 0,
+                               static_cast<u32>(done.tick));
+        }
+    }
+    if (list_trace_pending.size() == ListTraceSlots) {
+        list_trace_current.reset();
+        return;
+    }
+    const u32 slot = list_trace_next_slot;
+    list_trace_next_slot = (list_trace_next_slot + 1) % ListTraceSlots;
+    list_trace_current = ListTraceSubmission{.tick = 0, .slot = slot, .marks = 1};
+    current_upload_cmdbuf.ResetQueryPool(*list_trace_pool, slot * ListTraceSlotQueries,
+                                         ListTraceSlotQueries);
+    current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *list_trace_pool,
+                                         slot * ListTraceSlotQueries);
+}
+
+void Scheduler::EndListTraceSubmission(vk::CommandBuffer cmdbuf, u64 tick) {
+    if (!list_trace_current) {
+        return;
+    }
+    constexpr u32 end_query = ListTraceSlotQueries - 1;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *list_trace_pool,
+                          list_trace_current->slot * ListTraceSlotQueries + end_query);
+    list_trace_current->marks |= 1U << end_query;
+    list_trace_current->tick = tick;
+    list_trace_pending.push(*list_trace_current);
+    list_trace_current.reset();
 }
 
 void Scheduler::DispatchWork() {
@@ -596,6 +713,9 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     if (trace_query_pool && !trace_gpu_failed) {
         TraceGpuSubmission();
     }
+    if (list_trace_pool) {
+        BeginListTraceSubmission();
+    }
 }
 
 void Scheduler::TraceShader(u64 hash, u32 stage) {
@@ -828,20 +948,25 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (trace_query_pool) {
             trace_work = {};
         }
+        EndListTraceSubmission(cmdbuf, signal_value);
         cmdbuf.End();
 
         if (on_submit) {
             on_submit();
         }
 
+        namespace IdleTrace = VideoCommon::IdleTrace;
+        IdleTrace::Note(IdleTrace::Event::WorkerSubmitBegin, 0, static_cast<u32>(signal_value));
         std::unique_lock lock{submit_mutex, std::defer_lock};
         {
             const VideoCommon::Nx2Profile::Scope scope{
                 VideoCommon::Nx2Profile::Zone::WorkerSubmitLock};
             lock.lock();
         }
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const VkResult submitted = master_semaphore->SubmitQueue(
+            cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
+        IdleTrace::Note(IdleTrace::Event::WorkerSubmitEnd, 0, static_cast<u32>(signal_value));
+        switch (const VkResult result = submitted) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&

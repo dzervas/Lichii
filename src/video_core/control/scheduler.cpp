@@ -14,6 +14,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra::Control {
@@ -77,7 +78,10 @@ bool Scheduler::ResumePending(GPU& gpu) {
                 continue;
             }
             BindChannel(gpu, state->bind_id);
+            namespace IdleTrace = VideoCommon::IdleTrace;
+            IdleTrace::Note(IdleTrace::Event::ResumeBegin, static_cast<u32>(state->bind_id));
             dma_pusher.DispatchCalls();
+            IdleTrace::Note(IdleTrace::Event::ResumeEnd, static_cast<u32>(state->bind_id));
             progress = true;
             any_progress = true;
         }
