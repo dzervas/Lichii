@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include "common/common_types.h"
+#include "video_core/nx2_idle_trace.h"
 
 namespace Core {
 class System;
@@ -151,6 +152,7 @@ public:
     }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
+        IdleTrace::Note(IdleTrace::Event::HookRequest);
         hook_requested.store(true, std::memory_order_seq_cst);
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
@@ -271,6 +273,7 @@ public:
             return;
         }
         Count(g_acquire_stats.settles);
+        IdleTrace::Note(IdleTrace::Event::SettleIdle);
         RequestIdleHook();
     }
     /// Logs g_acquire_stats every 10 s (front, while they count).
@@ -403,6 +406,7 @@ private:
         if (unpublished >= PublishAfterWait &&
             back_idle_at.load(std::memory_order_relaxed) == published_local) {
             Count(g_acquire_stats.early_publishes);
+            IdleTrace::Note(IdleTrace::Event::EarlyPublish);
             Publish();
         }
     }

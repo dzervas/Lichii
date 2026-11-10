@@ -187,10 +187,12 @@ void GpuSplit::WaitForSpace(size_t words) {
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    IdleTrace::Note(IdleTrace::Event::WaitForBegin, static_cast<u32>(DrainSite::RingFull));
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
             Nx2Profile::AddDrain(DrainSite::RingFull, start);
+            IdleTrace::Note(IdleTrace::Event::WaitForEnd, static_cast<u32>(DrainSite::RingFull));
             return;
         }
         if (spins < 4096) {
@@ -208,7 +210,9 @@ void GpuSplit::Publish() {
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
     published.store(write_position, std::memory_order_seq_cst);
-    if (back_waiting.load(std::memory_order_seq_cst)) {
+    const bool waking = back_waiting.load(std::memory_order_seq_cst);
+    IdleTrace::Note(IdleTrace::Event::Publish, waking ? 1 : 0, static_cast<u32>(write_position));
+    if (waking) {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
@@ -224,6 +228,7 @@ void GpuSplit::Drain(DrainSite site) {
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
+    IdleTrace::Note(IdleTrace::Event::DrainBegin, static_cast<u32>(site));
     bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -231,6 +236,7 @@ void GpuSplit::Drain(DrainSite site) {
             if (BackQuiet()) {
                 publish_every = 8;
                 Nx2Profile::AddDrain(site, start);
+                IdleTrace::Note(IdleTrace::Event::DrainEnd, static_cast<u32>(site));
                 return;
             }
             if (!hook_asked) {
@@ -354,11 +360,13 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    IdleTrace::Note(IdleTrace::Event::WaitForBegin, static_cast<u32>(site));
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             Nx2Profile::AddDrain(site, start);
+            IdleTrace::Note(IdleTrace::Event::WaitForEnd, static_cast<u32>(site));
             return true;
         }
         Backoff(spins, target);
@@ -561,6 +569,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front publishes what it holds after a few more words from now on.
             back_idle_at.store(read_position, std::memory_order_relaxed);
+            IdleTrace::Note(IdleTrace::Event::BackIdle, 0, static_cast<u32>(read_position));
             const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
                                                        : std::chrono::steady_clock::time_point{};
             // The front usually sends more within microseconds: spin briefly before sleeping.
@@ -583,7 +592,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
+                        IdleTrace::Note(IdleTrace::Event::HookBegin, 0);
                         idle_hook(idle_argument);
+                        IdleTrace::Note(IdleTrace::Event::HookEnd, 0);
                     }
                     back_quiet.store(true, std::memory_order_release);
                 }
@@ -599,13 +610,17 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
                     Count(g_acquire_stats.back_sleeps);
+                    IdleTrace::Note(IdleTrace::Event::BackSleep);
                     wake.wait(seen, std::memory_order_seq_cst);
+                    IdleTrace::Note(IdleTrace::Event::BackWake);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
             }
         }
         u64 last_store = read_position;
+        IdleTrace::Note(IdleTrace::Event::BackRun, 0,
+                        static_cast<u32>(available - read_position));
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
@@ -616,7 +631,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                IdleTrace::Note(IdleTrace::Event::HookBegin, 1);
                 idle_hook(idle_argument);
+                IdleTrace::Note(IdleTrace::Event::HookEnd, 1);
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).
