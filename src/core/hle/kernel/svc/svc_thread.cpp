@@ -42,11 +42,6 @@ void BackOffAfterNoOpYields(KernelCore& kernel, bool no_op) {
     thread_local const KThread* streak_thread = nullptr;
     thread_local u32 streak = 0;
     const KThread* const thread = GetCurrentThreadPointer(kernel);
-    // Lab: EDEN_LAB_NO_BACKOFF=1 turns the backoff off for A/B runs with one binary.
-    static const bool lab_no_backoff = std::getenv("EDEN_LAB_NO_BACKOFF") != nullptr;
-    if (lab_no_backoff) {
-        return;
-    }
     if (!no_op || thread != streak_thread) {
         streak_thread = thread;
         streak = 0;
