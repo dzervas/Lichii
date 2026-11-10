@@ -67,6 +67,7 @@ struct AcquireStats {
     std::atomic<u64> drain_word{};      ///< ...the word is unmapped or on a GPU-written page
     std::atomic<u64> drain_queued{};    ///< ...a queued release to it is unknown or doesn't meet it
     std::atomic<u64> valve_drains{}; ///< Of drained: polls of an unmet acquire, once per 1 ms
+    std::atomic<u64> undrained_waits{}; ///< Unmet acquires that wait without a first drain
     std::atomic<u64> polls{};     ///< Polls that keep waiting without a drain
     std::atomic<u64> acquire_polls{}; ///< Polls of suspended channels waiting on an acquire
     std::atomic<u64> list_polls{};    ///< ...and on a command list copy the GPU writes

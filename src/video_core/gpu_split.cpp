@@ -708,6 +708,7 @@ void GpuSplit::ReportAcquire() {
     const u64 drain_word = take(stats.drain_word);
     const u64 drain_queued = take(stats.drain_queued);
     const u64 valve_drains = take(stats.valve_drains);
+    const u64 undrained_waits = take(stats.undrained_waits);
     const u64 polls = take(stats.polls);
     const u64 acquire_polls = take(stats.acquire_polls);
     const u64 list_polls = take(stats.list_polls);
@@ -719,12 +720,12 @@ void GpuSplit::ReportAcquire() {
     LOG_INFO(HW_GPU,
              "Acquires: {} passed without a drain ({} by a queued release), {} resumed by a "
              "latch, {} drained ({} by the 1 ms valve; {} equal or mask, {} by the settings, {} "
-             "unmapped or GPU-written word, {} queued release unknown or short), {} polls waited "
-             "without a drain in 10 s; polls: {} of acquires, {} of GPU-written list copies; "
+             "unmapped or GPU-written word, {} queued release unknown or short), {} waited without a first drain, "
+             "{} polls waited without a drain in 10 s; polls: {} of acquires, {} of GPU-written list copies; "
              "back: {} waits for work, {} slept, {:.1f} ms spinning; {} early publishes, {} idle "
              "hooks asked by polls",
              passed, by_queued, latched, drained, valve_drains, drain_operation, drain_settings,
-             drain_word, drain_queued, polls, acquire_polls, list_polls, back_waits, back_sleeps,
+             drain_word, drain_queued, undrained_waits, polls, acquire_polls, list_polls, back_waits, back_sleeps,
              spin_ms, early_publishes, settles);
     ReportAcquireDrains();
     const u64 mismatches = take(stats.mismatches);

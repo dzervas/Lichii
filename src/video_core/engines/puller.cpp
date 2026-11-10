@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <unordered_set>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -151,6 +152,30 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
                : AcquireCheck::NotMet;
 }
 
+// Words whose last unmet acquire a drain did not meet: the CPU releases them, not GPU work the
+// front sent before the acquire, so the next unmet acquire on one waits without draining first.
+// Front thread only.
+std::unordered_set<DAddr>& CpuReleasedWords() {
+    static std::unordered_set<DAddr> words;
+    return words;
+}
+
+void NoteDrainedWord(DmaPusher& dma_pusher, GPUVAddr address, bool met) {
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    auto& words = CpuReleasedWords();
+    if (met) {
+        words.erase(*device);
+        return;
+    }
+    if (words.size() >= 1024) {
+        words.clear();
+    }
+    words.insert(*device);
+}
+
 // EDEN_NX2_GPU_PROFILE: times an acquire's drain and tells what it changed (AcquireDrains).
 class AcquireDrainProbe {
 public:
@@ -262,6 +287,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     auto& stats = VideoCommon::g_acquire_stats;
     VideoCommon::AcquireDrainPath drain_path{};
+    bool valve_after_undrained = false;
     switch (const AcquireCheck check = CheckWithoutDrain(dma_pusher, *pending_acquire, drain_path);
             check) {
     case AcquireCheck::MetByQueued:
@@ -272,6 +298,11 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     case AcquireCheck::Met:
         VideoCommon::Count(stats.passed);
         VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
+        if (pending_acquire->undrained) {
+            // As after the drain the acquire skipped: what the front reads next waits for the
+            // work sent before it.
+            VideoCommon::GpuSplit::Get().NoteSync();
+        }
         return true;
     case AcquireCheck::NotMet: {
         // A release the back ran latches the waiter. Otherwise poll again later, without waiting
@@ -281,6 +312,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         // reports waits over 2 s.
         if (Nx2SemaphoreWaiters::Get().Latched(this)) {
             VideoCommon::Count(stats.latched);
+            if (pending_acquire->undrained) {
+                VideoCommon::GpuSplit::Get().NoteSync();
+            }
             return true;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -290,6 +324,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             return false;
         }
         pending_acquire->last_drain = now;
+        valve_after_undrained = pending_acquire->undrained;
+        pending_acquire->undrained = false;
         VideoCommon::Count(stats.valve_drains);
         drain_path = VideoCommon::AcquireDrainPath::Valve;
         break;
@@ -304,7 +340,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                             [this](u32 word) { return pending_acquire->Matches(word); }};
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
-    probe.Finish(Nx2SemaphoreWaiters::Get().Latched(this) || pending_acquire->Matches(current));
+    const bool met_now =
+        Nx2SemaphoreWaiters::Get().Latched(this) || pending_acquire->Matches(current);
+    probe.Finish(met_now);
+    if (valve_after_undrained && met_now) {
+        // The work before the acquire released it after all: drain first next time.
+        NoteDrainedWord(dma_pusher, pending_acquire->address, true);
+    }
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
             !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
@@ -488,6 +530,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             .last_fences = std::chrono::steady_clock::now(),
             .last_drain = std::chrono::steady_clock::now(),
             .reported = false,
+            .undrained = false,
         };
         if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
             op != GpuSemaphoreOperation::AcquireMask) {
@@ -497,8 +540,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         auto& stats = VideoCommon::g_acquire_stats;
         VideoCommon::AcquireDrainPath drain_path{};
-        if (const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire, drain_path);
-            without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
+        const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire, drain_path);
+        if (without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
             if (without_drain == AcquireCheck::MetByQueued) {
                 // What the front reads after the acquire waits for the work sent before the
                 // release (GpuSplit::NoteSync).
@@ -509,18 +552,44 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VerifyWithoutDrain(dma_pusher, acquire, without_drain);
             return;
         }
+        auto& waiters = Nx2SemaphoreWaiters::Get();
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        if (without_drain == AcquireCheck::NotMet && CpuReleasedWords().contains(*device)) {
+            // Nothing sent to the word meets it, and a drain didn't the last time: wait without
+            // draining. The waiter is registered before the fences are released, so a release
+            // among them, or one the back runs later, latches it; polls read the word and drain
+            // once per 1 ms (CanResumeAcquire). On resuming, what the front reads next waits for
+            // the work sent before the acquire (NoteSync), as after a drain.
+            if (waiters.Add(this, *device, acquire.value, acquire.operation)) {
+                OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+                VideoCommon::Count(stats.undrained_waits);
+                if (waiters.Latched(this) ||
+                    acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+                    waiters.Remove(this);
+                    VideoCommon::GpuSplit::Get().NoteSync();
+                    return;
+                }
+                pending_acquire = acquire;
+                pending_acquire->undrained = true;
+                dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                return;
+            }
+        }
         VideoCommon::Count(stats.drained);
         AcquireDrainProbe probe{dma_pusher, acquire.address, drain_path,
                                 [&acquire](u32 word) { return acquire.Matches(word); }};
         DrainBack();
         const bool met = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
         probe.Finish(met);
+        if (without_drain == AcquireCheck::NotMet) {
+            NoteDrainedWord(dma_pusher, acquire.address, met);
+        }
         if (met) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.
-        auto& waiters = Nx2SemaphoreWaiters::Get();
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
             device && !waiters.Add(this, *device, acquire.value, acquire.operation)) {
             if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
