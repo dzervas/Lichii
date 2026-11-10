@@ -623,6 +623,173 @@ TEST_CASE("GpuSplit dispatch preserves mapped uploads and macro boundaries",
     }
 }
 
+TEST_CASE("GpuSplit constant buffer write entries match one entry per write",
+          "[video_core][maxwell_fast_method][gpu_split_dispatch]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr DAddr device_address = 0x10000;
+    for (u64 page = 0; page < 3; ++page) {
+        const VAddr virtual_address = 0x4000 + page * 0x1000;
+        auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000 + page * 0x8000);
+        table.entries.GetAndFault(virtual_address >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing) - virtual_address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device_address, 0x3000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(device_address, 0x4000, 0x3000, asid);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x3000, Tegra::PTEKind::PITCH, false);
+
+    struct Snapshot {
+        std::array<u8, 0x3000> bytes{};
+        std::array<u32, Maxwell3D::Regs::NUM_REGS> regs{};
+        std::array<u32, Maxwell3D::Regs::NUM_REGS> shadow{};
+        Maxwell3D::DirtyState::Flags dirty{};
+        std::vector<std::pair<u32, u32>> sink;
+        bool deferred_draw{};
+    };
+    const auto snapshot = [&](const Maxwell3D& engine) {
+        Snapshot result;
+        f.memory.ReadBlockUnsafe(gpu_address, result.bytes.data(), result.bytes.size());
+        result.regs = engine.regs.reg_array;
+        result.shadow = engine.shadow_state.reg_array;
+        result.dirty = engine.dirty.flags;
+        result.sink = engine.method_sink;
+        result.deferred_draw = engine.draw_manager.HasDeferredDraw();
+        return result;
+    };
+    constexpr u32 subsequent = 1u << 26;
+    for (const u32 seed : {1u, 2u, 3u, 4u}) {
+        CAPTURE(seed);
+        std::vector<Snapshot> expected;
+        for (auto* engine : {&f.slow, &f.fast}) {
+            const bool batched = engine == &f.fast;
+            std::array<u8, 0x3000> cleared{};
+            f.memory.WriteBlockUnsafe(gpu_address, cleared.data(), cleared.size());
+            engine->dirty.flags.reset();
+            VideoCommon::GpuSplit split;
+            Access::Initialize(split, f.system);
+            std::mt19937 rng{seed};
+            size_t observed{};
+            const auto inspect = [&] {
+                split.Defer([&, engine] {
+                    auto actual = snapshot(*engine);
+                    if (engine == &f.slow) {
+                        expected.push_back(std::move(actual));
+                    } else {
+                        REQUIRE(observed < expected.size());
+                        const auto& reference = expected[observed];
+                        REQUIRE(actual.bytes == reference.bytes);
+                        REQUIRE(actual.regs == reference.regs);
+                        REQUIRE(actual.shadow == reference.shadow);
+                        REQUIRE(actual.dirty == reference.dirty);
+                        REQUIRE(actual.sink == reference.sink);
+                        REQUIRE(actual.deferred_draw == reference.deferred_draw);
+                    }
+                    ++observed;
+                });
+            };
+            const auto write = [&](u32 method, u32 argument, bool direct) {
+                if (batched) {
+                    split.ConstBufferWrite(engine, method, argument, direct, true);
+                } else if (direct) {
+                    split.MacroWrite(engine, method, argument);
+                } else {
+                    split.Method(engine, method, argument, true, nullptr);
+                }
+            };
+            for (u32 step = 0; step < 4000; ++step) {
+                const bool direct = rng() % 2 == 0;
+                switch (rng() % 16) {
+                case 0:
+                    // Mapped, across a page end, or unmapped.
+                    write(CbAddressHigh, 0, direct);
+                    write(CbAddressLow,
+                          rng() % 8 == 0 ? 0x2000'0000
+                                         : static_cast<u32>(gpu_address) + (rng() % 4) * 0x800,
+                          direct);
+                    break;
+                case 1:
+                    write(CbSize, rng() % 2 == 0 ? 0x1000 : 0x10 + rng() % 0x40, direct);
+                    break;
+                case 2:
+                case 3:
+                    write(CbOffset, rng() % 2 == 0 ? (rng() % 0x400) * 4 : 0x7f0 + (rng() % 8) * 4,
+                          direct);
+                    break;
+                case 4:
+                    split.MacroWrite(engine, ShadowControl, rng() % 4);
+                    break;
+                case 5:
+                    // An instanced loop the next write ends.
+                    split.MacroWrite(engine, DrawBegin, rng() % 2 == 0 ? 0 : subsequent);
+                    split.MacroWrite(engine, DrawEnd, 0);
+                    break;
+                case 6: {
+                    const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                    split.Method(engine, method, RandomArgument(rng, method, *engine), true,
+                                 nullptr);
+                    break;
+                }
+                case 7:
+                    inspect();
+                    break;
+                default: {
+                    const u32 words = 1 + rng() % 8;
+                    const u32 first = rng() % 16;
+                    for (u32 i = 0; i < words; ++i) {
+                        write(CbData + (first + i) % 16, rng() % 2 == 0 ? rng() : rng() % 4,
+                              rng() % 2 == 0);
+                    }
+                    break;
+                }
+                }
+            }
+            inspect();
+            split.Publish();
+            u64 position{};
+            while (position < Access::End(split)) {
+                position = Access::Execute(split, position, Access::End(split));
+            }
+            REQUIRE(observed == expected.size());
+        }
+        f.Compare();
+    }
+}
+
+TEST_CASE("GpuSplit notes a constant buffer write entry's writes at its end",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    split.MacroWrite(&f.fast, CbSize, 0x100);
+    split.Defer([] {}, 0, VideoCommon::GpuSplit::Writes::Noted);
+    const u64 before = Access::End(split);
+    split.ConstBufferWrite(&f.fast, CbData, 1, true, true);
+    // Held until something else is sent or asked for.
+    CHECK(Access::End(split) == before);
+    split.NoteAnyWrite();
+    split.ConstBufferWrite(&f.fast, CbData + 1, 2, false, true);
+    const u64 end = split.Position();
+    CHECK(end == before + 3);
+    CHECK(Access::WritesTarget(split, f.memory, 0x1000, 4) == end);
+    split.Defer([] {}, 0, VideoCommon::GpuSplit::Writes::Noted);
+    CHECK(Access::End(split) == end + 3);
+}
+
 TEST_CASE("GpuSplit CB batching preserves words at the GPU address space end",
           "[video_core][maxwell_fast_method][gpu_split_dispatch]") {
     using Access = VideoCommon::GpuSplitTestAccess;

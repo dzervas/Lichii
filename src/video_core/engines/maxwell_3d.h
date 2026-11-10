@@ -3208,6 +3208,9 @@ public:
     /// constant buffer data registers, uploaded in one memory write within a device page.
     void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
                               u32 count);
+    /// GpuSplit's back: the constant buffer register writes GpuSplit::ConstBufferWrite sent in
+    /// one entry, each as its own entry would run, the data words written a piece at a time.
+    void CallConstBufferWrites(Core::System& system, const u64* writes, u32 count);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
@@ -3345,6 +3348,14 @@ private:
     void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);
     /// EDEN_NX2_PERF_VERIFY: CallMethodFast's register state against CallMethodSlow's.
     void VerifyCallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    /// One of CallConstBufferWrites' writes, as GpuSplit::Execute runs a Method entry.
+    void CallSplitConstBufferWrite(Core::System& system, u64 write);
+    /// CallConstBufferWrites on CallMethodFast's path; `written` collects each data word written
+    /// (its GPU address and value).
+    void RunConstBufferWrites(Core::System& system, const u64* writes, u32 count,
+                              std::vector<std::pair<GPUVAddr, u32>>* written);
+    /// EDEN_NX2_PERF_VERIFY: RunConstBufferWrites against a write at a time.
+    void VerifyConstBufferWrites(Core::System& system, const u64* writes, u32 count);
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;

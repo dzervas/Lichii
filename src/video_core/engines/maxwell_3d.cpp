@@ -683,6 +683,182 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
+void Maxwell3D::CallConstBufferWrites(Core::System& system, const u64* writes, u32 count) {
+    if (record_write_history || trace_first_method_writes || executing_macro != 0) {
+        for (u32 i = 0; i < count; ++i) {
+            CallSplitConstBufferWrite(system, writes[i]);
+        }
+        return;
+    }
+    if (perf_verify) {
+        return VerifyConstBufferWrites(system, writes, count);
+    }
+    RunConstBufferWrites(system, writes, count, nullptr);
+}
+
+void Maxwell3D::CallSplitConstBufferWrite(Core::System& system, u64 write) {
+    using VideoCommon::GpuSplit;
+    const u32 method = static_cast<u32>(write & 0xffff);
+    const u32 argument = static_cast<u32>(write >> 32);
+    const bool direct = (write & GpuSplit::ConstBufferDirect) != 0;
+    if (!direct && !execution_mask[method]) {
+        method_sink.emplace_back(method, argument);
+        return;
+    }
+    ConsumeSink(system);
+    CallMethod(system, method, argument, direct || (write & GpuSplit::ConstBufferLast) != 0);
+}
+
+void Maxwell3D::RunConstBufferWrites(Core::System& system, const u64* writes, u32 count,
+                                     std::vector<std::pair<GPUVAddr, u32>>* written) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    using VideoCommon::GpuSplit;
+    // A piece: words each right after the previous one, in one device page.
+    std::array<u32, GpuSplit::MaxConstBufferWrites> words;
+    GPUVAddr piece{};
+    u32 piece_words{};
+    const auto write_piece = [&] {
+        if (piece_words == 0) {
+            return;
+        }
+        const GPUVAddr end = piece + u64{piece_words} * sizeof(u32);
+        if (VideoCommon::Nx2FastDraw::Enabled()) {
+            NoteFastDrawConstantData(piece, end);
+        }
+        memory_manager.WriteWordsCached(piece, words.data(), piece_words);
+        piece_words = 0;
+    };
+    // A deferred draw (ProcessDirtyRegisters issues it) reads the words written before.
+    const auto before_draw = [&] {
+        if (draw_manager.HasDeferredDraw()) {
+            write_piece();
+        }
+    };
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(writes[i] & 0xffff);
+        const u32 method_argument = static_cast<u32>(writes[i] >> 32);
+        if ((writes[i] & GpuSplit::ConstBufferDirect) == 0 && !execution_mask[method]) {
+            method_sink.emplace_back(method, method_argument);
+            continue;
+        }
+        if (!method_sink.empty()) {
+            before_draw();
+            ConsumeSink(system);
+        }
+        // From here on as CallMethodFast, with CallMethodSlow's profile counts.
+        if (Profile::Enabled()) {
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+            const bool same = regs.reg_array[method] == method_argument;
+            if (same) {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+            Profile::CountMethod(method, same);
+        }
+        const u32 argument = ProcessShadowRam(method, method_argument);
+        if (!execution_mask[method]) {
+            if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+                before_draw();
+                ProcessDirtyRegisters(method, argument);
+            }
+            continue;
+        }
+        before_draw();
+        ProcessDirtyRegisters(method, argument);
+        const GPUVAddr buffer = regs.const_buffer.Address();
+        const u32 offset = regs.const_buffer.offset;
+        const u32 size = regs.const_buffer.size;
+        if (buffer == 0 || offset >= size || size - offset < sizeof(u32)) {
+            // Asserted or dropped as ProcessCBData does.
+            write_piece();
+            ProcessCBData(argument);
+            continue;
+        }
+        const GPUVAddr address = buffer + offset;
+        if (piece_words != 0 && (address != piece + u64{piece_words} * sizeof(u32) ||
+                                 (address & Core::DEVICE_PAGEMASK) == 0)) {
+            write_piece();
+        }
+        if (piece_words == 0) {
+            piece = address;
+        }
+        words[piece_words++] = argument;
+        if (written != nullptr) {
+            written->emplace_back(address, argument);
+        }
+        regs.const_buffer.offset = offset + static_cast<u32>(sizeof(u32));
+    }
+    write_piece();
+}
+
+void Maxwell3D::VerifyConstBufferWrites(Core::System& system, const u64* writes, u32 count) {
+    using VideoCommon::GpuSplit;
+    // Both runs would issue it.
+    if (draw_manager.HasDeferredDraw()) {
+        for (u32 i = 0; i < count; ++i) {
+            CallSplitConstBufferWrite(system, writes[i]);
+        }
+        return;
+    }
+    // The fast run first, then a write at a time from the same state: the words land twice, the
+    // same twice when both runs agree.
+    const auto reg_array = regs.reg_array;
+    const auto shadow = shadow_state.reg_array;
+    const DirtyState::Flags flags = dirty.flags;
+    const auto sink = method_sink;
+    std::vector<std::pair<GPUVAddr, u32>> fast_written;
+    RunConstBufferWrites(system, writes, count, &fast_written);
+    const auto fast_regs = regs.reg_array;
+    const auto fast_shadow = shadow_state.reg_array;
+    const DirtyState::Flags fast_flags = dirty.flags;
+    const auto fast_sink = method_sink;
+    regs.reg_array = reg_array;
+    shadow_state.reg_array = shadow;
+    dirty.flags = flags;
+    method_sink = sink;
+    std::vector<std::pair<GPUVAddr, u32>> written;
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(writes[i] & 0xffff);
+        const u32 argument = static_cast<u32>(writes[i] >> 32);
+        const bool direct = (writes[i] & GpuSplit::ConstBufferDirect) != 0;
+        if (!direct && !execution_mask[method]) {
+            method_sink.emplace_back(method, argument);
+            continue;
+        }
+        ConsumeSink(system);
+        if (method >= cb_data) {
+            const u32 value = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay
+                                  ? shadow_state.reg_array[method]
+                                  : argument;
+            const u32 offset = regs.const_buffer.offset;
+            if (regs.const_buffer.Address() != 0 && offset < regs.const_buffer.size &&
+                regs.const_buffer.size - offset >= sizeof(u32)) {
+                written.emplace_back(regs.const_buffer.Address() + offset, value);
+            }
+        }
+        CallMethod(system, method, argument,
+                   direct || (writes[i] & GpuSplit::ConstBufferLast) != 0);
+    }
+    if (written == fast_written && fast_regs == regs.reg_array &&
+        fast_shadow == shadow_state.reg_array && fast_flags == dirty.flags &&
+        fast_sink == method_sink) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 64) {
+        return;
+    }
+    LOG_ERROR(HW_GPU,
+              "Nx2Perf method: {} constant buffer register writes: {} words written ({} one at a "
+              "time{}), registers {}, shadow RAM {}, dirty flags {}, method sink {}",
+              count, fast_written.size(), written.size(),
+              written == fast_written ? ", the same" : ", others",
+              fast_regs == regs.reg_array ? "match" : "differ",
+              fast_shadow == shadow_state.reg_array ? "matches" : "differs",
+              fast_flags == dirty.flags ? "match" : "differ",
+              fast_sink == method_sink ? "matches" : "differs");
+}
+
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     // Every word of a macro register run is a parameter of the macro it started, whichever macro
     // register it writes (as on the split front, FrontCallMethod). Only a write to an ordinary
@@ -1442,7 +1618,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
     }
     using Writes = VideoCommon::GpuSplit::Writes;
-    if (from_macro) {
+    constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+    constexpr u32 cb_end = MAXWELL3D_REG_INDEX(const_buffer.buffer) + 16;
+    if (method - cb_size < cb_end - cb_size) {
+        // As below, in one entry with the constant buffer writes next to it.
+        split.ConstBufferWrite(this, method, argument, from_macro, is_last_call);
+        fs.sink_pending = !from_macro && !execution_mask[method];
+    } else if (from_macro) {
         // Direct writes consume the sink first.
         split.MacroWrite(this, method, argument, Writes::Noted);
         fs.sink_pending = false;
