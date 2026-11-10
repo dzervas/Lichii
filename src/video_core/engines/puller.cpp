@@ -25,6 +25,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -66,6 +67,15 @@ void OnBack(const Func& func) {
 
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+}
+
+/// EDEN_NX2_IDLE_TRACE: how a poll of the channel's suspended acquire ended.
+bool NotePoll(const DmaPusher& dma_pusher, VideoCommon::IdleTrace::AcquirePollResult result,
+              bool resumes) {
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::AcquirePoll,
+                                 static_cast<u32>(dma_pusher.channel_state.bind_id),
+                                 static_cast<u32>(result));
+    return resumes;
 }
 
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
@@ -199,6 +209,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    using VideoCommon::IdleTrace::AcquirePollResult;
     auto& stats = VideoCommon::g_acquire_stats;
     switch (const AcquireCheck check = CheckWithoutDrain(dma_pusher, *pending_acquire); check) {
     case AcquireCheck::MetByQueued:
@@ -209,7 +220,10 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     case AcquireCheck::Met:
         VideoCommon::Count(stats.passed);
         VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
-        return true;
+        return NotePoll(dma_pusher,
+                        check == AcquireCheck::Met ? AcquirePollResult::Met
+                                                   : AcquirePollResult::MetByQueued,
+                        true);
     case AcquireCheck::NotMet: {
         // A release the back ran latches the waiter. Otherwise poll again later, without waiting
         // for the back: until it runs one, nothing sent to the word meets it. Work only a drain
@@ -218,13 +232,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         // reports waits over 2 s.
         if (Nx2SemaphoreWaiters::Get().Latched(this)) {
             VideoCommon::Count(stats.latched);
-            return true;
+            return NotePoll(dma_pusher, AcquirePollResult::Latched, true);
         }
         const auto now = std::chrono::steady_clock::now();
         if (now - pending_acquire->last_drain < std::chrono::milliseconds{1}) {
             VideoCommon::Count(stats.polls);
             VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
-            return false;
+            return NotePoll(dma_pusher, AcquirePollResult::Waiting, false);
         }
         pending_acquire->last_drain = now;
         VideoCommon::Count(stats.valve_drains);
@@ -245,10 +259,10 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                      dma_pusher.channel_state.bind_id, pending_acquire->address,
                      pending_acquire->value, current);
         }
-        return true;
+        return NotePoll(dma_pusher, AcquirePollResult::DrainedMet, true);
     }
     if (pending_acquire->Matches(current)) {
-        return true;
+        return NotePoll(dma_pusher, AcquirePollResult::DrainedMet, true);
     }
     // With delayed fence operations (Balanced or Accurate fences, accurate GPU), a release
     // queued after the acquire released the fences waits in the caches for the next fence. With
@@ -263,7 +277,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         ReleaseFences(dma_pusher);
         if (Nx2SemaphoreWaiters::Get().Latched(this) ||
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
-            return true;
+            return NotePoll(dma_pusher, AcquirePollResult::DrainedMet, true);
         }
     }
     if (!pending_acquire->reported &&
@@ -280,7 +294,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
     }
-    return false;
+    return NotePoll(dma_pusher, AcquirePollResult::DrainedWaiting, false);
 }
 
 bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
@@ -294,6 +308,8 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::AcquireResume,
+                                     static_cast<u32>(dma_pusher.channel_state.bind_id));
     }
     return true;
 }
@@ -442,6 +458,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Count(stats.drained);
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::AcquireDrain,
+                                     static_cast<u32>(dma_pusher.channel_state.bind_id),
+                                     static_cast<u32>(acquire.address));
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
@@ -461,6 +480,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+            VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::AcquireSuspend,
+                                         static_cast<u32>(dma_pusher.channel_state.bind_id),
+                                         static_cast<u32>(acquire.address));
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
         } else {
             waiters.Remove(this);

@@ -25,6 +25,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
@@ -870,14 +871,18 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             on_submit();
         }
 
+        namespace IdleTrace = VideoCommon::IdleTrace;
+        IdleTrace::Note(IdleTrace::Event::WorkerSubmitBegin, 0, static_cast<u32>(signal_value));
         std::unique_lock lock{submit_mutex, std::defer_lock};
         {
             const VideoCommon::Nx2Profile::Scope scope{
                 VideoCommon::Nx2Profile::Zone::WorkerSubmitLock};
             lock.lock();
         }
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const VkResult submitted = master_semaphore->SubmitQueue(
+            cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
+        IdleTrace::Note(IdleTrace::Event::WorkerSubmitEnd, 0, static_cast<u32>(signal_value));
+        switch (const VkResult result = submitted) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&

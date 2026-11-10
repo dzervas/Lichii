@@ -25,6 +25,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -104,7 +105,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     split.SettleIdleBack();
+                    namespace IdleTrace = VideoCommon::IdleTrace;
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
+                    const u32 sleep_kind = waited < std::chrono::microseconds{500} ? 0
+                                           : waited < std::chrono::seconds{2}      ? 1
+                                                                                   : 2;
+                    IdleTrace::Note(IdleTrace::Event::PollSleepBegin, sleep_kind);
+                    SCOPE_EXIT {
+                        IdleTrace::Note(IdleTrace::Event::PollSleepEnd, sleep_kind);
+                    };
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else if (waited < std::chrono::seconds{2}) {
@@ -122,7 +131,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::QueueWaitBegin);
                 state.queue.PopWait(next, stop_token);
+                VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::QueueWaitEnd);
             }
             if (stop_token.stop_requested()) {
                 break;
@@ -133,7 +144,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     Profile::Scope scope{Profile::Zone::Push};
+                    namespace IdleTrace = VideoCommon::IdleTrace;
+                    IdleTrace::Note(IdleTrace::Event::PushBegin,
+                                    static_cast<u32>(submit_list->channel));
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                    IdleTrace::Note(IdleTrace::Event::PushEnd,
+                                    static_cast<u32>(submit_list->channel));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     // TickWork ends fast draw reuse itself when it runs a request.
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
@@ -189,6 +205,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 }
 
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::GuestSubmit,
+                                 static_cast<u32>(channel));
     PushCommand(SubmitListCommand(channel, std::move(entries)), false, is_async);
 }
 

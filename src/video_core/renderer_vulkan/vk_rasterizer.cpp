@@ -75,6 +75,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -2398,7 +2399,9 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval (#161).
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        const u64 tick = scheduler.Flush();
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListCopyFlush, 0,
+                                     static_cast<u32>(tick));
     }
 }
 
@@ -3662,7 +3665,9 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        const u64 tick = scheduler.Flush();
+        VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListCopyFlush, 1,
+                                     static_cast<u32>(tick));
     }
     buffer_cache.Nx2CollectListCopies(false);
     return copied;
