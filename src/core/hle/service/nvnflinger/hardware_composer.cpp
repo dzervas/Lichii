@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
+#include "core/core.h"
 #include "core/lab_stats.h"
 #include "core/hle/service/nvnflinger/buffer_item.h"
 #include "core/hle/service/nvnflinger/buffer_item_consumer.h"
@@ -112,6 +113,8 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
             has_acquired_buffer = true;
         }
         if (result == CacheStatus::BufferAcquired && !layer->is_overlay) {
+            // Lab: Switch 1 frames also drive the debug server's frame waits (input, shots).
+            Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
             Core::LabStats::OnGameFrame();
         }
 
