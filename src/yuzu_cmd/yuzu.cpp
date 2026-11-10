@@ -664,6 +664,22 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                                           &manual_provider);
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
+    // The Qt frontend registers the containers its game list scans, which is where an NSP's or
+    // XCI's control data (NACP) comes from. Do the same for the booted file: without it the game
+    // reads an empty NACP (Luigi's Mansion 3 then aborts with 2162-0001).
+    if (const auto file =
+            state->system.GetFilesystem()->OpenFile(lp.filepath, FileSys::OpenMode::Read)) {
+        switch (Loader::IdentifyFile(file)) {
+        case Loader::FileType::NSP:
+        case Loader::FileType::NSZ:
+        case Loader::FileType::XCI:
+        case Loader::FileType::XCZ:
+            void(manual_provider.AddEntriesFromContainer(file));
+            break;
+        default:
+            break;
+        }
+    }
     state->system.GetUserChannel().clear();
 
     Service::AM::FrontendAppletParameters load_parameters{
