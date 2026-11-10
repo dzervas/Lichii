@@ -166,12 +166,13 @@ void Fermi2D::Blit() {
         if (lab_ms > 1.0) {
             LOG_INFO(HW_GPU,
                      "LabBlit sw {:.2f} ms: src {:#x} {}x{} fmt={:#x} {} -> dst {:#x} {}x{} "
-                     "fmt={:#x} {}, rect {}x{} -> {}x{}, filter={}",
+                     "fmt={:#x} {} depth={} bh={} bd={}, rect {}x{} -> {}x{}, filter={}",
                      lab_ms, src.Address(), src.width, src.height, static_cast<u32>(src.format),
                      src.linear == MemoryLayout::BlockLinear ? "block" : "pitch",
                      regs.dst.Address(), regs.dst.width, regs.dst.height,
                      static_cast<u32>(regs.dst.format),
                      regs.dst.linear == MemoryLayout::BlockLinear ? "block" : "pitch",
+                     regs.dst.depth, regs.dst.block_height, regs.dst.block_depth,
                      config.src_x1 - config.src_x0, config.src_y1 - config.src_y0,
                      config.dst_x1 - config.dst_x0, config.dst_y1 - config.dst_y0,
                      static_cast<u32>(config.filter));
