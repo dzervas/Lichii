@@ -61,7 +61,14 @@ void OnGameFrame() {
         s.switches = Snapshot(yield_switches);
         return;
     }
-    s.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s.last_frame).count());
+    const double interval_ms = std::chrono::duration<double, std::milli>(now - s.last_frame).count();
+    s.intervals_ms.push_back(interval_ms);
+    if (interval_ms > 45.0) {
+        // steady_clock is CLOCK_MONOTONIC on Linux: matches `perf record -k CLOCK_MONOTONIC`.
+        LOG_INFO(Debug, "LabStats long frame: end_ns={} ms={:.1f}",
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+                 interval_ms);
+    }
     s.last_frame = now;
     if (s.intervals_ms.size() < Window) {
         return;
