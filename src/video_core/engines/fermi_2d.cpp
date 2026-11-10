@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <mutex>
 #include <set>
 #include <cstdlib>
@@ -156,7 +157,25 @@ void Fermi2D::Blit() {
 
     memory_manager.FlushCaching();
     if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+        // Lab (dotfiles-m0h.5): time software blits, log the slow ones.
+        const auto lab_start = std::chrono::steady_clock::now();
         sw_blitter->Blit(src, regs.dst, config);
+        const double lab_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - lab_start)
+                                  .count();
+        if (lab_ms > 1.0) {
+            LOG_INFO(HW_GPU,
+                     "LabBlit sw {:.2f} ms: src {:#x} {}x{} fmt={:#x} {} -> dst {:#x} {}x{} "
+                     "fmt={:#x} {}, rect {}x{} -> {}x{}, filter={}",
+                     lab_ms, src.Address(), src.width, src.height, static_cast<u32>(src.format),
+                     src.linear == MemoryLayout::BlockLinear ? "block" : "pitch",
+                     regs.dst.Address(), regs.dst.width, regs.dst.height,
+                     static_cast<u32>(regs.dst.format),
+                     regs.dst.linear == MemoryLayout::BlockLinear ? "block" : "pitch",
+                     config.src_x1 - config.src_x0, config.src_y1 - config.src_y0,
+                     config.dst_x1 - config.dst_x0, config.dst_y1 - config.dst_y0,
+                     static_cast<u32>(config.filter));
+        }
     }
 }
 
