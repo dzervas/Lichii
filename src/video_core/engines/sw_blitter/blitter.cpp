@@ -379,9 +379,11 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
         for_each_dst_run([&](u64 offset, u64 size) {
             memory_manager.ReadBlockUnsafe(part_address + offset, part.data() + offset, size);
         });
+        lab_t[3] = LabClock::now();
         SwizzleSubrect(part, impl->dst_buffer, dst_bytes_per_pixel, dst.width, dst_part.height,
                        dst.depth, config.dst_x0, dst_part.origin_y, dst_extent_x, dst_extent_y,
                        dst.block_height, dst.block_depth, dst_extent_x * dst_bytes_per_pixel);
+        lab_t[4] = LabClock::now();
         for_each_dst_run([&](u64 offset, u64 size) {
             memory_manager.WriteBlockCached(part_address + offset, part.data() + offset, size);
         });
