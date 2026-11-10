@@ -6,12 +6,18 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
+#include "audio_core/common/common.h"
 #include "audio_core/sink/sink.h"
 #include "audio_core/sink/sink_stream.h"
+#include "common/polyfill_thread.h"
+#include "common/thread.h"
 
 namespace Core {
 class System;
@@ -21,9 +27,17 @@ namespace AudioCore::Sink {
 class NullSinkStreamImpl final : public SinkStream {
 public:
     explicit NullSinkStreamImpl(Core::System& system_, StreamType type_)
-        : SinkStream{system_, type_} {}
+        : SinkStream{system_, type_} {
+        if (type == StreamType::Render || type == StreamType::Out) {
+            consumer = std::jthread([this](std::stop_token stop_token) { Consume(stop_token); });
+        }
+    }
     ~NullSinkStreamImpl() override {}
-    void AppendBuffer(SinkBuffer&, std::span<s16>) override {}
+    void AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) override {
+        if (consumer.joinable()) {
+            SinkStream::AppendBuffer(buffer, samples);
+        }
+    }
     bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples) override {
         return buffer.frames == TargetSampleCount && buffer.frames_played == 0 &&
                !buffer.consumed && samples.size() == TargetSampleCount * 2;
@@ -40,10 +54,32 @@ public:
     std::vector<s16> ReleaseBuffer(u64) override {
         return {};
     }
+
+private:
+    /// Plays queued output in real time and discards it, as a device's callback would. Without
+    /// it the audio renderer, which waits only for free queue space, runs unthrottled.
+    void Consume(std::stop_token stop_token) {
+        Common::SetCurrentThreadName("NullSinkStream");
+        constexpr std::chrono::microseconds period{TargetSampleCount * 1'000'000ULL /
+                                                   TargetSampleRate};
+        std::vector<s16> discarded(TargetSampleCount * GetDeviceChannels());
+        auto next = std::chrono::steady_clock::now();
+        while (!stop_token.stop_requested()) {
+            next += period;
+            std::this_thread::sleep_until(next);
+            if (!paused) {
+                ProcessAudioOutAndRender(discarded, TargetSampleCount);
+            }
+            // After a host stall, carry on from now rather than playing the backlog at once.
+            next = (std::max)(next, std::chrono::steady_clock::now() - 20 * period);
+        }
+    }
+
+    std::jthread consumer;
 };
 
 /**
- * A no-op sink for when no audio out is wanted.
+ * A sink for when no audio out is wanted: output streams are played in real time into nothing.
  */
 class NullSink final : public Sink {
 public:
@@ -52,28 +88,31 @@ public:
 
     SinkStream* AcquireSinkStream(Core::System& system, u32, const std::string&,
                                   StreamType type) override {
-        if (null_sink == nullptr) {
-            null_sink = std::make_unique<NullSinkStreamImpl>(system, type);
-            null_sink->SetDeviceVolume(device_volume);
-        }
-        return null_sink.get();
+        SinkStreamPtr& stream =
+            sink_streams.emplace_back(std::make_unique<NullSinkStreamImpl>(system, type));
+        stream->SetDeviceVolume(device_volume);
+        return stream.get();
     }
 
-    void CloseStream(SinkStream*) override {}
-    void CloseStreams() override {}
+    void CloseStream(SinkStream* stream) override {
+        std::erase_if(sink_streams, [stream](const SinkStreamPtr& s) { return s.get() == stream; });
+    }
+    void CloseStreams() override {
+        sink_streams.clear();
+    }
     f32 GetDeviceVolume() const override {
         return device_volume;
     }
     void SetDeviceVolume(f32 volume) override {
         device_volume = volume;
-        if (null_sink != nullptr) {
-            null_sink->SetDeviceVolume(volume);
+        for (auto& stream : sink_streams) {
+            stream->SetDeviceVolume(volume);
         }
     }
     void SetSystemVolume(f32 volume) override {}
 
 private:
-    SinkStreamPtr null_sink{};
+    std::vector<SinkStreamPtr> sink_streams{};
 };
 
 } // namespace AudioCore::Sink
