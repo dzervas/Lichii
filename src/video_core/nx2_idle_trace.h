@@ -52,6 +52,12 @@ enum class Event : u16 {
     // Other threads
     Present,     ///< RendererVulkan::Composite
     GuestSubmit, ///< The CPU submits a command list (aux: channel)
+    // GPU timestamps of a submission (arg: its tick), written by VulkanWorker once the GPU is
+    // done with it. Their time is the GPU's clock in ns, not the time stamp counter.
+    GpuSubmitStart, ///< Top of pipe at the start of the submission
+    GpuProducer,    ///< Bottom of pipe before the dispatch that writes command list pages
+    GpuCopy,        ///< Bottom of pipe before the command list page copies
+    GpuSubmitEnd,   ///< Bottom of pipe at the end of the submission
 };
 
 enum class AcquirePollResult : u32 {
@@ -70,6 +76,8 @@ inline bool g_enabled{};
 void ReadSwitch();
 
 void Write(Event event, u16 aux, u32 arg);
+/// A record with its own time (the Gpu* events).
+void WriteAt(u64 time, Event event, u16 aux, u32 arg);
 
 inline void Note(Event event, u32 aux = 0, u32 arg = 0) {
     if (g_enabled) {

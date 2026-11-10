@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <queue>
@@ -97,6 +98,13 @@ public:
         work();
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
     }
+
+    /// EDEN_NX2_IDLE_TRACE: a GPU timestamp in the current submission, once per submission and
+    /// kind, for the command list copies' timing (Producer: before the dispatch that writes
+    /// command list pages; Copy: before their copy). The submission's start and end are timed
+    /// too, and every timestamp goes to the idle trace once the GPU is done with it.
+    enum class ListTraceMark : u32 { Producer = 1, Copy = 2 };
+    void TraceListMark(ListTraceMark mark);
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -440,6 +448,8 @@ private:
 
     void TraceGpuSubmission();
     void ReportWorkTimes();
+    void BeginListTraceSubmission();
+    void EndListTraceSubmission(vk::CommandBuffer cmdbuf, u64 tick);
     void TraceShader(u64 hash, u32 stage);
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
@@ -501,6 +511,21 @@ private:
     bool trace_gpu_sampling{};
     bool trace_gpu_pending{};
     bool trace_gpu_failed{};
+
+    /// EDEN_NX2_IDLE_TRACE's GPU timestamps (worker thread): ListTraceSlotQueries per
+    /// submission (start, producer, copy, end), a ring of ListTraceSlots.
+    static constexpr u32 ListTraceSlots = 1024;
+    static constexpr u32 ListTraceSlotQueries = 4;
+    struct ListTraceSubmission {
+        u64 tick{};
+        u32 slot{};
+        u32 marks{}; ///< Bits of the queries written (1 << query)
+    };
+    vk::QueryPool list_trace_pool;
+    std::queue<ListTraceSubmission> list_trace_pending;
+    std::optional<ListTraceSubmission> list_trace_current;
+    u32 list_trace_next_slot{};
+    u64 list_trace_mask{};
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

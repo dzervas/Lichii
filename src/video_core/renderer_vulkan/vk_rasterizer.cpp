@@ -2157,6 +2157,11 @@ void RasterizerVulkan::DispatchCompute() {
         });
         scheduler.NoteComputeWrites();
     };
+    const auto trace_list_producer = [this] {
+        if (VideoCommon::IdleTrace::g_enabled && buffer_cache.Nx2HasListCopyRequests()) {
+            scheduler.TraceListMark(Scheduler::ListTraceMark::Producer);
+        }
+    };
     if (frame_dump.CapturingBuffers()) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
@@ -2176,6 +2181,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        trace_list_producer();
         record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
@@ -2198,6 +2204,7 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
+    trace_list_producer();
     record_read_barrier();
     if (marking_effects) {
         const auto written = pipeline->WrittenImages();
@@ -2293,6 +2300,9 @@ void RasterizerVulkan::FlushAll() {}
 void RasterizerVulkan::SubmitNx2ListCopies() {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval (#161).
+    if (VideoCommon::IdleTrace::g_enabled && buffer_cache.Nx2HasListCopyRequests()) {
+        scheduler.TraceListMark(Scheduler::ListTraceMark::Copy);
+    }
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         const u64 tick = scheduler.Flush();
         VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListCopyFlush, 0,
@@ -3553,6 +3563,9 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+    if (VideoCommon::IdleTrace::g_enabled && buffer_cache.Nx2HasListCopyRequests()) {
+        scheduler.TraceListMark(Scheduler::ListTraceMark::Copy);
+    }
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         const u64 tick = scheduler.Flush();
         VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::ListCopyFlush, 1,
