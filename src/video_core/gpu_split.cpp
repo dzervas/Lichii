@@ -120,6 +120,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     const char* const verify = std::getenv("EDEN_NX2_ACQUIRE_VERIFY");
     g_acquire_verify = verify != nullptr && verify[0] == '1';
     g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
+    Tegra::Nx2SemaphoreWaiters::count_writes = g_acquire_counting;
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -636,6 +637,53 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     front_wake.notify_all();
 }
 
+namespace {
+
+void ReportAcquireDrains() {
+    static constexpr std::array<const char*, static_cast<size_t>(AcquireDrainPath::Count)>
+        path_names{"not met", "equal or mask", "settings", "word", "queued", "valve", "sem execute"};
+    static constexpr std::array<const char*, static_cast<size_t>(AcquireDrainOutcome::Count)>
+        outcome_names{"met before", "back wrote", "other wrote", "not met"};
+    constexpr size_t outcomes = static_cast<size_t>(AcquireDrainOutcome::Count);
+    auto& drains = g_acquire_drains;
+    std::string text;
+    for (size_t path = 0; path < path_names.size(); ++path) {
+        for (size_t outcome = 0; outcome < outcomes; ++outcome) {
+            const size_t cell = path * outcomes + outcome;
+            if (drains.counts[cell] != 0) {
+                text += fmt::format(" | {}/{} {} {:.1f} ms", path_names[path],
+                                    outcome_names[outcome], drains.counts[cell],
+                                    static_cast<double>(drains.ns[cell]) / 1e6);
+            }
+        }
+    }
+    text += " | sem execute ops";
+    for (const u64 operations : drains.sem_execute_operations) {
+        text += fmt::format(" {}", operations);
+    }
+    std::vector<std::pair<u64, std::array<u64, outcomes>>> words(drains.not_met_words.begin(),
+                                                                  drains.not_met_words.end());
+    const auto total = [](const auto& entry) {
+        u64 sum = 0;
+        for (const u64 value : entry.second) {
+            sum += value;
+        }
+        return sum;
+    };
+    std::ranges::sort(words, std::greater{}, total);
+    text += fmt::format(" | {} not-met words, busiest:", words.size());
+    for (size_t i = 0; i < std::min<size_t>(words.size(), 6); ++i) {
+        text += fmt::format(" {:#x} ({})", words[i].first, fmt::join(words[i].second, "/"));
+    }
+    LOG_INFO(HW_GPU, "Acquire drains in 10 s (path/outcome count time){}", text);
+    drains.counts.fill(0);
+    drains.ns.fill(0);
+    drains.sem_execute_operations.fill(0);
+    drains.not_met_words.clear();
+}
+
+} // Anonymous namespace
+
 void GpuSplit::ReportAcquire() {
     static u32 calls{};
     static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
@@ -678,6 +726,7 @@ void GpuSplit::ReportAcquire() {
              passed, by_queued, latched, drained, valve_drains, drain_operation, drain_settings,
              drain_word, drain_queued, polls, acquire_polls, list_polls, back_waits, back_sleeps,
              spin_ms, early_publishes, settles);
+    ReportAcquireDrains();
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);
