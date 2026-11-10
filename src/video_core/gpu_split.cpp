@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -48,6 +49,158 @@ void Pause() {
 }
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
+
+/// EDEN_NX2_GPU_PROFILE (the back's Execute without Nx2Perf): the entries the back runs and how
+/// constant buffer data reaches it from the 3D engine's single method writes, logged every 10 s.
+/// A group is a run of 3D method entries to the constant buffer registers (size, address, offset
+/// 0x8e0-0x8e3, data 0x8e4-0x8f3); a piece is a run of its data words each written right after
+/// the previous one.
+class ConstBufferPattern {
+public:
+    void Entry() {
+        if ((++entries & 0xfff) == 0) {
+            Report();
+        }
+    }
+    /// A 3D method entry, before it runs; `direct` when a macro wrote it.
+    void Method(const Tegra::Engines::Maxwell3D& maxwell3d, u32 method, bool direct) {
+        using Tegra::Engines::Maxwell3D;
+        constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (method - cb_size >= cb_data + 16 - cb_size) {
+            return End(method & 0x1fff);
+        }
+        if (!in_group) {
+            in_group = true;
+            group_words = 0;
+            group_pieces = 0;
+            have_previous = false;
+        }
+        if (method < cb_data) {
+            ++setups;
+            EndRun();
+            return;
+        }
+        const auto& cb = maxwell3d.regs.const_buffer;
+        const GPUVAddr buffer = cb.Address();
+        const GPUVAddr target = buffer + cb.offset;
+        ++words;
+        macro_words += direct ? 1 : 0;
+        ++group_words;
+        ++run;
+        if (!have_previous || buffer != previous_buffer || target != previous_end) {
+            ++group_pieces;
+        }
+        if (have_previous) {
+            size_t bucket = 6;
+            if (buffer == previous_buffer) {
+                const s64 delta = static_cast<s64>(target - previous_end);
+                bucket = delta == 0 ? 0 : delta < 0 ? 1 : delta <= 16 ? 2 : delta <= 256 ? 3
+                                     : delta < 0x1000 ? 4 : 5;
+            }
+            ++deltas[bucket];
+        }
+        have_previous = true;
+        previous_buffer = buffer;
+        previous_end = target + sizeof(u32);
+    }
+    /// A ConstBufferWrites entry of `count` writes.
+    void Batch(u32 count) {
+        End(~0U);
+        ++batches;
+        batched += count;
+    }
+    /// Any other entry: a Multi entry to `method` of the 3D engine, else `method` is ~0.
+    void End(u32 method) {
+        if (in_group) {
+            in_group = false;
+            ++groups;
+            ++group_word_counts[Bucket(group_words)];
+            ++group_piece_counts[Bucket(group_pieces)];
+            pieces += group_pieces;
+            if (method < enders.size()) {
+                ++enders[method];
+            } else {
+                ++other_enders;
+            }
+        }
+        EndRun();
+    }
+
+private:
+    void Report() {
+        const auto now = std::chrono::steady_clock::now();
+        if (start == std::chrono::steady_clock::time_point{}) {
+            start = now;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - start).count();
+        if (seconds < 10.0) {
+            return;
+        }
+        const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+        const auto list = [&rate](const auto& counts) {
+            std::string text;
+            for (const u64 count : counts) {
+                text += fmt::format("{}{:.0f}", text.empty() ? "" : "/", rate(count));
+            }
+            return text;
+        };
+        std::array<u32, 0x2000> ender_counts;
+        std::ranges::transform(enders, ender_counts.begin(),
+                               [](u64 count) { return static_cast<u32>(count); });
+        LOG_INFO(HW_GPU,
+                 "GPU back thread entries per second: {:.0f}; constant buffer groups {:.0f} with "
+                 "{:.0f} setup writes and {:.0f} data words ({:.0f} from macros) in {:.0f} pieces; words per group "
+                 "(0/1/2/3-4/5-8/9-16/17-32/33+) {}; pieces per group {}; data word runs "
+                 "(1/2-3/4-7/8+) {}; next word in a group (contiguous/back/<=16 B/<=256 B/<4 KiB/"
+                 ">=4 KiB ahead/other buffer) {}; {:.0f} batched entries of {:.0f} writes; ended by "
+                 "{:.0f} non-3D entries and 3D:{}",
+                 rate(entries), rate(groups), rate(setups), rate(words), rate(macro_words),
+                 rate(pieces),
+                 list(group_word_counts), list(group_piece_counts), list(run_counts), list(deltas),
+                 rate(batches), rate(batched), rate(other_enders),
+                 Nx2Profile::TopMethods(ender_counts, nullptr,
+                                        static_cast<u64>(seconds * 1e9)));
+        *this = {};
+        start = now;
+    }
+
+    void EndRun() {
+        if (run != 0) {
+            ++run_counts[std::min<size_t>(std::bit_width(run) - 1, run_counts.size() - 1)];
+            run = 0;
+        }
+    }
+    static size_t Bucket(u32 count) {
+        return count == 0 ? 0 : std::min<size_t>(std::bit_width(count - 1) + 1, 7);
+    }
+
+    std::chrono::steady_clock::time_point start{};
+    u64 entries{};
+    u64 groups{};
+    u64 setups{};
+    u64 words{};
+    u64 macro_words{};
+    u64 pieces{};
+    std::array<u64, 8> group_word_counts{};
+    std::array<u64, 8> group_piece_counts{};
+    std::array<u64, 4> run_counts{};
+    std::array<u64, 7> deltas{};
+    std::array<u64, 0x2000> enders{};
+    u64 other_enders{};
+    u64 batches{};
+    u64 batched{};
+    bool in_group{};
+    bool have_previous{};
+    u32 group_words{};
+    u32 group_pieces{};
+    u32 run{};
+    GPUVAddr previous_buffer{};
+    GPUVAddr previous_end{};
+};
+
+ConstBufferPattern g_cb_pattern;
 
 } // Anonymous namespace
 
@@ -157,6 +310,9 @@ void GpuSplit::Stop() {
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
+    cb_count = 0;
+    cb_note_count = 0;
+    cb_any_write = false;
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -202,6 +358,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    SendOpenWrites();
     if (published_local == write_position) {
         return;
     }
@@ -215,6 +372,7 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain(DrainSite site) {
+    SendOpenWrites();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
         return;
@@ -258,6 +416,7 @@ bool GpuSplit::WaitForSync() {
 }
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
+    SendOpenWrites();
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases the back ran hold their values in memory.
         const u64 done = consumed.load(std::memory_order_acquire);
@@ -300,6 +459,22 @@ void ForEachDeviceRange(const Tegra::MemoryManager& memory, GPUVAddr address, u6
 } // Anonymous namespace
 
 void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    if (cb_count != 0) {
+        // Noted once the open entry is sent, at its end.
+        if (cb_note_count != 0) {
+            NotedWrite& last = cb_notes[cb_note_count - 1];
+            if (last.memory == &memory && last.address + last.size == address) {
+                last.size += size;
+                return;
+            }
+        }
+        if (cb_note_count == cb_notes.size()) {
+            cb_any_write = true;
+            return;
+        }
+        cb_notes[cb_note_count++] = {&memory, address, size};
+        return;
+    }
     if (size > MaxNotedBytes || address + size < address) {
         NoteAnyWrite();
         return;
@@ -337,6 +512,7 @@ u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
 }
 
 bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    SendOpenWrites();
     return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
                    DrainSite::MacroDmaWrites);
 }
@@ -346,6 +522,7 @@ bool GpuSplit::WaitForSyncedWriters() {
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+    SendOpenWrites();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return false;
@@ -421,6 +598,23 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
     }
 }
 
+void GpuSplit::SendConstBufferWrites() {
+    const u32 count = cb_count;
+    cb_count = 0;
+    u64* const entry = Reserve(1 + count);
+    entry[0] = static_cast<u64>(Kind::ConstBufferWrites) | (u64{count} << 8);
+    std::memcpy(entry + 1, cb_writes.data(), size_t{count} * sizeof(u64));
+    Commit(1 + count);
+    for (u32 i = 0; i < cb_note_count; ++i) {
+        NoteWrite(*cb_notes[i].memory, cb_notes[i].address, cb_notes[i].size);
+    }
+    cb_note_count = 0;
+    if (cb_any_write) {
+        cb_any_write = false;
+        NoteAnyWrite();
+    }
+}
+
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
     auto* const heap = new std::function<void()>(std::move(func));
     Defer([heap] {
@@ -435,6 +629,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Wrap:
         return 0;
     case Kind::Engine:
+        if (Nx2Profile::Enabled()) {
+            g_cb_pattern.Entry();
+            g_cb_pattern.End(~0U);
+        }
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
     case Kind::Method: {
@@ -489,6 +687,15 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             }
             return (head & HasSegment) != 0 ? 2 : 1;
         }
+        if (Nx2Profile::Enabled()) {
+            g_cb_pattern.Entry();
+            if (engine->reports_fast_draw_breaks) {
+                g_cb_pattern.Method(*static_cast<Tegra::Engines::Maxwell3D*>(engine), method,
+                                    (head & Direct) != 0);
+            } else {
+                g_cb_pattern.End(~0U);
+            }
+        }
         if (!engine->reports_fast_draw_breaks) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
         }
@@ -513,6 +720,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (Nx2Profile::Enabled()) {
+            g_cb_pattern.Entry();
+            g_cb_pattern.End(engine->reports_fast_draw_breaks ? method & 0x1fff : ~0U);
+        }
         if (!engine->reports_fast_draw_breaks) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
         }
@@ -525,7 +736,22 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
     }
+    case Kind::ConstBufferWrites: {
+        const u32 count = static_cast<u32>((head >> 8) & 0xffffff);
+        if (Nx2Profile::Enabled()) {
+            g_cb_pattern.Entry();
+            g_cb_pattern.Batch(count);
+        }
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)->CallConstBufferWrites(*system, entry + 1,
+                                                                                   count);
+        return 1 + count;
+    }
     case Kind::Call: {
+        if (Nx2Profile::Enabled()) {
+            g_cb_pattern.Entry();
+            g_cb_pattern.End(~0U);
+        }
         Nx2Profile::Scope call_scope{Nx2Profile::Zone::SplitCall};
         if ((head & FastDrawNeutral) == 0) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
