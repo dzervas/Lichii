@@ -21,6 +21,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/lab_stats.h"
 
 namespace Kernel {
 
@@ -685,6 +686,7 @@ void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
 
     // If the thread's yield count matches, there's nothing for us to do.
     if (cur_thread.GetYieldScheduleCount() == cur_process.GetScheduledCount()) {
+        Core::LabStats::Count(Core::LabStats::yield_early_outs[0]);
         return;
     }
 
@@ -704,6 +706,7 @@ void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
             // If the next thread is different, we have an update to perform.
             if (next_thread != std::addressof(cur_thread)) {
                 SetSchedulerUpdateNeeded(kernel);
+                Core::LabStats::Count(Core::LabStats::yield_switches[0]);
             } else {
                 // Otherwise, set the thread's yield count so that we won't waste work until the
                 // process is scheduled again.
@@ -724,6 +727,7 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
 
     // If the thread's yield count matches, there's nothing for us to do.
     if (cur_thread.GetYieldScheduleCount() == cur_process.GetScheduledCount()) {
+        Core::LabStats::Count(Core::LabStats::yield_early_outs[1]);
         return;
     }
 
@@ -792,6 +796,7 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
             // perform.
             if (suggested != nullptr || next_thread != std::addressof(cur_thread)) {
                 SetSchedulerUpdateNeeded(kernel);
+                Core::LabStats::Count(Core::LabStats::yield_switches[1]);
             } else if (!recheck) {
                 // Otherwise if we don't need to re-check, set the thread's yield count so that we
                 // won't waste work until the process is scheduled again.
@@ -812,6 +817,7 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
 
     // If the thread's yield count matches, there's nothing for us to do.
     if (cur_thread.GetYieldScheduleCount() == cur_process.GetScheduledCount()) {
+        Core::LabStats::Count(Core::LabStats::yield_early_outs[2]);
         return;
     }
 
@@ -864,6 +870,7 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
                 // update.
                 if (suggested != std::addressof(cur_thread)) {
                     SetSchedulerUpdateNeeded(kernel);
+                    Core::LabStats::Count(Core::LabStats::yield_switches[2]);
                 } else {
                     // Otherwise, set the thread's yield count so that we won't waste work until the
                     // process is scheduled again.
@@ -872,6 +879,7 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
             } else {
                 // Otherwise, we have an update to perform.
                 SetSchedulerUpdateNeeded(kernel);
+                Core::LabStats::Count(Core::LabStats::yield_switches[2]);
             }
         }
     }

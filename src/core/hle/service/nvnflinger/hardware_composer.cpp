@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
+#include "core/lab_stats.h"
 #include "core/hle/service/nvnflinger/buffer_item.h"
 #include "core/hle/service/nvnflinger/buffer_item_consumer.h"
 #include "core/hle/service/nvnflinger/hardware_composer.h"
@@ -109,6 +110,9 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
         // If we acquired a new buffer, we need to present.
         if (result == CacheStatus::BufferAcquired) {
             has_acquired_buffer = true;
+        }
+        if (result == CacheStatus::BufferAcquired && !layer->is_overlay) {
+            Core::LabStats::OnGameFrame();
         }
 
         const auto& buffer = m_framebuffers[consumer_id];

@@ -18,6 +18,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/thread_startup_policy.h"
+#include "core/lab_stats.h"
 
 namespace Kernel::Svc {
 namespace {
@@ -196,6 +197,11 @@ void SleepThread(Core::System& system, s64 ns) {
     const auto yield_type = static_cast<Svc::YieldType>(ns);
 
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
+    {
+        using namespace Core::LabStats;
+        Count(sleep_counts[ns > 0 ? SleepPositive : ns == 0 ? SleepYield0 : ns == -1 ? SleepYieldMinus1
+                                                   : ns == -2 ? SleepYieldMinus2 : SleepOther]);
+    }
 
     // When the input tick is positive, sleep.
     if (ns > 0) {
