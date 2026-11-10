@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -21,8 +22,10 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#include "common/div_ceil.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
+#include "common/page_protection_stats.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -516,7 +519,17 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
+            if (Common::PageProtectionStats::g_enabled) [[unlikely]] {
+                const auto start = std::chrono::steady_clock::now();
+                host_buffer->Protect(vaddr, size, perm);
+                const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start);
+                Common::PageProtectionStats::Add(cached, vaddr >> YUZU_PAGEBITS,
+                                                 Common::DivCeil(size, YUZU_PAGESIZE),
+                                                 static_cast<u64>(ns.count()));
+            } else {
+                host_buffer->Protect(vaddr, size, perm);
+            }
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
@@ -951,6 +964,10 @@ struct Memory::Impl {
             // It is often the case the games like to access wildly different addresses. Hence why I propose
             // we should let the compiler just do it's thing...
             if (current_area.last_address != subaddress) {
+                if (Common::PageProtectionStats::g_enabled) [[unlikely]] {
+                    Common::PageProtectionStats::g_write_traps.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 // Short circuit the need to check for address/size
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);

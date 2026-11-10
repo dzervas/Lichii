@@ -20,6 +20,7 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
+#include "common/page_protection_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -543,6 +544,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
+    Common::PageProtectionStats::t_gpu_back_thread = true;
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();

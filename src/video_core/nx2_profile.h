@@ -19,6 +19,7 @@
 #include "video_core/gpu_split.h"
 #include "common/logging.h"
 #include "common/cpu_features.h"
+#include "common/page_protection_stats.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/thread_cpu_clock.h"
 #include "video_core/nx2_stutter_trace.h"
@@ -155,6 +156,7 @@ inline void ReadSwitch() {
     StutterTrace::ReadSwitch();
     g_zones_enabled = g_enabled || StutterTrace::Enabled();
     Common::g_count_spin_contention = g_enabled;
+    Common::PageProtectionStats::g_enabled = g_enabled;
 }
 
 inline bool Enabled() {
@@ -331,6 +333,37 @@ inline void AddDrain(DrainSite site, u64 start) {
     }
 }
 
+/// Logs and resets Common::PageProtectionStats over `window` ns.
+inline void ReportPageProtection(u64 window) {
+    namespace Stats = Common::PageProtectionStats;
+    const auto per_second = [window](u64 value) {
+        return static_cast<double>(value) * 1e9 / static_cast<double>(window);
+    };
+    std::string line;
+    for (const bool cached : {false, true}) {
+        for (const bool back : {true, false}) {
+            Stats::Totals& totals = Stats::g_totals[cached ? 1 : 0][back ? 1 : 0];
+            const u64 calls = totals.calls.exchange(0, std::memory_order_relaxed);
+            const u64 pages = totals.pages.exchange(0, std::memory_order_relaxed);
+            const u64 ns = totals.protect_ns.exchange(0, std::memory_order_relaxed);
+            line += fmt::format(" | {} on {}: {:.0f} pages in {:.0f} calls, {:.1f} ms",
+                                cached ? "protected" : "unprotected",
+                                back ? "GPU back" : "other threads", per_second(pages),
+                                per_second(calls), per_second(ns) / 1e6);
+        }
+    }
+    size_t distinct;
+    {
+        std::scoped_lock lock{Stats::g_pages_mutex};
+        distinct = Stats::g_pages.size();
+        Stats::g_pages.clear();
+    }
+    line += fmt::format(" | {} distinct pages in {:.1f} s | write traps {:.0f}", distinct,
+                        static_cast<double>(window) / 1e9,
+                        per_second(Stats::g_write_traps.exchange(0, std::memory_order_relaxed)));
+    LOG_INFO(HW_GPU, "Page protection per second:{}", line);
+}
+
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
 /// the totals every 10 s.
 /// `report_all_contention`: also log (and reset) every thread's spin mutex contention.
@@ -433,6 +466,9 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
                             static_cast<double>(window) / 1e6);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    if (report_all_contention) {
+        ReportPageProtection(window);
+    }
     if (const std::string methods = TopMethods(t_method_count, &t_method_same, window); !methods.empty()) {
         LOG_INFO(HW_GPU, "{} methods per second:{}", thread_name, methods);
     }
