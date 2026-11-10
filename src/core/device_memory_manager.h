@@ -148,6 +148,29 @@ public:
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
+    /// While alive, the pages this thread's updates leave without cache users (count 0) stay
+    /// write-protected; when it ends, those still without one are unprotected. CPU write traps
+    /// update the counts holding the GPU caches' mutexes, and unprotecting there (an mprotect
+    /// and its TLB shootdown) kept the GPU back thread waiting for those mutexes. A late
+    /// unprotect only costs more traps, and the recheck leaves the pages another thread cached
+    /// in between protected.
+    class ScopedUncacheDeferral {
+    public:
+        explicit ScopedUncacheDeferral(DeviceMemoryManager& manager_);
+        ~ScopedUncacheDeferral();
+
+        ScopedUncacheDeferral(const ScopedUncacheDeferral&) = delete;
+        ScopedUncacheDeferral& operator=(const ScopedUncacheDeferral&) = delete;
+
+    private:
+        friend DeviceMemoryManager;
+
+        void Defer(DAddr page_addr);
+
+        DeviceMemoryManager* manager{}; ///< Null when an outer scope on this thread defers
+        std::vector<std::pair<DAddr, size_t>> ranges;
+    };
+
 private:
     struct TranslationEntry {
         DAddr guest_page{};
@@ -165,6 +188,7 @@ private:
         u32 cursor{};
     };
     static inline thread_local TranslationCache t_cache{};
+    static inline thread_local ScopedUncacheDeferral* t_uncache_deferral{};
 
     /// This thread's translations, emptied when Map or Unmap ran since they were made.
     TranslationCache& Translations() {

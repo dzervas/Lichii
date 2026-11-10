@@ -675,6 +675,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
             cache_bytes = 0;
         }
     };
+    ScopedUncacheDeferral* const deferral =
+        t_uncache_deferral != nullptr && t_uncache_deferral->manager == this ? t_uncache_deferral
+                                                                             : nullptr;
     size_t old_vpage = (base_vaddress >> Memory::YUZU_PAGEBITS) - 1;
     for (; page != page_end; ++page) {
         CounterAtomicType& count = cached_pages->at(page >> subentries_shift).Count(page);
@@ -704,10 +707,14 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
         // Assume delta is either -1 or 1
         if (count.load(std::memory_order::relaxed) == 0) {
-            if (uncache_bytes == 0) {
-                uncache_begin = vpage;
+            if (deferral != nullptr) {
+                deferral->Defer(page << Memory::YUZU_PAGEBITS);
+            } else {
+                if (uncache_bytes == 0) {
+                    uncache_begin = vpage;
+                }
+                uncache_bytes += Memory::YUZU_PAGESIZE;
             }
-            uncache_bytes += Memory::YUZU_PAGESIZE;
         } else if (uncache_bytes > 0) {
             if (memory_device_inter != nullptr) {
                 MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
@@ -729,6 +736,37 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
         }
     }
     release_pending();
+}
+
+template <typename Traits>
+DeviceMemoryManager<Traits>::ScopedUncacheDeferral::ScopedUncacheDeferral(
+    DeviceMemoryManager& manager_) {
+    if (t_uncache_deferral == nullptr) {
+        manager = &manager_;
+        t_uncache_deferral = this;
+    }
+}
+
+template <typename Traits>
+DeviceMemoryManager<Traits>::ScopedUncacheDeferral::~ScopedUncacheDeferral() {
+    if (manager == nullptr) {
+        return;
+    }
+    t_uncache_deferral = nullptr;
+    // A delta of 0 changes no count and unprotects the pages whose count is 0, under the same
+    // range lock the updates that protect them take.
+    for (const auto& [addr, size] : ranges) {
+        manager->UpdatePagesCachedCount(addr, size, 0);
+    }
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ScopedUncacheDeferral::Defer(DAddr page_addr) {
+    if (!ranges.empty() && ranges.back().first + ranges.back().second == page_addr) {
+        ranges.back().second += Memory::YUZU_PAGESIZE;
+        return;
+    }
+    ranges.emplace_back(page_addr, Memory::YUZU_PAGESIZE);
 }
 
 template <typename Traits>

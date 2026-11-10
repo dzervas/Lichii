@@ -2535,6 +2535,8 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    // Destroyed last: unprotects the pages after the caches' mutexes are released.
+    const Tegra::MaxwellDeviceMemoryManager::ScopedUncacheDeferral uncache_deferral{device_memory};
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.OnCPUWrite(addr, size)) {
@@ -2579,6 +2581,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
+    const Tegra::MaxwellDeviceMemoryManager::ScopedUncacheDeferral uncache_deferral{device_memory};
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         // WriteMemory downloads GPU-written bytes elsewhere on the written pages, which only the
