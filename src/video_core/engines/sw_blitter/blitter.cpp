@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
+#include <chrono>
 #include <mutex>
 #include <set>
 #include <algorithm>
@@ -9,6 +11,7 @@
 
 #include "common/alignment.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include "common/scratch_buffer.h"
 #include "video_core/engines/sw_blitter/blitter.h"
 #include "video_core/engines/sw_blitter/converter.h"
@@ -281,10 +284,15 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
     const size_t src_size = get_surface_size(src, src_bytes_per_pixel);
     const SubSurface src_part = CoveredRows(src, src_bytes_per_pixel, config.src_x0, config.src_y0,
                                             src_extent_x, src_extent_y, src_size);
+    // Lab (dotfiles-m0h.5): phase timing of slow blits.
+    using LabClock = std::chrono::steady_clock;
+    std::array<LabClock::time_point, 6> lab_t{};
+    lab_t[0] = LabClock::now();
 
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::SafeRead> tmp_buffer(
         memory_manager, src.Address() + src_part.offset, src_part.size, &impl->tmp_buffer);
 
+    lab_t[1] = LabClock::now();
     const size_t src_copy_size = src_extent_x * src_extent_y * src_bytes_per_pixel;
     const size_t dst_copy_size = dst_extent_x * dst_extent_y * dst_bytes_per_pixel;
 
@@ -331,6 +339,7 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                                   src.pitch, config.src_x0, src_part.origin_y, src_bytes_per_pixel);
     }
 
+    lab_t[2] = LabClock::now();
     // Conversion Phase
     if (no_passthrough) {
         if (src.format != dst.format || config.filter == Fermi2D::Filter::Bilinear) {
@@ -380,6 +389,7 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
         Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadWrite>
             tmp_buffer2(memory_manager, dst.Address() + dst_part.offset, dst_part.size,
                         &impl->tmp_buffer);
+        lab_t[3] = LabClock::now();
 
         if (dst.linear == Fermi2D::MemoryLayout::BlockLinear) {
             SwizzleSubrect(tmp_buffer2, impl->dst_buffer, dst_bytes_per_pixel, dst.width,
@@ -391,7 +401,19 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                                      dst.pitch, config.dst_x0, dst_part.origin_y,
                                      static_cast<size_t>(dst_bytes_per_pixel));
         }
+        lab_t[4] = LabClock::now();
     } // tmp_buffer2 writes the destination back here
+    lab_t[5] = LabClock::now();
+    const auto lab_ms = [&](int a, int b) {
+        return std::chrono::duration<double, std::milli>(lab_t[b] - lab_t[a]).count();
+    };
+    if (lab_ms(0, 5) > 1.0) {
+        LOG_INFO(HW_GPU,
+                 "LabBlit phases: src read {:.2f} (size {:#x}), unswizzle {:.2f}, dst read {:.2f} "
+                 "(size {:#x}), swizzle {:.2f}, dst write-back {:.2f} ms",
+                 lab_ms(0, 1), src_part.size, lab_ms(1, 2), lab_ms(2, 3), dst_part.size,
+                 lab_ms(3, 4), lab_ms(4, 5));
+    }
     impl->ReleaseLargeBuffers();
     return true;
 }
