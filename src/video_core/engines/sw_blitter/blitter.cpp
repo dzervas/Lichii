@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <chrono>
 #include <mutex>
 #include <set>
@@ -384,6 +385,41 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                        dst.depth, config.dst_x0, dst_part.origin_y, dst_extent_x, dst_extent_y,
                        dst.block_height, dst.block_depth, dst_extent_x * dst_bytes_per_pixel);
         lab_t[4] = LabClock::now();
+        // Lab (dotfiles-m0h.5): EDEN_LAB_BLIT_CHECK=1 compares with the whole-part path.
+        static const bool lab_check = std::getenv("EDEN_LAB_BLIT_CHECK") != nullptr;
+        if (lab_check) {
+            std::vector<u8> whole(dst_part.size);
+            memory_manager.ReadBlock(part_address, whole.data(), whole.size());
+            const std::vector<u8> before = whole;
+            SwizzleSubrect(whole, impl->dst_buffer, dst_bytes_per_pixel, dst.width,
+                           dst_part.height, dst.depth, config.dst_x0, dst_part.origin_y,
+                           dst_extent_x, dst_extent_y, dst.block_height, dst.block_depth,
+                           dst_extent_x * dst_bytes_per_pixel);
+            std::vector<bool> in_run(whole.size());
+            for_each_dst_run([&](u64 offset, u64 size) {
+                std::fill_n(in_run.begin() + offset, size, true);
+            });
+            size_t outside_changed = 0, inside_mismatch = 0, run_bytes = 0;
+            for (size_t i = 0; i < whole.size(); ++i) {
+                if (in_run[i]) {
+                    ++run_bytes;
+                    inside_mismatch += whole[i] != part[i];
+                } else {
+                    outside_changed += whole[i] != before[i];
+                }
+            }
+            static u64 lab_checks{};
+            static u64 lab_bad{};
+            ++lab_checks;
+            lab_bad += (outside_changed | inside_mismatch) != 0;
+            if (lab_bad != 0 || (lab_checks & 63) == 1) {
+                LOG_INFO(HW_GPU,
+                         "LabBlitCheck #{}: part {:#x} runs {:#x} bytes, changed outside {}, "
+                         "mismatch inside {}, bad so far {}",
+                         lab_checks, whole.size(), run_bytes, outside_changed, inside_mismatch,
+                         lab_bad);
+            }
+        }
         for_each_dst_run([&](u64 offset, u64 size) {
             memory_manager.WriteBlockCached(part_address + offset, part.data() + offset, size);
         });
