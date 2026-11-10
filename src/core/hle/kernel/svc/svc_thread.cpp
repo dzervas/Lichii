@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common/scope_exit.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
@@ -20,6 +21,35 @@
 
 namespace Kernel::Svc {
 namespace {
+
+// A yield that can't switch threads returns at once on hardware, and some games spin on it
+// (Luigi's Mansion 3's main thread makes ~4.7 million such yields per second). Each one is a
+// full JIT exit and kernel round trip that keeps a host core busy, which on hosts with few cores
+// or a shared power budget (Steam Deck: 4 cores, 15 W for CPU and GPU) slows the threads doing
+// the work. After a streak of them, give the host core away for a moment. Hardware makes no
+// timing promise for a yield, so the guest can't tell beyond reacting up to ~0.1 ms later.
+// Opt-in (Settings::values.yield_backoff): with fewer busy cores, hosts that scale clocks with load
+// run the remaining threads slower (Steam Deck: ~3.4 -> ~2.4 GHz, slightly more late frames).
+constexpr u32 NoOpYieldStreak = 64;
+constexpr auto NoOpYieldBackoff = std::chrono::microseconds{50};
+
+void BackOffAfterNoOpYields(KernelCore& kernel, bool no_op) {
+    if (!Settings::values.yield_backoff.GetValue()) {
+        return;
+    }
+    thread_local const KThread* streak_thread = nullptr;
+    thread_local u32 streak = 0;
+    const KThread* const thread = GetCurrentThreadPointer(kernel);
+    if (!no_op || thread != streak_thread) {
+        streak_thread = thread;
+        streak = 0;
+        return;
+    }
+    // In single-core mode one host thread runs every core, so sleeping would stall them all.
+    if (++streak >= NoOpYieldStreak && kernel.IsMulticore()) {
+        std::this_thread::sleep_for(NoOpYieldBackoff);
+    }
+}
 
 constexpr bool IsValidVirtualCoreId(int32_t core_id) {
     return (0 <= core_id && core_id < static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES));
@@ -186,7 +216,15 @@ void SleepThread(Core::System& system, s64 ns) {
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
         static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
-    } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
+        BackOffAfterNoOpYields(kernel, false);
+        return;
+    }
+
+    // The same check the yields start with: nothing was scheduled since this thread's last
+    // yield that found nothing to switch to.
+    const bool no_op =
+        GetCurrentThread(kernel).GetYieldScheduleCount() == GetCurrentProcess(kernel).GetScheduledCount();
+    if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
     } else if (yield_type == Svc::YieldType::WithCoreMigration) {
         KScheduler::YieldWithCoreMigration(kernel);
@@ -195,6 +233,7 @@ void SleepThread(Core::System& system, s64 ns) {
     } else {
         // Nintendo does nothing at all if an otherwise invalid value is passed.
     }
+    BackOffAfterNoOpYields(kernel, no_op);
 }
 
 /// Gets the thread context

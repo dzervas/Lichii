@@ -106,6 +106,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, cpu_ticks, tr("Custom CPU Ticks"),
            tr("Set a custom value of CPU ticks. Higher values can increase performance, but may "
               "cause deadlocks. A range of 77-21000 is recommended."));
+    INSERT(Settings, yield_backoff, tr("Back off spinning threads"),
+           tr("When a game thread keeps yielding without anything else to run, the emulator "
+              "briefly gives its host CPU core away instead of spinning.\n"
+              "Saves CPU time and power (about half the APU power in Luigi's Mansion 3 on the "
+              "Steam Deck), but on hosts that lower clocks with load it can cost some frame "
+              "pacing."));
     INSERT(Settings, cpu_backend, tr("Backend:"), QString());
 
     // Cpu Debug
