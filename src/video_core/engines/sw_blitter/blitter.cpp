@@ -170,6 +170,38 @@ SubSurface CoveredRows(const Fermi2D::Surface& surface, u32 bytes_per_pixel, s32
     return part.offset + part.size <= surface_size ? part : whole;
 }
 
+// The GOBs of a block linear part that a blit's rectangle covers in the part's first slice, as
+// byte runs from the part's start: per GOB column, the GOBs of the covered lines in each row of
+// blocks. Reading and writing back just these runs, rather than the whole part, matters when the
+// blocks are much taller or deeper than the blit: Luigi's Mansion 3 streams 128x64 tiles into
+// slice 0 of 128x64x16 volumes with 16-deep blocks, 64 KiB of data in 1 MiB, and the read and
+// write-back of the whole volume took ~1.5 ms per tile.
+template <typename Func>
+void ForEachCoveredGobRun(const Fermi2D::Surface& surface, u32 bytes_per_pixel, u32 x0,
+                          u32 origin_y, u32 extent_x, u32 extent_y, Func&& func) {
+    const u32 lines_shift = GOB_SIZE_Y_SHIFT + surface.block_height;
+    const u32 line_mask = (1U << lines_shift) - 1;
+    const u64 block_size = u64{GOB_SIZE} << (surface.block_height + surface.block_depth);
+    const u64 row_size =
+        u64{Common::AlignUpLog2(surface.width * bytes_per_pixel, GOB_SIZE_X_SHIFT)
+            >> GOB_SIZE_X_SHIFT} *
+        block_size;
+    const u64 first_column = (u64{x0} * bytes_per_pixel) >> GOB_SIZE_X_SHIFT;
+    const u64 last_column = ((u64{x0} + extent_x) * bytes_per_pixel - 1) >> GOB_SIZE_X_SHIFT;
+    const u32 end_line = origin_y + extent_y;
+    for (u32 line = origin_y; line < end_line;) {
+        const u32 row = line >> lines_shift;
+        const u32 row_end = (std::min)((row + 1) << lines_shift, end_line);
+        const u64 first_gob = (line & line_mask) >> GOB_SIZE_Y_SHIFT;
+        const u64 last_gob = ((row_end - 1) & line_mask) >> GOB_SIZE_Y_SHIFT;
+        for (u64 column = first_column; column <= last_column; ++column) {
+            func(row * row_size + column * block_size + (first_gob << GOB_SIZE_SHIFT),
+                 (last_gob - first_gob + 1) << GOB_SIZE_SHIFT);
+        }
+        line = row_end;
+    }
+}
+
 } // namespace
 
 struct SoftwareBlitEngine::BlitEngineImpl {
@@ -313,7 +345,38 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
     const size_t dst_size = get_surface_size(dst, dst_bytes_per_pixel);
     const SubSurface dst_part = CoveredRows(dst, dst_bytes_per_pixel, config.dst_x0, config.dst_y0,
                                             dst_extent_x, dst_extent_y, dst_size);
-    {
+    const auto for_each_dst_run = [&](auto&& func) {
+        ForEachCoveredGobRun(dst, dst_bytes_per_pixel, static_cast<u32>(config.dst_x0),
+                             dst_part.origin_y, dst_extent_x, dst_extent_y, func);
+    };
+    // SwizzleSubrect writes the first slice only, unless the rectangle runs past the bottom of the
+    // part and carries on into the next slices.
+    bool gob_runs = dst.linear == Fermi2D::MemoryLayout::BlockLinear && config.dst_x0 >= 0 &&
+                    config.dst_y0 >= 0 && dst_extent_x != 0 && dst_extent_y != 0 &&
+                    u64{dst_part.origin_y} + dst_extent_y <= dst_part.height;
+    if (gob_runs) {
+        for_each_dst_run([&](u64 offset, u64 size) { gob_runs &= offset + size <= dst_part.size; });
+    }
+    if (gob_runs) {
+        // Only the covered GOBs are read and written back (ForEachCoveredGobRun); the swizzle
+        // writes inside them only. Like the DMA engine's copies, the destination is read as it
+        // is in guest memory and written as cached writes: their invalidations are applied in
+        // one batch at the next FlushCaching (every draw, dispatch and blit), where per-page
+        // flushes and invalidations took the buffer and texture cache locks for each GOB run,
+        // contended by the CPU threads' write traps.
+        impl->tmp_buffer.resize_destructive(dst_part.size);
+        const std::span<u8> part{impl->tmp_buffer.data(), dst_part.size};
+        const GPUVAddr part_address = dst.Address() + dst_part.offset;
+        for_each_dst_run([&](u64 offset, u64 size) {
+            memory_manager.ReadBlockUnsafe(part_address + offset, part.data() + offset, size);
+        });
+        SwizzleSubrect(part, impl->dst_buffer, dst_bytes_per_pixel, dst.width, dst_part.height,
+                       dst.depth, config.dst_x0, dst_part.origin_y, dst_extent_x, dst_extent_y,
+                       dst.block_height, dst.block_depth, dst_extent_x * dst_bytes_per_pixel);
+        for_each_dst_run([&](u64 offset, u64 size) {
+            memory_manager.WriteBlockCached(part_address + offset, part.data() + offset, size);
+        });
+    } else {
         Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadWrite>
             tmp_buffer2(memory_manager, dst.Address() + dst_part.offset, dst_part.size,
                         &impl->tmp_buffer);
