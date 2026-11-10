@@ -650,8 +650,18 @@ public:
         return stored;
     }
 
+    /// EDEN_NX2_GPU_PROFILE: counts OnWrite per word (hashed), for WriteEpoch.
+    static inline bool count_writes{};
+    /// Changes when the GPU writes the word at device_address (or one sharing its hash slot).
+    [[nodiscard]] u32 WriteEpoch(u64 device_address) const {
+        return write_epochs[EpochSlot(device_address)].load(std::memory_order_acquire);
+    }
+
     /// A GPU write of value to the u32 at device_address.
     void OnWrite(u64 device_address, u32 value) {
+        if (count_writes) {
+            write_epochs[EpochSlot(device_address)].fetch_add(1, std::memory_order_release);
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -695,9 +705,14 @@ private:
         }
     }
 
+    static size_t EpochSlot(u64 device_address) {
+        return static_cast<size_t>(((device_address >> 2) * 0x9E3779B97F4A7C15ULL) >> 52);
+    }
+
     std::mutex mutex; ///< Held to fill, empty and latch slots
     std::array<Slot, MaxWaiters> slots{};
     std::atomic<size_t> count{};
+    std::array<std::atomic<u32>, 4096> write_epochs{};
 };
 
 } // namespace Tegra

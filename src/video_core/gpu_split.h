@@ -94,7 +94,38 @@ struct AcquireStats {
     std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drain_ns{};
 };
 inline AcquireStats g_acquire_stats;
-/// Whether g_acquire_stats counts, as of the split's last start.
+
+/// Why a semaphore acquire drained the split (AcquireDrains).
+enum class AcquireDrainPath : u32 {
+    NotMet,     ///< A greater-or-equal acquire the word and the queued releases don't meet
+    Operation,  ///< An equal or mask acquire
+    Settings,   ///< The split or the accuracy settings ask for it
+    Word,       ///< The word is unmapped or on a GPU-written page
+    Queued,     ///< A queued release to the word is unknown or doesn't meet it
+    Valve,      ///< A poll of a waiting acquire, once per 1 ms
+    SemExecute, ///< An Ampere SEM_EXECUTE acquire (always drains)
+    Count,
+};
+/// What the drain found: the word in memory met the acquire before it, the back wrote the word
+/// during it (a GPU release the front had not noted), something else changed it (the CPU), or
+/// the acquire is still unmet.
+enum class AcquireDrainOutcome : u32 { MetBefore, BackWrote, OtherWrote, NotMet, Count };
+
+/// EDEN_NX2_GPU_PROFILE: semaphore acquires that drained the split, by path and outcome, with
+/// the time spent in the drain, logged with g_acquire_stats (front thread only).
+struct AcquireDrains {
+    static constexpr size_t Cells = static_cast<size_t>(AcquireDrainPath::Count) *
+                                    static_cast<size_t>(AcquireDrainOutcome::Count);
+    std::array<u64, Cells> counts{};
+    std::array<u64, Cells> ns{};
+    std::array<u64, 8> sem_execute_operations{};
+    /// NotMet-path drains by device address (the busiest are logged).
+    std::unordered_map<u64, std::array<u64, static_cast<size_t>(AcquireDrainOutcome::Count)>>
+        not_met_words;
+};
+inline AcquireDrains g_acquire_drains;
+/// Whether g_acquire_stats counts (EDEN_NX2_GPU_PROFILE or EDEN_NX2_ACQUIRE_VERIFY), as of the
+/// split's last start.
 inline bool g_acquire_counting{};
 /// EDEN_NX2_ACQUIRE_VERIFY=1: acquires decided without a drain drain anyway and compare.
 inline bool g_acquire_verify{};
