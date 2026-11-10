@@ -5,9 +5,10 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace Common::PageProtectionStats {
 
@@ -28,9 +29,13 @@ inline std::array<std::array<Totals, 2>, 2> g_totals{};
 inline std::atomic<std::uint64_t> g_write_traps{};
 inline thread_local bool t_gpu_back_thread{};
 
-/// Distinct pages switched since the last report: with the totals, how often each one flips.
+/// Pages switched since the last report, with the steady_clock time of their last unprotect
+/// (0: not unprotected since it was last protected): how often each one flips, and how soon a
+/// page a CPU write unprotected is protected again.
 inline std::mutex g_pages_mutex;
-inline std::unordered_set<std::uint64_t> g_pages;
+inline std::unordered_map<std::uint64_t, std::uint64_t> g_pages;
+/// Protected pages by the time since their unprotect: under 20 ms, 100 ms, 1 s, later.
+inline std::array<std::uint64_t, 4> g_reprotect_ages{};
 
 inline void Add(bool cached, std::uint64_t first_page, std::uint64_t num_pages,
                 std::uint64_t protect_ns) {
@@ -38,9 +43,22 @@ inline void Add(bool cached, std::uint64_t first_page, std::uint64_t num_pages,
     totals.calls.fetch_add(1, std::memory_order_relaxed);
     totals.pages.fetch_add(num_pages, std::memory_order_relaxed);
     totals.protect_ns.fetch_add(protect_ns, std::memory_order_relaxed);
+    const auto now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
     std::scoped_lock lock{g_pages_mutex};
     for (std::uint64_t page = first_page; page != first_page + num_pages; ++page) {
-        g_pages.insert(page);
+        std::uint64_t& unprotected_at = g_pages[page];
+        if (!cached) {
+            unprotected_at = now;
+            continue;
+        }
+        if (unprotected_at != 0) {
+            const std::uint64_t age = now - unprotected_at;
+            ++g_reprotect_ages[age < 20'000'000 ? 0 : age < 100'000'000 ? 1 : age < 1'000'000'000 ? 2 : 3];
+            unprotected_at = 0;
+        }
     }
 }
 

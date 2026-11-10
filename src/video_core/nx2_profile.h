@@ -353,13 +353,24 @@ inline void ReportPageProtection(u64 window) {
         }
     }
     size_t distinct;
+    size_t still_unprotected{};
+    std::array<u64, 4> ages;
     {
         std::scoped_lock lock{Stats::g_pages_mutex};
         distinct = Stats::g_pages.size();
+        for (const auto& [page, unprotected_at] : Stats::g_pages) {
+            still_unprotected += unprotected_at != 0 ? 1 : 0;
+        }
         Stats::g_pages.clear();
+        ages = Stats::g_reprotect_ages;
+        Stats::g_reprotect_ages = {};
     }
-    line += fmt::format(" | {} distinct pages in {:.1f} s | write traps {:.0f}", distinct,
-                        static_cast<double>(window) / 1e9,
+    line += fmt::format(" | {} distinct pages in {:.1f} s, {} unprotected at its end | "
+                        "protected again after an unprotect in the window: {:.0f} within 20 ms, "
+                        "{:.0f} within 100 ms, {:.0f} within 1 s, {:.0f} later | write traps {:.0f}",
+                        distinct, static_cast<double>(window) / 1e9, still_unprotected,
+                        per_second(ages[0]), per_second(ages[1]), per_second(ages[2]),
+                        per_second(ages[3]),
                         per_second(Stats::g_write_traps.exchange(0, std::memory_order_relaxed)));
     LOG_INFO(HW_GPU, "Page protection per second:{}", line);
 }
