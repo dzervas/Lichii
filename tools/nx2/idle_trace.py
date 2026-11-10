@@ -9,7 +9,8 @@ marks.json "measure" and "end" when given), or the last S seconds both GPU threa
 (default 40). Printed: the back's idle time (ran out of work until it runs entries again) and
 its futex sleeps per frame, attributed to what the front was in at the time; latency
 distributions of the command list copy round trip and of the acquires the channels wait on; and
-event counts per frame.
+event counts per frame. With GPU timestamps in the trace (Gpu* events), the copies' submissions
+are broken down on the GPU's clock as well (gpu_list_breakdown).
 
 Front states, by priority: drain:<site> and waitfor:<site> (it waits for the back: the back runs
 its idle hook), poll:<reason> (only suspended channels, polled; reason: the suspensions, `list`
@@ -41,7 +42,9 @@ EVENTS = [
     "AcquireDrain", "AcquireSuspend", "AcquirePoll", "AcquireResume", "ListSuspend", "ListPoll",
     "ListResume", "Publish", "EarlyPublish", "SettleIdle", "HookRequest",
     "Present", "GuestSubmit",
+    "GpuSubmitStart", "GpuProducer", "GpuCopy", "GpuSubmitEnd",
 ]
+GPU_EVENTS = ("GpuSubmitStart", "GpuProducer", "GpuCopy", "GpuSubmitEnd")
 E = {name: index for index, name in enumerate(EVENTS)}
 POLL_RESULTS = ["met", "met-by-queued", "latched", "waiting", "drained-met", "drained-waiting"]
 # gpu_split.h DrainSite
@@ -379,6 +382,138 @@ def cause(label):
     return "(d) other: " + label
 
 
+def gpu_list_breakdown(threads, lists, begin, end, to_ns, frames):
+    """The command list copies' submissions on the GPU's clock: how long the GPU still ran earlier
+    submissions after the copy's was submitted (queue), the submission's own work before the
+    producer dispatch, the dispatch, the copy, and the end until the front saw it done.
+
+    The GPU clock is mapped to the steady clock by the lower envelope of (GPU start - CPU
+    vkQueueSubmit begin) per second: a submission can't start before it is submitted, and the
+    first ones after an idle GPU start within microseconds of it. Its error is that latency."""
+    gpu = collections.defaultdict(dict)  # tick -> event -> GPU ns
+    submit_begin, submit_end = {}, {}
+    for thread in threads.values():
+        for t, c, a in zip(thread.ticks, thread.codes, thread.args):
+            name = EVENTS[c & 0xFFFF] if c & 0xFFFF < len(EVENTS) else None
+            if name in GPU_EVENTS:
+                gpu[a][name] = t
+            elif name == "WorkerSubmitBegin":
+                submit_begin[a] = to_ns(t)
+            elif name == "WorkerSubmitEnd":
+                submit_end[a] = to_ns(t)
+    if not gpu:
+        return None
+    window_ns = 1e9
+    envelope = {}
+    for tick, events in gpu.items():
+        if "GpuSubmitStart" in events and tick in submit_begin:
+            key = int(submit_begin[tick] // window_ns)
+            delta = events["GpuSubmitStart"] - submit_begin[tick]
+            envelope[key] = min(envelope.get(key, delta), delta)
+    keys = sorted(envelope)
+    if not keys:
+        return None
+
+    def offset(cpu_ns):
+        """GPU ns - steady ns at cpu_ns, linear between the windows' envelopes."""
+        x = cpu_ns / window_ns - 0.5
+        i = bisect.bisect_right(keys, x) - 1
+        if i < 0:
+            return envelope[keys[0]]
+        if i + 1 >= len(keys):
+            return envelope[keys[-1]]
+        k0, k1 = keys[i], keys[i + 1]
+        w = (x - k0) / (k1 - k0)
+        return envelope[k0] * (1 - w) + envelope[k1] * w
+
+    ticks_sorted = sorted(gpu)
+    ends = [gpu[t].get("GpuSubmitEnd") for t in ticks_sorted]
+    # The latest end of every submission up to each one (the queue's backlog).
+    backlog_end, latest = [], None
+    for value in ends:
+        if value is not None:
+            latest = value if latest is None else max(latest, value)
+        backlog_end.append(latest)
+    index_of = {t: i for i, t in enumerate(ticks_sorted)}
+    lo_ns, hi_ns = to_ns(begin), to_ns(end)
+    busy = []
+    for t in ticks_sorted:
+        events = gpu[t]
+        if "GpuSubmitStart" in events and "GpuSubmitEnd" in events and t in submit_begin and \
+                lo_ns <= submit_begin[t] < hi_ns:
+            busy.append((events["GpuSubmitStart"], events["GpuSubmitEnd"]))
+    series = collections.defaultdict(list)
+    totals = collections.Counter()
+    depth = []
+    violations = checked = 0
+    for entry in lists:
+        if not begin <= entry["suspend"] < end:
+            continue
+        tick = entry["tick"]
+        events = gpu.get(tick)
+        if not events or "GpuSubmitEnd" not in events or tick not in submit_end:
+            series["(no GPU timestamps)"].append(0)
+            continue
+        off = offset(submit_end[tick])
+        submitted = submit_end[tick] + off  # on the GPU clock
+        i = index_of[tick]
+        previous_end = backlog_end[i - 1] if i > 0 else None
+        own_begin = max(submitted, previous_end) if previous_end is not None else submitted
+        gpu_end = events["GpuSubmitEnd"]
+        parts = {}
+        parts["queue: earlier submissions still running"] = max(0.0, own_begin - submitted)
+        producer, copy = events.get("GpuProducer"), events.get("GpuCopy")
+        if producer is not None:
+            parts["own submission: work before the producer"] = max(0.0, producer - own_begin)
+            if copy is not None:
+                parts["producer dispatch (to before the copy)"] = max(0.0, copy - producer)
+        elif copy is not None:
+            parts["own submission: work before the copy (no producer mark)"] = \
+                max(0.0, copy - own_begin)
+        if copy is not None:
+            parts["copy (to the submission's end)"] = max(0.0, gpu_end - copy)
+        else:
+            parts["own submission (no marks)"] = max(0.0, gpu_end - own_begin)
+        parts["submitted -> GPU end"] = gpu_end - submitted
+        if entry["first_true"] is not None:
+            seen = to_ns(entry["first_true"]) + off
+            checked += 1
+            if seen < gpu_end:
+                violations += 1
+            parts["GPU end -> done seen"] = seen - gpu_end
+            parts["submitted -> done seen"] = seen - submitted
+        parts["own submission GPU start (top of pipe) - submitted"] = \
+            events.get("GpuSubmitStart", submitted) - submitted
+        for name, value in parts.items():
+            series[name].append(value / 1e3)
+            totals[name] += value
+        # Earlier submissions not done yet when this one was submitted.
+        n = 0
+        j = i - 1
+        while j >= 0 and ends[j] is not None and ends[j] > submitted:
+            n += 1
+            j -= 1
+        depth.append(n)
+    result = {"windows": len(keys), "seen_before_end": violations, "checked": checked,
+              "parts_us": {k: percentiles(v) for k, v in series.items()},
+              "parts_ms_per_frame": {k: v / 1e6 / max(frames, 1) for k, v in totals.items()},
+              "queue_depth": percentiles(depth).replace(" us", "")}
+    if busy:
+        busy.sort()
+        covered, cursor = 0, None
+        for a, b in busy:
+            if cursor is None or a > cursor:
+                covered += b - a
+                cursor = b
+            elif b > cursor:
+                covered += b - cursor
+                cursor = b
+        span = busy[-1][1] - busy[0][0]
+        result["gpu_busy"] = covered / span if span > 0 else 0.0
+        result["submissions_per_frame"] = len(busy) / max(frames, 1)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("trace")
@@ -504,6 +639,18 @@ def main():
     for name, values in series.items():
         print(f"  {name:48} {percentiles(values)}")
     result["list_copy_us"] = {k: percentiles(v) for k, v in series.items()}
+
+    breakdown = gpu_list_breakdown(threads, lists, begin, end, to_ns, frames)
+    if breakdown is not None:
+        print(f"\ncommand list copies on the GPU clock ({breakdown['windows']} 1 s windows; "
+              f"done seen before the GPU end {breakdown['seen_before_end']}/"
+              f"{breakdown['checked']}; GPU busy {breakdown.get('gpu_busy', 0) * 100:.0f}% "
+              f"(submission start to end), {breakdown.get('submissions_per_frame', 0):.0f} "
+              f"submissions/frame):")
+        for name, text in breakdown["parts_us"].items():
+            print(f"  {name:58} {breakdown['parts_ms_per_frame'].get(name, 0):6.3f} ms/frame  {text}")
+        print(f"  earlier submissions not done when submitted: {breakdown['queue_depth']}")
+        result["gpu_list_copy"] = breakdown
 
     # Acquires the channels waited on.
     print("\nacquire waits by class (per frame):")

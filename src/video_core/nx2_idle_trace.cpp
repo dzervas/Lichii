@@ -26,7 +26,7 @@ namespace {
 
 // File layout, little endian: blocks of a 16-byte header {u32 magic, u32 thread, u32 count,
 // u32 reserved} and `count` 16-byte records. Event records: {u64 ticks, u32 arg, u16 event,
-// u16 aux}, ticks from Nx2Profile::Ticks. A thread's first block has count 0 and its name (16
+// u16 aux}, ticks from Nx2Profile::Ticks (GPU ns for the Gpu* events). A thread's first block has count 0 and its name (16
 // bytes) instead. Calibration blocks (thread CalibrationThread) hold one {u64 ticks, u64 steady
 // clock ns} pair.
 constexpr u32 Magic = 0x544c4449; // "IDLT"
@@ -199,6 +199,10 @@ void ReadSwitch() {
 }
 
 void Write(Event event, u16 aux, u32 arg) {
+    WriteAt(Nx2Profile::Ticks(), event, aux, arg);
+}
+
+void WriteAt(u64 time, Event event, u16 aux, u32 arg) {
     auto& own = t_chunk;
     if (own.chunk == nullptr) {
         own.index = g_writer.Register();
@@ -206,8 +210,7 @@ void Write(Event event, u16 aux, u32 arg) {
     } else if (own.chunk->count == ChunkRecords) {
         own.chunk = g_writer.Swap(std::move(own.chunk), own.index);
     }
-    own.chunk->records[own.chunk->count++] =
-        Record{Nx2Profile::Ticks(), arg, static_cast<u16>(event), aux};
+    own.chunk->records[own.chunk->count++] = Record{time, arg, static_cast<u16>(event), aux};
 }
 
 } // namespace VideoCommon::IdleTrace
