@@ -202,6 +202,28 @@ public:
         }
     }
 
+    /// A write to the 3D constant buffer registers (size, address, offset, data: 0x8e0-0x8f3)
+    /// with Writes::Noted, as MacroWrite (`direct`) or Method sends it. NVN sends ~6 in a row, one
+    /// per entry, half of all entries: the ones in a row go in one entry
+    /// (Maxwell3D::CallConstBufferWrites), sent before anything else is sent, waited for or
+    /// noted. What NoteWrite and NoteAnyWrite note meanwhile counts from the end of that entry.
+    /// `maxwell3d` is a Maxwell3D.
+    void ConstBufferWrite(Tegra::Engines::EngineInterface* maxwell3d, u32 method, u32 argument,
+                          bool direct, bool is_last) {
+        if (cb_count == cb_writes.size() || (cb_count != 0 && maxwell3d != front_engine)) {
+            SendConstBufferWrites();
+        }
+        if (cb_count == 0) {
+            SelectEngine(maxwell3d);
+        }
+        cb_writes[cb_count++] = u64{method & 0xffff} | (direct ? ConstBufferDirect : 0) |
+                                (is_last ? ConstBufferLast : 0) | (u64{argument} << 32);
+    }
+    /// ConstBufferWrite's encoding: bits 0-15 method, 32-63 argument, and these flags.
+    static constexpr u64 ConstBufferDirect = u64{1} << 16;
+    static constexpr u64 ConstBufferLast = u64{1} << 17;
+    static constexpr u32 MaxConstBufferWrites = 64;
+
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
 
@@ -266,6 +288,7 @@ public:
     /// runs its idle hook (the deferred submit) and sleeps now instead of spinning for more, as it
     /// did when every poll drained (Drain asks for the hook), but without the wait.
     void SettleIdleBack() {
+        SendOpenWrites();
         if (hook_requested.load(std::memory_order_relaxed) || BackQuiet() ||
             consumed.load(std::memory_order_acquire) != write_position) {
             return;
@@ -278,7 +301,8 @@ public:
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
     /// The ring position after the entries sent so far, for WaitUntil.
-    [[nodiscard]] u64 Position() const {
+    [[nodiscard]] u64 Position() {
+        SendOpenWrites();
         return write_position;
     }
     /// Waits until the back executed the entries sent before `position`. Returns whether any of
@@ -289,6 +313,7 @@ public:
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
+        SendOpenWrites();
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
@@ -298,6 +323,7 @@ public:
     /// bit; semaphore acquires drain, or note it when a release still queued meets them): the
     /// guest's GPU work before it is complete before the commands after it are fetched.
     void NoteSync() {
+        SendOpenWrites();
         last_sync_position = write_position;
         synced_writer_position = last_writer_position;
     }
@@ -324,6 +350,10 @@ public:
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
     /// The entry just sent may write guest memory anywhere.
     void NoteAnyWrite() {
+        if (cb_count != 0) {
+            cb_any_write = true;
+            return;
+        }
         last_any_write = write_position;
     }
     /// Waits until the back executed every entry sent so far that can write guest memory in
@@ -341,6 +371,7 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        ConstBufferWrites, ///< Bits 8-31 count; then ConstBufferWrite's writes, a word each
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -381,8 +412,17 @@ private:
                                  static_cast<size_t>(payload[function_words])});
     }
 
+    /// Sends the open ConstBufferWrites entry, if any.
+    void SendOpenWrites() {
+        if (cb_count != 0) {
+            SendConstBufferWrites();
+        }
+    }
+    void SendConstBufferWrites();
+
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        SendOpenWrites();
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -458,6 +498,17 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// The writes ConstBufferWrite holds for the open entry, and what was noted meanwhile.
+    std::array<u64, MaxConstBufferWrites> cb_writes{};
+    u32 cb_count{};
+    struct NotedWrite {
+        const Tegra::MemoryManager* memory;
+        GPUVAddr address;
+        u64 size;
+    };
+    std::array<NotedWrite, MaxConstBufferWrites> cb_notes{};
+    u32 cb_note_count{};
+    bool cb_any_write{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
