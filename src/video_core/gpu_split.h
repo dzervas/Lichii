@@ -479,8 +479,10 @@ private:
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Front side, in its own 128-byte blocks (x86 prefetchers pull 64-byte lines in pairs): the
+    // back writes back_engine on every engine entry, and next to these fields that made the
+    // front miss the cache on almost every ring write (found by SerkiGohan).
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};
@@ -514,8 +516,8 @@ private:
     u32 cb_note_count{};
     bool cb_any_write{};
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Back side, in its own block.
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
 
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
     /// idle hook ran, cleared before it executes entries.
@@ -529,7 +531,8 @@ private:
     static inline thread_local bool on_gpu_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
-    alignas(64) std::atomic<bool> hook_requested{};
+    // The front writes hook_requested (RequestIdleHook): not in the back's block.
+    alignas(128) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
     std::atomic<bool> back_quiet{true};
 
