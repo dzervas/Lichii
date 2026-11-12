@@ -514,3 +514,20 @@ TEST_CASE("Fast draw keeps vertex attribute formats light while their type class
     CHECK_FALSE(light(format(3, 0x20, Size::Size_R32, Type::SInt, true)));
     FastDraw::g_dynamic_vertex_input.store(previous);
 }
+
+TEST_CASE("Fast draw memory serial moves on every break but a changed register", "[fast_draw]") {
+    FastDrawFixture f;
+    const auto moves = [&](auto&& change) {
+        const u64 serial = FastDraw::Serial();
+        const u64 memory = FastDraw::MemorySerial();
+        change();
+        REQUIRE(FastDraw::Serial() != serial);
+        return FastDraw::MemorySerial() != memory;
+    };
+    constexpr u32 blend = MAXWELL3D_REG_INDEX(blend.enable[0]);
+    CHECK_FALSE(moves([&] { f.Write(blend, f.Reg(blend) ^ 1); }));
+    CHECK(moves([&] { f.Write(MAXWELL3D_REG_INDEX(clear_surface), 0x3c); }));
+    CHECK(moves([&] { FastDraw::Break(FastDraw::Reason::Invalidation); }));
+    CHECK(moves([&] { FastDraw::Break(FastDraw::Reason::DeltaOverflow); }));
+    CHECK(moves([&] { FastDraw::Break(FastDraw::Reason::Fence); }));
+}

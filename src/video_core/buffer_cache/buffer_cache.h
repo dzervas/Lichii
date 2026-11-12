@@ -2502,7 +2502,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     bool verify_kept = false;
     if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
         if (UniformRangeKept(stage, index, device_addr, size)) {
-            if (ubo_keep_verify) {
+            // A keep RebindKeptUniform turns down (another size, after a pipeline change) binds
+            // as without one: nothing to verify.
+            if (ubo_keep_verify &&
+                VideoCommon::KeptUniformBindable(runtime, stage, index, device_addr, size)) {
                 ++uniform_keep.verified;
                 verify_kept = true;
                 if (!VideoCommon::KeptUniformHolds<Runtime>(device_memory, stage, index,

@@ -84,6 +84,7 @@ enum class BindDelta : u8 {
     UniformIds,       ///< UNIFORM_IDS: a uniform buffer bound again keeps its resolved buffer
     AttributeFormats, ///< ATTRIBUTES: attribute format writes that keep the type class
     TextureRebind,    ///< TEXTURES: delta draws after texture handle writes (RebindTextures)
+    UniformKeeps,     ///< KEEPS: uniform keeps on full draws after register changes only
     Count,
 };
 
@@ -91,7 +92,8 @@ enum class BindDelta : u8 {
     static const std::array<bool, static_cast<size_t>(BindDelta::Count)> on = [] {
         static constexpr std::array<const char*, static_cast<size_t>(BindDelta::Count)> names{
             "EDEN_NX2_BIND_DELTA_UPSTREAM", "EDEN_NX2_BIND_DELTA_UNIFORM_IDS",
-            "EDEN_NX2_BIND_DELTA_ATTRIBUTES", "EDEN_NX2_BIND_DELTA_TEXTURES"};
+            "EDEN_NX2_BIND_DELTA_ATTRIBUTES", "EDEN_NX2_BIND_DELTA_TEXTURES",
+            "EDEN_NX2_BIND_DELTA_KEEPS"};
         const auto off = [](const char* name) {
             const char* const value = std::getenv(name);
             return value != nullptr && value[0] == '0';
@@ -191,12 +193,19 @@ inline void NoteBreak(Reason reason, u32 method) {
 } // namespace Stats
 
 inline std::atomic<u64> g_serial{1};
+/// Breaks for any reason but a changed register: those can write memory, delete buffers or
+/// lose constant buffer writes (overflow). A full draw after register changes only keeps
+/// uniform buffers as a delta draw does while it stays.
+inline std::atomic<u64> g_memory_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
 
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
+        if (reason != Reason::Register) {
+            g_memory_serial.fetch_add(1, std::memory_order_relaxed);
+        }
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
         if (Stats::g_enabled) [[unlikely]] {
             Stats::NoteBreak(reason, method);
@@ -206,6 +215,10 @@ inline void Break(Reason reason, u32 method = 0) {
 
 inline u64 Serial() {
     return g_serial.load(std::memory_order_relaxed);
+}
+
+inline u64 MemorySerial() {
+    return g_memory_serial.load(std::memory_order_relaxed);
 }
 
 /// The device memory a GPU range maps to. A write through another GPU address that maps the

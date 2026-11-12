@@ -392,6 +392,7 @@ private:
         GraphicsPipeline* pipeline{};
         const Tegra::Engines::Maxwell3D* maxwell3d{};
         u64 serial{};
+        u64 memory_serial{};
         u64 map_serial{};
         u64 tick{};
         u64 render_pass{};
@@ -455,11 +456,14 @@ private:
     /// map_serial as read then), and the images it samples need no preparing.
     bool DeltaStillHolds(u64 serial, u64 map_serial);
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
-                          u64 map_serial);
+                          u64 memory_serial, u64 map_serial);
     void ReportFastDraws();
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     bool taken_rebind{}; ///< Its texture handles were written or bound: RebindTextures
+    /// The previous draw a full draw can keep uniform buffers after (only registers changed
+    /// since, in the same command buffer), or none.
+    std::optional<ReusableDraw> keep_draw;
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
                Maxwell::MaxShaderStage>

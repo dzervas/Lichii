@@ -479,6 +479,13 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     candidate_pipeline = draw.pipeline;
     draw_outcome = DrawStats::Delta;
     taken_rebind = false;
+    keep_draw.reset();
+    if (draw.pipeline != nullptr && draw.maxwell3d == maxwell3d &&
+        draw.memory_serial == FastDraw::MemorySerial() &&
+        draw.map_serial == gpu_memory->MapSerial() && draw.tick == scheduler.CurrentTick() &&
+        FastDraw::BindDeltaOn(FastDraw::BindDelta::UniformKeeps)) {
+        keep_draw = draw;
+    }
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
         draw_outcome = static_cast<u8>(DrawStats::Early + static_cast<size_t>(reason));
@@ -632,7 +639,8 @@ bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
 }
 
 void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
-                                        bool is_indirect, u64 serial, u64 map_serial) {
+                                        bool is_indirect, u64 serial, u64 memory_serial,
+                                        u64 map_serial) {
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto topology = draw_state.topology;
     const auto ineligible = [&]() -> std::optional<Ineligible> {
@@ -660,6 +668,7 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
         .pipeline = pipeline,
         .maxwell3d = maxwell3d,
         .serial = serial,
+        .memory_serial = memory_serial,
         .map_serial = map_serial,
         .tick = scheduler.CurrentTick(),
         .render_pass = scheduler.RenderPassSerial(),
@@ -1291,6 +1300,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // What the next draw's TakeReusableDraw compares with, read once the caches are locked: a
     // break from here on, this draw's own resolve included, ends the delta chain.
     const u64 draw_serial = FastDraw::Serial();
+    const u64 draw_memory_serial = FastDraw::MemorySerial();
     const u64 draw_map_serial = gpu_memory->MapSerial();
     if (FastDraw::Stats::g_enabled) [[unlikely]] {
         // The breaks this draw's serial was compared after (TakeReusableDraw and DeltaStillHolds).
@@ -1322,7 +1332,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         draw_outcome = static_cast<u8>(
             (verify_pipeline ? DrawStats::Verified : DrawStats::Delta) + (taken_rebind ? 2 : 0));
     }
-    buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
+    // A full draw after register changes only keeps uniform buffers as a delta draw does: nothing
+    // but registers changed since the previous draw (rechecked now that the caches are locked),
+    // and taken_delta holds every constant buffer bind and write since.
+    const bool keep_uniforms = fast_draw_on && keep_draw &&
+                               keep_draw->memory_serial == draw_memory_serial &&
+                               keep_draw->map_serial == draw_map_serial &&
+                               keep_draw->tick == scheduler.CurrentTick();
+    buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta || keep_uniforms ? &taken_delta
+                                                                                : nullptr);
     if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
             report_failure("configure failed");
@@ -1449,7 +1467,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
     if (fast_draw_on) {
-        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
+        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_memory_serial,
+                         draw_map_serial);
         const size_t index = static_cast<size_t>(path);
         const u64 prepare_ns = Profile::Now() - fast_draw_start;
         fast_draw_stats.prepare_ns[index] += prepare_ns;
