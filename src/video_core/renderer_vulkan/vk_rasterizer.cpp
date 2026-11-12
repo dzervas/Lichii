@@ -3538,9 +3538,11 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
         if (Common::MemCensus::g_enabled) [[unlikely]] {
+            // Per page, as CPU write traps: thousands of small writes a frame.
             Common::MemCensus::Note(Common::MemCensus::Event::CpuWrite,
                                     static_cast<u8>(Common::MemCensus::CpuWrite::InlineEngine),
-                                    *cpu_addr, copy_size, copy_size, 0, uploaded ? 1 : 0);
+                                    *cpu_addr & ~DAddr{0xfff}, 0x1000, copy_size, 0,
+                                    uploaded ? 1 : 0);
         }
         if (!uploaded && !defer) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);

@@ -33,7 +33,8 @@ enum class Event : u8 {
 enum class CpuWrite : u8 {
     Trap,       ///< Each write that reached Memory's rasterizer write path
     Invalidate,   ///< ...that called the GPU caches' OnCPUWrite (ns; aux: kept collected)
-    InlineEngine, ///< Inline-to-memory engine data written by the GPU thread (aux: uploaded)
+    InlineEngine, ///< Inline-to-memory engine data written by the GPU thread, per page (aux:
+                  ///< uploaded into GPU-written memory)
 };
 
 enum class Protection : u8 {
