@@ -21,6 +21,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/mem_census.h"
 #include "common/paged_scalar.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -651,11 +652,28 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
     u64 cache_begin = 0;
     u64 uncache_bytes = 0;
     u64 cache_bytes = 0;
-    const auto MarkRegionCaching = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
-
     std::atomic_thread_fence(std::memory_order_acquire);
     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
     size_t page = addr >> Memory::YUZU_PAGEBITS;
+    // A run of pages always ends before `page`.
+    const auto MarkRegionCaching = [&](Memory::Memory* memory, VAddr vaddr, size_t run_bytes,
+                                       bool cached) {
+        if (!Common::MemCensus::g_enabled) [[likely]] {
+            DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching(memory, vaddr, run_bytes,
+                                                                          cached);
+            return;
+        }
+        const u64 start = Common::MemCensus::Now();
+        DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching(memory, vaddr, run_bytes,
+                                                                      cached);
+        const auto protection = delta == 0 ? Common::MemCensus::Protection::Deferred
+                                           : Common::MemCensus::Protection::Direct;
+        Common::MemCensus::Note(cached ? Common::MemCensus::Event::Protect
+                                       : Common::MemCensus::Event::Unprotect,
+                                static_cast<u8>(protection),
+                                (DAddr{page} << Memory::YUZU_PAGEBITS) - run_bytes, run_bytes,
+                                run_bytes, Common::MemCensus::Now() - start);
+    };
     auto [asid, base_vaddress] = ExtractCPUBacking(page);
     auto* memory_device_inter =
         asid.id < registered_processes.size() ? registered_processes[asid.id] : nullptr;

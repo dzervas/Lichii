@@ -25,6 +25,7 @@
 #include "common/div_ceil.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
+#include "common/mem_census.h"
 #include "common/page_protection_stats.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
@@ -959,6 +960,11 @@ struct Memory::Impl {
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                Common::MemCensus::Note(Common::MemCensus::Event::CpuWrite,
+                                        static_cast<u8>(Common::MemCensus::CpuWrite::Trap),
+                                        address & ~YUZU_PAGEMASK, YUZU_PAGESIZE, size);
+            }
             // Performance note:
             // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
             // It is often the case the games like to access wildly different addresses. Hence why I propose
@@ -968,9 +974,18 @@ struct Memory::Impl {
                     Common::PageProtectionStats::g_write_traps.fetch_add(
                         1, std::memory_order_relaxed);
                 }
+                const u64 census_start =
+                    Common::MemCensus::g_enabled ? Common::MemCensus::Now() : 0;
                 // Short circuit the need to check for address/size
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);
+                if (Common::MemCensus::g_enabled) [[unlikely]] {
+                    Common::MemCensus::Note(
+                        Common::MemCensus::Event::CpuWrite,
+                        static_cast<u8>(Common::MemCensus::CpuWrite::Invalidate),
+                        address & ~YUZU_PAGEMASK, YUZU_PAGESIZE, size,
+                        Common::MemCensus::Now() - census_start, do_collection ? 1 : 0);
+                }
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {
