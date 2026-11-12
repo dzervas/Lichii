@@ -512,10 +512,12 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 }
             }
         };
+        const Common::MemCensus::WaitTimer census_wait;
         if (staged.empty()) {
             if constexpr (has_mapped) {
                 runtime.FinishForHostRead();
             }
+            census_wait.Done(ranges.front().first, ranges.front().second);
             land(nullptr);
         } else {
             auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
@@ -530,6 +532,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             } else {
                 runtime.Finish();
             }
+            census_wait.Done(ranges.front().first, ranges.front().second);
             land(&staging);
         }
     }
@@ -808,6 +811,11 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
             runtime.WaitForHostRead(*tick);
             waited = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
             VideoCore::AsyncReadback::CountHostWait(waited);
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                Common::MemCensus::Note(Common::MemCensus::Event::ReadWait,
+                                        static_cast<u8>(Common::MemCensus::t_reason), device_addr,
+                                        size, size, waited);
+            }
             lock.lock();
         }
         WriteReadDownloads(*tick, VideoCore::AsyncReadback::t_reading
@@ -1106,6 +1114,9 @@ void BufferCache<P>::WriteReadDownloads(u64 tick, VideoCore::AsyncReadback::Land
     if constexpr (!IS_OPENGL) {
         while (!read_downloads.empty() && read_downloads.front().tick <= tick) {
             ReadDownload& download = read_downloads.front();
+            const Common::MemCensus::ReasonScope census_reason{
+                download.early ? Common::MemCensus::Reason::EarlyRead
+                               : Common::MemCensus::Reason::GuestRead};
             // Guest memory this writes, and what its read check reads. The guest CPU writes
             // collected from now on store their bytes once this download is in guest memory.
             DAddr landing_begin = ~DAddr{0};
@@ -1432,6 +1443,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     } while (channel_state->has_deleted_buffers);
     auto& src_buffer = slot_buffers[buffer_a];
     auto& dest_buffer = slot_buffers[buffer_b];
+    Common::MemCensus::SetBind(Common::MemCensus::Bind::Dma);
     SynchronizeBuffer(src_buffer, *cpu_src_address, static_cast<u32>(amount));
     SynchronizeBuffer(dest_buffer, *cpu_dest_address, static_cast<u32>(amount));
     std::array copies{BufferCopy{
@@ -1464,6 +1476,11 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     src_buffer.MarkUsage(copy.src_offset, copy.size);
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::GpuWrite,
+                                static_cast<u8>(Common::MemCensus::Bind::Dma), *cpu_dest_address,
+                                amount, amount, 0, has_new_downloads ? 1 : 0);
+    }
     if (has_new_downloads) {
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         NoteUniformWrite(*cpu_dest_address, amount);
@@ -1499,6 +1516,11 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
     runtime.ClearBuffer(dest_buffer, offset, size, value);
     dest_buffer.MarkUsage(offset, size);
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::GpuWrite,
+                                static_cast<u8>(Common::MemCensus::Bind::DmaClear),
+                                *cpu_dst_address, size, size);
+    }
     return true;
 }
 
@@ -1518,6 +1540,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
     DAddr device_addr, u32 size, ObtainBufferSynchronize sync_info, ObtainBufferOperation post_op) {
     const BufferId buffer_id = FindBuffer(device_addr, size, false);
     Buffer& buffer = slot_buffers[buffer_id];
+    Common::MemCensus::SetBind(Common::MemCensus::Bind::Obtain);
 
     // synchronize op
     switch (sync_info) {
@@ -2115,6 +2138,11 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::Download,
+                                static_cast<u8>(Common::MemCensus::t_reason), device_addr, size,
+                                size);
+    }
     // EDEN_NX2_READ_CHECK: newer GPU bytes than an early download brought before.
     if (!early_landed.empty()) {
         ForgetEarlyLanded(device_addr, size);
@@ -2145,6 +2173,7 @@ void BufferCache<P>::PopAsyncBuffers() {
         async_buffers.pop_front();
         return;
     }
+    const Common::MemCensus::ReasonScope census_reason{Common::MemCensus::Reason::Flush};
     auto& downloads = pending_downloads.front();
     auto& ranges = pending_download_ranges.front();
     auto& async_buffer = async_buffers.front();
@@ -2236,6 +2265,11 @@ void BufferCache<P>::BindHostIndexBuffer() {
                 device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
                                               guest_uint8_indices.data(), guest_size);
                 indices = guest_uint8_indices;
+                if (Common::MemCensus::g_enabled) [[unlikely]] {
+                    Common::MemCensus::NoteUpload(
+                        Common::MemCensus::Bind::Index, channel_state->index_buffer.device_addr,
+                        guest_size, guest_size, Common::MemCensus::Hash(indices, 0));
+                }
             }
             if (!indices.empty()) {
                 runtime.BindHostUint8IndexBuffer(indices);
@@ -2388,6 +2422,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
         HostBindings<typename P::Buffer> host_bindings;
         bool any_valid{false};
         auto& flags = maxwell3d->dirty.flags;
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::Vertex);
         for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
             const Binding& binding = channel_state->vertex_buffers[index];
             Buffer& buffer = slot_buffers[binding.buffer_id];
@@ -2430,6 +2465,7 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
     const auto bind_buffer = [this](const Binding& binding) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::Indirect);
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
     };
     if (current_draw_indirect->include_count) {
@@ -2540,6 +2576,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 .dst_offset = buffer.Offset(device_addr),
                 .size = upload_size,
             }};
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                CensusUpload(Common::MemCensus::Bind::NativeBank, buffer, device_addr, upload_size,
+                             copies, upload_size);
+            }
             UploadMemory(buffer, upload_size, upload_size, copies);
         }
     }
@@ -2585,6 +2625,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
         }
+        if (Common::MemCensus::g_enabled) [[unlikely]] {
+            const std::array copies{BufferCopy{.src_offset = 0, .dst_offset = offset, .size = size}};
+            CensusUpload(Common::MemCensus::Bind::UniformStream, buffer, device_addr, size, copies,
+                         size);
+        }
         return;
     }
     // Classic cached path
@@ -2593,6 +2638,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                   "Uniform keep verify: stage {} slot {} at {:#x}+{:#x} is no longer streamed",
                   stage, index, device_addr, size);
     }
+    Common::MemCensus::SetBind(Common::MemCensus::Bind::Uniform);
     if (SynchronizeBuffer(buffer, device_addr, size)) {
         ++channel_state->uniform_cache_hits[0];
     }
@@ -2720,6 +2766,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::StorageGraphics);
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
             return;
         }
@@ -2750,6 +2797,7 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
         const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::TextureBuffer);
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const bool is_written = ((channel_state->written_texture_buffers[stage] >> index) & 1) != 0;
@@ -2791,6 +2839,7 @@ void BufferCache<P>::BindHostTransformFeedbackBuffers() {
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
             size = binding.size;
+            Common::MemCensus::SetBind(Common::MemCensus::Bind::TransformFeedback);
             SynchronizeBuffer(buffer, binding.device_addr, size);
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
             offset = buffer.Offset(binding.device_addr);
@@ -2844,10 +2893,17 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
+                if (Common::MemCensus::g_enabled) [[unlikely]] {
+                    const std::array copies{
+                        BufferCopy{.src_offset = 0, .dst_offset = offset, .size = size}};
+                    CensusUpload(Common::MemCensus::Bind::UniformStreamCompute, buffer,
+                                 binding.device_addr, size, copies, size);
+                }
                 return;
             }
         }
 
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::UniformCompute);
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         buffer.MarkUsage(offset, size);
@@ -2875,6 +2931,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
         const u64 write_mark_limit =
             native ? u64{channel_state->compute_storage_write_marks[index]} : ~u64{0};
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::StorageCompute);
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
@@ -2907,6 +2964,7 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
         const TextureBufferBinding& binding = channel_state->compute_texture_buffers[index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
+        Common::MemCensus::SetBind(Common::MemCensus::Bind::TextureBufferCompute);
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const bool is_written =
@@ -3199,6 +3257,11 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::GpuWrite,
+                                static_cast<u8>(Common::MemCensus::t_bind), device_addr, size,
+                                size);
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -3300,6 +3363,11 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             };
             buffer.MarkUsage(copy.src_offset, copy.size);
             runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                Common::MemCensus::Note(Common::MemCensus::Event::Download,
+                                        static_cast<u8>(Common::MemCensus::Reason::CommandList),
+                                        begin, end - begin, end - begin);
+            }
             recorded = true;
             std::scoped_lock lock{nx2_list_mutex};
             Nx2ListPage& entry = nx2_list_pages[page];
@@ -3381,7 +3449,13 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             }
         }
         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
-        runtime.WaitSubmittedTick(tick);
+        {
+            const Common::MemCensus::ReasonScope census_reason{
+                Common::MemCensus::Reason::CommandList};
+            const Common::MemCensus::WaitTimer census_wait;
+            runtime.WaitSubmittedTick(tick);
+            census_wait.Done(page, page_size);
+        }
         std::scoped_lock lock{nx2_list_mutex};
         const auto it = nx2_list_pages.find(page);
         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
@@ -3404,6 +3478,7 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
 
 template <class P>
 void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    const Common::MemCensus::ReasonScope census_reason{Common::MemCensus::Reason::CommandList};
     constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
     boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges;
     for (const DAddr page : pages) {
@@ -3723,6 +3798,10 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             return true;
         }
         const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
+        if (Common::MemCensus::g_enabled) [[unlikely]] {
+            CensusUpload(Common::MemCensus::t_bind, buffer, device_addr, size, copies_span,
+                         total_size_bytes);
+        }
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         // Mapped uploads carry their own barriers (or run in the upload command buffer, which
         // ends with one); another barrier here only ended the render pass (~50 times a frame in
@@ -3750,6 +3829,10 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             return true;
         }
         const std::span<BufferCopy> copies_span(copies.data(), copies.size());
+        if (Common::MemCensus::g_enabled) [[unlikely]] {
+            CensusUpload(Common::MemCensus::t_bind, buffer, device_addr, size, copies_span,
+                         total_size_bytes);
+        }
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         return false;
     }
@@ -3759,6 +3842,8 @@ template <class P>
 void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr,
                                                u32 size) {
     Buffer& buffer = slot_buffers[buffer_id];
+    Common::MemCensus::SetBind(slot == NUM_VERTEX_BUFFERS ? Common::MemCensus::Bind::Index
+                                                          : Common::MemCensus::Bind::Vertex);
     // The deletion count keeps a freed and reused buffer id from passing for the scanned one.
     GeometrySync& sync = geometry_syncs[slot];
     ++geometry_stats.syncs;
@@ -3789,6 +3874,23 @@ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 larg
     } else {
         ImmediateUploadMemory(buffer, largest_copy, copies);
     }
+}
+
+template <class P>
+void BufferCache<P>::CensusUpload(Common::MemCensus::Bind bind, Buffer& buffer,
+                                  DAddr device_addr, u64 size,
+                                  std::span<const BufferCopy> copies, u64 total_size_bytes) {
+    u64 hash = 0;
+    for (const BufferCopy& copy : copies) {
+        if (census_scratch.size() < copy.size) {
+            census_scratch.resize(copy.size);
+        }
+        device_memory.ReadBlockUnsafe(buffer.CpuAddr() + copy.dst_offset, census_scratch.data(),
+                                      copy.size);
+        hash = Common::MemCensus::Hash(std::span(census_scratch.data(), copy.size),
+                                       hash ^ copy.dst_offset);
+    }
+    Common::MemCensus::NoteUpload(bind, device_addr, size, total_size_bytes, hash);
 }
 
 template <class P>
@@ -3868,7 +3970,13 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
 
     BufferId buffer_id = FindBuffer(dest_address, static_cast<u32>(copy_size), false);
     auto& buffer = slot_buffers[buffer_id];
+    Common::MemCensus::SetBind(Common::MemCensus::Bind::Inline);
     SynchronizeBuffer(buffer, dest_address, static_cast<u32>(copy_size));
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::NoteUpload(Common::MemCensus::Bind::Inline, dest_address, copy_size,
+                                      copy_size,
+                                      Common::MemCensus::Hash(inlined_buffer.first(copy_size), 0));
+    }
 
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         auto upload_staging = runtime.UploadStagingBuffer(copy_size);
@@ -3928,6 +4036,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
+    const Common::MemCensus::WaitTimer census_wait;
     runtime.Finish();
     const u8* const mapped_memory = download_staging.mapped_span.data();
     DAddr landing_begin = ~DAddr{0};
@@ -3937,6 +4046,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         landing_begin = (std::min)(landing_begin, address);
         landing_end = (std::max)(landing_end, address + download.copy.size);
     }
+    census_wait.Done(landing_begin, landing_end - landing_begin);
     const VideoCore::DownloadLanding landing{landing_begin, landing_end};
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
@@ -3990,7 +4100,9 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
+            const Common::MemCensus::WaitTimer census_wait;
             runtime.FinishForHostRead();
+            census_wait.Done(landing_begin, landing_end - landing_begin);
             const VideoCore::DownloadLanding landing{landing_begin, landing_end};
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             for (const BufferCopy& copy : copies) {
@@ -4010,7 +4122,9 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        const Common::MemCensus::WaitTimer census_wait;
         runtime.Finish();
+        census_wait.Done(landing_begin, landing_end - landing_begin);
         const VideoCore::DownloadLanding landing{landing_begin, landing_end};
         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         for (const BufferCopy& copy : copies) {

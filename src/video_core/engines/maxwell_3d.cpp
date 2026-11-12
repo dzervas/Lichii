@@ -17,6 +17,7 @@
 #include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/bit_util.h"
+#include "common/mem_census.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -2150,6 +2151,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
             split.Run(
                 [memory = &memory_manager, source, read_bytes] {
+                    const Common::MemCensus::ReasonScope census_reason{
+                        Common::MemCensus::Reason::MacroRead};
                     memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                 },
                 VideoCommon::DrainSite::MacroDmaFlush);

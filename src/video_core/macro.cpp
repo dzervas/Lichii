@@ -21,6 +21,7 @@
 #endif
 
 #include "common/assert.h"
+#include "common/mem_census.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -1464,6 +1465,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     const bool dirty =
                         memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
                     if (dirty) {
+                        const Common::MemCensus::ReasonScope census_reason{
+                            Common::MemCensus::Reason::MacroRead};
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
                         if (++flushes % 2000 == 1) {

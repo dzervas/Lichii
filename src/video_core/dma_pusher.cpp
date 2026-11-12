@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/mem_census.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -902,12 +903,16 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         }
         VideoCommon::GpuSplit::Get().Run(
             [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
+                const Common::MemCensus::ReasonScope census_reason{
+                    Common::MemCensus::Reason::CommandList};
                 rasterizer->FlushGpuWrittenCommandListPages(pages);
             },
             VideoCommon::DrainSite::ListFlush);
     } else if (dirty) {
         VideoCommon::GpuSplit::Get().Run(
             [memory = &memory_manager, first_page, size = end_page - first_page] {
+                const Common::MemCensus::ReasonScope census_reason{
+                    Common::MemCensus::Reason::CommandList};
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::ListFlush);

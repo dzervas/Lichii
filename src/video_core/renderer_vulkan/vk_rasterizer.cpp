@@ -31,6 +31,7 @@
 #include "common/dkb_frame_trace.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/mem_census.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -2762,8 +2763,11 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     });
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
+    const Common::MemCensus::ReasonScope census_reason{Common::MemCensus::Reason::Query};
+    const Common::MemCensus::WaitTimer census_wait;
     std::unique_lock lock{wait_mutex};
     wait_cv.wait(lock, [&written] { return written; });
+    census_wait.Done(addr, size);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -3533,6 +3537,11 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         // Guest memory has the words now: a command list copy of the page no longer does.
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
+        if (Common::MemCensus::g_enabled) [[unlikely]] {
+            Common::MemCensus::Note(Common::MemCensus::Event::CpuWrite,
+                                    static_cast<u8>(Common::MemCensus::CpuWrite::InlineEngine),
+                                    *cpu_addr, copy_size, copy_size, 0, uploaded ? 1 : 0);
+        }
         if (!uploaded && !defer) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }

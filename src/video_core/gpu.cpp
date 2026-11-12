@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/mem_census.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -295,9 +296,13 @@ struct GPU::Impl {
         namespace AsyncReadback = VideoCore::AsyncReadback;
         const u64 request = AsyncReadback::Now();
         const u64 area_size = raster_area.end_address - raster_area.start_address;
+        const Common::MemCensus::ReasonScope census_reason{Common::MemCensus::Reason::GuestRead};
         // In flight: an earlier read's downloads cover the area, only FinishRead is left.
         if (!raster_area.in_flight) {
+            const Common::MemCensus::WaitTimer census_wait;
             const u64 fence = RequestSyncOperation([this, raster_area, area_size]() {
+                const Common::MemCensus::ReasonScope census_reason{
+                    Common::MemCensus::Reason::GuestRead};
                 const u64 start = AsyncReadback::Now();
                 // Apply collected guest writes before downloading GPU data over guest memory.
                 InvalidateGPUCache();
@@ -308,6 +313,7 @@ struct GPU::Impl {
             });
             gpu_thread.TickGPU(is_async);
             WaitForSyncOperation(fence);
+            census_wait.Done(raster_area.start_address, area_size);
         }
         // The GPU thread submitted the downloads without waiting for the host GPU: this thread
         // waits for them and writes them to guest memory, while the GPU thread goes on.
@@ -329,6 +335,8 @@ struct GPU::Impl {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
                 const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
+                    const Common::MemCensus::ReasonScope census_reason{
+                        Common::MemCensus::Reason::CpuWriteOverGpu};
                     rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
                     rasterizer->OnCacheInvalidation(addr, size);
                 });

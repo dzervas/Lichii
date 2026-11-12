@@ -17,6 +17,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/mem_census.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -688,6 +689,7 @@ void QueryCacheBase<Traits>::FinishReads(DAddr address, size_t size) {
         if (VideoCore::ReadCheckWrites::Enabled()) {
             VideoCore::ReadCheckWrites::Note(address, size, "a query result");
         }
+        const Common::MemCensus::ReasonScope census_reason{Common::MemCensus::Reason::Query};
         impl->rasterizer.FinishRead(address, size);
     }
 }

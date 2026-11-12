@@ -30,6 +30,7 @@
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
+#include "common/mem_census.h"
 #include "common/range_sets.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -667,6 +668,11 @@ private:
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
+    /// EDEN_NX2_MEM_CENSUS: notes an upload of `copies` into `buffer` for the range
+    /// [device_addr, device_addr + size), hashing the guest bytes they copy.
+    void CensusUpload(Common::MemCensus::Bind bind, Buffer& buffer, DAddr device_addr, u64 size,
+                      std::span<const BufferCopy> copies, u64 total_size_bytes);
+
     void ImmediateUploadMemory(Buffer& buffer, u64 largest_copy,
                                std::span<const BufferCopy> copies);
 
@@ -827,6 +833,7 @@ private:
     } uniform_keep;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
+    std::vector<u8> census_scratch; ///< EDEN_NX2_MEM_CENSUS: guest bytes of an upload
 
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
