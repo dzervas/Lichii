@@ -756,6 +756,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                                                                                    count);
         return 1 + count;
     }
+    case Kind::Tag:
+        Nx2Profile::SetOrigin(static_cast<u32>((head >> 8) & 0xffff));
+        OriginProfile::AddBinds(static_cast<u32>((head >> 32) & 0xffff), static_cast<u32>(head >> 48));
+        return 1;
     case Kind::Call: {
         if (Nx2Profile::Enabled()) {
             g_cb_pattern.Entry();
@@ -777,6 +781,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
+    OriginProfile::SetRole(OriginProfile::Role::Back);
     on_back_thread = true;
     Common::PageProtectionStats::t_gpu_back_thread = true;
     back_running.store(true, std::memory_order_release);

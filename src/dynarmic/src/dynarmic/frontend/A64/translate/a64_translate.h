@@ -42,7 +42,7 @@ struct TranslationOptions {
     bool hook_hint_instructions = true;
 
     /// Diagnostic (nvn-probe): see UserConfig::block_entry_probes.
-    const std::unordered_set<u64>* block_entry_probes = nullptr;
+    bool (*block_entry_probe)(u64 pc) = nullptr;
 };
 
 /**

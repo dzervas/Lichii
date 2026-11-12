@@ -229,6 +229,17 @@ public:
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
 
+    /// nvn-probe (EDEN_NX2_ORIGIN_PROFILE), front: the command header the next entries come from,
+    /// and the texture and buffer bind headers counted since the last tag.
+    void NoteOrigin(u32 id, u32 texture_binds, u32 buffer_binds) {
+        if (id != origin_pending) {
+            SendOpenWrites(); // so a batch of constant buffer writes keeps the origin it came from
+            origin_pending = id;
+        }
+        origin_binds[0] += texture_binds;
+        origin_binds[1] += buffer_binds;
+    }
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
@@ -375,6 +386,7 @@ private:
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
         ConstBufferWrites, ///< Bits 8-31 count; then ConstBufferWrite's writes, a word each
+        Tag, ///< nvn-probe origin (EDEN_NX2_ORIGIN_PROFILE): bits 8-23 id, 32-47/48-63 binds
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -426,6 +438,9 @@ private:
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
         SendOpenWrites();
+        if (origin_pending != origin_sent) [[unlikely]] {
+            SendOrigin();
+        }
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -434,6 +449,18 @@ private:
         return ReserveSlow(words);
     }
     u64* ReserveSlow(size_t words);
+    void SendOrigin() {
+        origin_sent = origin_pending;
+        u64* const entry = Reserve(1);
+        entry[0] = static_cast<u64>(Kind::Tag) | (u64{origin_sent & 0xffff} << 8) |
+                   (u64{(std::min)(origin_binds[0], 0xffffu)} << 32) |
+                   (u64{(std::min)(origin_binds[1], 0xffffu)} << 48);
+        origin_binds[0] = origin_binds[1] = 0;
+        Commit(1);
+    }
+    u32 origin_pending{};
+    u32 origin_sent{};
+    u32 origin_binds[2]{};
     void Commit(size_t words) {
         write_position += words;
         const u64 unpublished = write_position - published_local;

@@ -657,6 +657,7 @@ bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
 
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
+    VideoCommon::OriginProfile::SetRole(VideoCommon::OriginProfile::Role::Worker);
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
     const VideoCommon::StutterTrace::ThreadScope stutter_thread{
         VideoCommon::StutterTrace::Thread::Worker};

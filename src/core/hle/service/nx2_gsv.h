@@ -1886,7 +1886,7 @@ private:
         m_pace_requested_us = 0;
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
-        if (Core::Nx2Probe::PaceTraceEnabled() || Core::Nx2Probe::BlockEntryProbes() != nullptr) {
+        if (Core::Nx2Probe::OnPresentWanted()) {
             const auto us = [](auto duration) {
                 return static_cast<s64>(
                     std::chrono::duration_cast<std::chrono::microseconds>(duration).count());

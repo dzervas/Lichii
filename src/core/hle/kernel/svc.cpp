@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <x86intrin.h>
 #include <cstring>
 #include <type_traits>
 
@@ -2545,6 +2546,7 @@ void Call(Core::System& system, u32 imm) {
             LOG_INFO(Kernel_SVC, "svc 0x18 t{} waits on{}", GetCurrentThread(kernel).GetThreadId(), list);
         }
     }
+    const u64 svc_start_tsc = Core::Nx2Probe::GuestTimingEnabled() ? __rdtsc() : 0;
     // nvn-probe: how long guest threads wait in WaitSynchronization (by the events' names),
     // SendSyncRequest (by the HLE request it made) and WaitForAddress.
     const bool wait_trace = Core::Nx2Probe::PaceTraceEnabled() && (imm == 0x18 || imm == 0x21 || imm == 0x34);
@@ -2602,6 +2604,10 @@ void Call(Core::System& system, u32 imm) {
         Call64(system, imm, args);
     } else {
         Call32(system, imm, args);
+    }
+    if (svc_start_tsc != 0) {
+        Core::Nx2Probe::OnSvc(static_cast<u32>(GetCurrentThread(kernel).GetThreadId()), svc_start_tsc,
+                              __rdtsc());
     }
     if (wait_trace) {
         const u32 thread_id = static_cast<u32>(GetCurrentThread(kernel).GetThreadId());

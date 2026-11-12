@@ -224,9 +224,9 @@ struct UserConfig {
     /// Processor ID
     std::uint8_t processor_id = 0;
 
-    /// Diagnostic (nvn-probe): blocks starting at these addresses first raise
-    /// InstructionCacheOperationRaised(BlockEntryProbe, pc).
-    const std::unordered_set<std::uint64_t>* block_entry_probes = nullptr;
+    /// Diagnostic (nvn-probe): blocks starting at an address this returns true for first raise
+    /// InstructionCacheOperationRaised(BlockEntryProbe, pc). Called when a block is translated.
+    bool (*block_entry_probe)(std::uint64_t pc) = nullptr;
 
     /// This enables unsafe optimizations that reduce emulation accuracy in favour of speed.
     /// For safety, in order to enable unsafe optimizations you have to set BOTH this flag

@@ -16,6 +16,7 @@
 #include "core/cpu_manager.h"
 #include "core/hle/kernel/k_interrupt_manager.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/nx2_probe.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_thread.h"
@@ -369,6 +370,10 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     // if (KProcess *next_process = next_thread->GetOwnerProcess(); next_process != cur_process) {
     //     KProcess::Switch(cur_process, next_process);
     // }
+
+    Core::Nx2Probe::OnGuestSwitch(
+        cur_thread == nullptr || cur_thread == m_idle_thread ? ~0u : static_cast<u32>(cur_thread->GetThreadId()),
+        next_thread == m_idle_thread ? ~0u : static_cast<u32>(next_thread->GetThreadId()));
 
     // Set the new thread.
     SetCurrentThread(kernel, next_thread);

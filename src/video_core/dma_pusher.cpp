@@ -471,6 +471,17 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
         } else {
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
+            if (VideoCommon::OriginProfile::g_enabled) [[unlikely]] {
+                const u32 key = (command_header.subchannel.Value() << 13) | command_header.method.Value();
+                const u32 id = VideoCommon::OriginProfile::IdOf(key);
+                VideoCommon::Nx2Profile::SetOrigin(id);
+                auto& split = VideoCommon::GpuSplit::Get();
+                if (split.Active()) {
+                    using namespace VideoCommon::OriginProfile;
+                    split.NoteOrigin(id, key == TextureBindKey ? 1 : 0,
+                                     key == UniformBindKey || key == StorageBindKey ? 1 : 0);
+                }
+            }
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
                 SetState(command_header);

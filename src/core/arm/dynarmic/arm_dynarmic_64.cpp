@@ -117,8 +117,19 @@ bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vect
 
 void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) {
     if (op == Dynarmic::A64::InstructionCacheOperation::BlockEntryProbe) {
-        Core::Nx2Probe::CountBlockEntry(
-            value, static_cast<u32>(Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId()));
+        auto& jit = *m_parent.m_jit;
+        const bool halt = Core::Nx2Probe::OnBlockProbe({
+            .pc = value,
+            .x0 = jit.GetRegister(0),
+            .lr = jit.GetRegister(30),
+            .sp = jit.GetSP(),
+            .thread_id = static_cast<u32>(Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId()),
+            .memory = &m_memory,
+            .process = m_process,
+        });
+        if (halt) {
+            jit.HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
+        }
         return;
     }
     last_code_addr = u64(-1); //invalidate cached page
@@ -343,7 +354,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
-    config.block_entry_probes = Core::Nx2Probe::BlockEntryProbes();
+    config.block_entry_probe = Core::Nx2Probe::BlockProbeFunction();
     config.global_monitor = &m_exclusive_monitor.monitor;
 
     // System registers

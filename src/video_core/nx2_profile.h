@@ -147,14 +147,16 @@ inline constexpr auto stutter_categories = [] {
 // A plain flag: Enabled() runs several times per method write (no guard to check).
 inline bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 /// Whether zones measure: for the profile or for EDEN_NX2_STUTTER_TRACE.
-inline bool g_zones_enabled = g_enabled || StutterTrace::ReadEnv();
+inline bool g_zones_enabled = g_enabled || StutterTrace::ReadEnv() ||
+                              std::getenv("EDEN_NX2_ORIGIN_PROFILE") != nullptr;
 
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
     g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
     StutterTrace::ReadSwitch();
-    g_zones_enabled = g_enabled || StutterTrace::Enabled();
+    g_zones_enabled = g_enabled || StutterTrace::Enabled() ||
+                      std::getenv("EDEN_NX2_ORIGIN_PROFILE") != nullptr;
     Common::g_count_spin_contention = g_enabled;
     Common::PageProtectionStats::g_enabled = g_enabled;
 }
@@ -198,11 +200,151 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
+} // namespace VideoCommon::Nx2Profile
+
+// Diagnostic (nvn-probe, dotfiles-2hg.62; not for merging). EDEN_NX2_ORIGIN_PROFILE=1: splits the
+// GPU threads' time by profile zone and by origin, the command header (subchannel << 13 | method)
+// the front was processing when it made the work. The front sends the origin to the back through
+// the ring (GpuSplit Kind::Tag). Every interval between two events (zone entered or left, origin
+// changed) goes to (thread role, zone, origin), so each thread's wall time is fully partitioned.
+// Draws and dispatches on the back also go by how many texture and buffer bind headers came since
+// the previous one.
+namespace VideoCommon::OriginProfile {
+
+inline bool g_enabled = std::getenv("EDEN_NX2_ORIGIN_PROFILE") != nullptr;
+
+enum class Role : u32 { Other, Front, Back, Worker, Count };
+inline constexpr u32 MaxZones = 64;
+inline constexpr u32 MaxOrigins = 4096;
+// MKW's NVN2 nvnCommandBufferBindTexture emits macro 0xe1c (only it does); BindUniformBuffer
+// macro 0xe02 and BindStorageBuffer 0x8e4 (measured in mkw-race, nvn-probe EDEN_NX2_NVN_TIME).
+inline constexpr u32 TextureBindKey = 0xe1c;
+inline constexpr u32 UniformBindKey = 0xe02;
+inline constexpr u32 StorageBindKey = 0x8e4;
+inline constexpr u32 Buckets = 8;
+
+struct Tables {
+    u64 ns[static_cast<u32>(Role::Count)][MaxZones][MaxOrigins];
+    u64 headers[MaxOrigins]; ///< Command headers the front parsed, by origin
+    std::atomic<u16> key_to_id[1u << 16];
+    u16 id_to_key[MaxOrigins];
+    u32 next_id{1};
+    // [draw 0 / dispatch 1][texture 0 / buffer 1 binds][bucket][zone]
+    u64 bucket_ns[2][2][Buckets][MaxZones];
+    u64 bucket_count[2][2][Buckets];
+    u64 bucket_binds[2][2][Buckets];
+};
+Tables& GetTables();
+
+struct ThreadState {
+    Role role{Role::Other};
+    u32 origin{};
+    u64 last{};
+    u32 in_draw{};
+    u32 draw_kind{};
+    u64 draw_acc[MaxZones]{};
+    u32 binds[2]{};
+};
+inline thread_local ThreadState t_state;
+
+inline void SetRole(Role role) {
+    t_state.role = role;
+}
+
+/// Charges the time since the last event to `zone` and the current origin.
+inline void Event(u32 zone) {
+    if (!g_enabled) {
+        return;
+    }
+    const u64 now = __rdtsc();
+    auto& state = t_state;
+    if (state.last != 0 && zone < MaxZones) {
+        const u64 elapsed = now - state.last;
+        GetTables().ns[static_cast<u32>(state.role)][zone][state.origin] += elapsed;
+        if (state.in_draw != 0) {
+            state.draw_acc[zone] += elapsed;
+        }
+    }
+    state.last = now;
+}
+
+/// Front: compact id of a command header's origin key.
+inline u32 IdOf(u32 key) {
+    auto& tables = GetTables();
+    u16 id = tables.key_to_id[key & 0xffff].load(std::memory_order_relaxed);
+    if (id == 0 && tables.next_id < MaxOrigins) {
+        id = static_cast<u16>(tables.next_id++);
+        tables.id_to_key[id] = static_cast<u16>(key);
+        tables.key_to_id[key & 0xffff].store(id, std::memory_order_relaxed);
+    }
+    ++tables.headers[id];
+    return id;
+}
+
+/// Back: binds the front counted since the previous tag (Kind::Tag).
+inline void AddBinds(u32 texture, u32 buffer) {
+    t_state.binds[0] += texture;
+    t_state.binds[1] += buffer;
+}
+
+void Dump(std::string& out, u64 present);
+
+} // namespace VideoCommon::OriginProfile
+
+namespace VideoCommon::Nx2Profile {
+
+static_assert(static_cast<u32>(Zone::Count) <= OriginProfile::MaxZones);
+
+inline void OriginEvent() {
+    OriginProfile::Event(static_cast<u32>(t_data.current));
+}
+
+/// Sets this thread's origin (charging the time so far to the previous one).
+inline void SetOrigin(u32 id) {
+    if (OriginProfile::g_enabled) {
+        OriginEvent();
+        OriginProfile::t_state.origin = id;
+    }
+}
+
+inline void OriginEnterZone(Zone zone) {
+    OriginEvent();
+    auto& state = OriginProfile::t_state;
+    if ((zone == Zone::Draw || zone == Zone::Compute) && state.role == OriginProfile::Role::Back) {
+        if (state.in_draw++ == 0) {
+            state.draw_kind = zone == Zone::Draw ? 0 : 1;
+        }
+    }
+}
+
+inline void OriginLeaveZone(Zone zone) {
+    OriginProfile::Event(static_cast<u32>(zone));
+    auto& state = OriginProfile::t_state;
+    if ((zone == Zone::Draw || zone == Zone::Compute) && state.role == OriginProfile::Role::Back &&
+        state.in_draw != 0 && --state.in_draw == 0) {
+        auto& tables = OriginProfile::GetTables();
+        for (u32 kind = 0; kind < 2; ++kind) {
+            const u32 binds = state.binds[kind];
+            const u32 bucket = (std::min)(binds, OriginProfile::Buckets - 1);
+            for (u32 z = 0; z < OriginProfile::MaxZones; ++z) {
+                tables.bucket_ns[state.draw_kind][kind][bucket][z] += state.draw_acc[z];
+            }
+            ++tables.bucket_count[state.draw_kind][kind][bucket];
+            tables.bucket_binds[state.draw_kind][kind][bucket] += binds;
+        }
+        std::fill(std::begin(state.draw_acc), std::end(state.draw_acc), 0);
+        state.binds[0] = state.binds[1] = 0;
+    }
+}
+
 class Scope {
 public:
     explicit Scope(Zone zone_) : zone{zone_}, enabled{g_zones_enabled} {
         if (!enabled) {
             return;
+        }
+        if (OriginProfile::g_enabled) {
+            OriginEnterZone(zone);
         }
         parent_child_ns = t_data.child_ns;
         t_data.child_ns = 0;
@@ -219,6 +361,9 @@ public:
     ~Scope() {
         if (!enabled) {
             return;
+        }
+        if (OriginProfile::g_enabled) {
+            OriginLeaveZone(zone);
         }
         const u64 end = Ticks();
         const u64 elapsed = end - start;
