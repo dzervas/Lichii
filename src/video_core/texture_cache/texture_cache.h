@@ -21,6 +21,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/mem_census.h"
 #include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -177,11 +178,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         if (must_download) {
+            const Common::MemCensus::ReasonScope census_reason{
+                Common::MemCensus::Reason::TextureGc};
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
+            const Common::MemCensus::WaitTimer census_wait;
             runtime.Finish();
+            census_wait.Done(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                Common::MemCensus::Note(Common::MemCensus::Event::Download,
+                                        static_cast<u8>(Common::MemCensus::t_reason), image.cpu_addr,
+                                        image.guest_size_bytes, image.guest_size_bytes);
+            }
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
@@ -1310,11 +1320,18 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         if (pending.empty()) {
             return;
         }
+        const Common::MemCensus::WaitTimer census_wait;
         runtime.Finish();
+        census_wait.Done(cpu_addr, size);
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                Common::MemCensus::Note(Common::MemCensus::Event::Download,
+                                        static_cast<u8>(Common::MemCensus::t_reason), image.cpu_addr,
+                                        image.guest_size_bytes, image.guest_size_bytes);
+            }
             ClearStaleImage(image);
         }
         pending.clear();
@@ -1931,6 +1948,7 @@ void TextureCache<P>::PopAsyncFlushes() {
     if (committed_downloads.empty()) {
         return;
     }
+    const Common::MemCensus::ReasonScope census_reason{Common::MemCensus::Reason::Flush};
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         const auto& download_ids = committed_downloads.front();
@@ -1950,6 +1968,11 @@ void TextureCache<P>::PopAsyncFlushes() {
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+                if (Common::MemCensus::g_enabled) [[unlikely]] {
+                    Common::MemCensus::Note(Common::MemCensus::Event::Download,
+                                            static_cast<u8>(Common::MemCensus::t_reason), image.cpu_addr,
+                                            image.guest_size_bytes, image.guest_size_bytes);
+                }
                 ClearStaleImage(image);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
@@ -2000,6 +2023,11 @@ void TextureCache<P>::PopAsyncFlushes() {
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+            if (Common::MemCensus::g_enabled) [[unlikely]] {
+                Common::MemCensus::Note(Common::MemCensus::Event::Download,
+                                        static_cast<u8>(Common::MemCensus::t_reason), image.cpu_addr,
+                                        image.guest_size_bytes, image.guest_size_bytes);
+            }
             ClearStaleImage(image);
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
@@ -2161,6 +2189,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             return;
         }
         ++tc_stale_gpu_written;
+    }
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::Upload,
+                                static_cast<u8>(Common::MemCensus::Bind::Texture), image.cpu_addr,
+                                image.guest_size_bytes, image.guest_size_bytes);
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
@@ -4193,6 +4226,11 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::GpuWrite,
+                                static_cast<u8>(Common::MemCensus::Bind::Image), image.cpu_addr,
+                                image.guest_size_bytes, image.guest_size_bytes);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
 }
