@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <unordered_set>
+
 #include <functional>
 #include <optional>
 
@@ -38,6 +40,9 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// Diagnostic (nvn-probe): see UserConfig::block_entry_probes.
+    const std::unordered_set<u64>* block_entry_probes = nullptr;
 };
 
 /**

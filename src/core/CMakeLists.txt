@@ -17,6 +17,8 @@ add_library(core STATIC
     constants.h
     core.cpp
     core.h
+    nx2_probe.cpp
+    nx2_probe.h
     game_settings.cpp
     game_settings.h
     core_timing.cpp

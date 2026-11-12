@@ -20,6 +20,8 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/nx2_probe.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
@@ -196,6 +198,10 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     if (ipc_trace) {
         LOG_INFO(Service, "ipc {}::{} ({})", service_name, ctx.GetCommand(), info->name);
     }
+    if (Core::Nx2Probe::PaceTraceEnabled()) {
+        Core::Nx2Probe::NoteRequest(static_cast<u32>(ctx.GetThread().GetThreadId()), service_name,
+                                    ctx.GetCommand());
+    }
     handler_invoker(this, info->handler_callback, ctx);
     if (ipc_trace) {
         // Response layout: [0..1] header, then 'SFCO', version, result.
@@ -224,6 +230,10 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         LOG_INFO(Service, "tipc {}::{} ({}) [2]={:#x} [3]={:#x} [4]={:#x}", service_name,
                  ctx.GetCommand(), info->name, w[2], w[3], w[4]);
+    }
+    if (Core::Nx2Probe::PaceTraceEnabled()) {
+        Core::Nx2Probe::NoteRequest(static_cast<u32>(ctx.GetThread().GetThreadId()), service_name,
+                                    ctx.GetCommand());
     }
     handler_invoker(this, info->handler_callback, ctx);
 }

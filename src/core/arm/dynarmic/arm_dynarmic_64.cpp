@@ -16,6 +16,8 @@
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/nx2_probe.h"
 #include "dynarmic/interface/A64/config.h"
 
 namespace Core {
@@ -114,6 +116,11 @@ bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vect
 }
 
 void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) {
+    if (op == Dynarmic::A64::InstructionCacheOperation::BlockEntryProbe) {
+        Core::Nx2Probe::CountBlockEntry(
+            value, static_cast<u32>(Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId()));
+        return;
+    }
     last_code_addr = u64(-1); //invalidate cached page
     switch (op) {
     case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU: {
@@ -336,6 +343,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
+    config.block_entry_probes = Core::Nx2Probe::BlockEntryProbes();
     config.global_monitor = &m_exclusive_monitor.monitor;
 
     // System registers

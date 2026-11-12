@@ -31,6 +31,7 @@
 #include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "core/nx2_probe.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/device_memory.h"
@@ -1882,8 +1883,26 @@ private:
         const auto waited = std::chrono::steady_clock::now();
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
+        m_pace_requested_us = 0;
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
+        if (Core::Nx2Probe::PaceTraceEnabled() || Core::Nx2Probe::BlockEntryProbes() != nullptr) {
+            const auto us = [](auto duration) {
+                return static_cast<s64>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
+            };
+            Core::Nx2Probe::OnPresent({
+                .present = present,
+                .thread_id = static_cast<u32>(ctx.GetThread().GetThreadId()),
+                .entered_ns = static_cast<s64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   entered.time_since_epoch())
+                                                   .count()),
+                .fence_us = us(waited - entered),
+                .composite_us = us(composited - waited),
+                .pace_us = us(paced - composited),
+                .pace_requested_us = m_pace_requested_us,
+            });
+        }
         if (Common::DkbFrameTrace::Enabled()) {
             const auto ms = [](auto duration) {
                 return std::chrono::duration<double, std::milli>(duration).count();
@@ -1971,6 +1990,7 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
+    s64 m_pace_requested_us{}; ///< nvn-probe: the last PaceToVblank's requested sleep
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
@@ -2067,6 +2087,7 @@ private:
             // between presents (Fortune's Weave's loader read one RomFS block per frame).
             const auto wait =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(pacing.deadline - now);
+            m_pace_requested_us = wait.count() / 1000;
             const auto sleep_start = trace ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
             static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(

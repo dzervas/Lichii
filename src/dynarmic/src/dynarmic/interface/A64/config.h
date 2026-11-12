@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 
 #include "dynarmic/interface/optimization_flags.h"
 
@@ -81,7 +82,9 @@ enum class InstructionCacheOperation {
     /// IC IALLU
     InvalidateAllToPoU,
     /// IC IALLUIS
-    InvalidateAllToPoUInnerSharable
+    InvalidateAllToPoUInnerSharable,
+    /// Diagnostic (nvn-probe): a block starting at a UserConfig::block_entry_probes address ran
+    BlockEntryProbe
 };
 
 struct UserCallbacks {
@@ -220,6 +223,10 @@ struct UserConfig {
 
     /// Processor ID
     std::uint8_t processor_id = 0;
+
+    /// Diagnostic (nvn-probe): blocks starting at these addresses first raise
+    /// InstructionCacheOperationRaised(BlockEntryProbe, pc).
+    const std::unordered_set<std::uint64_t>* block_entry_probes = nullptr;
 
     /// This enables unsafe optimizations that reduce emulation accuracy in favour of speed.
     /// For safety, in order to enable unsafe optimizations you have to set BOTH this flag
