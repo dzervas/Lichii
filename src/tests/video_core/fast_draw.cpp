@@ -468,3 +468,49 @@ TEST_CASE("Fast draw breaks on a release that signals a fence", "[fast_draw]") {
     f.Write(query, short_query); // short release: a fence
     CHECK(FastDraw::Serial() != serial);
 }
+
+TEST_CASE("Fast draw keeps vertex attribute formats light while their type class stays",
+          "[fast_draw]") {
+    using Attribute = Maxwell3D::Regs::VertexAttribute;
+    const auto format = [](u32 buffer, u32 offset, Attribute::Size size, Attribute::Type type,
+                           bool constant) {
+        Attribute attribute{};
+        attribute.buffer.Assign(buffer);
+        attribute.constant.Assign(constant ? 1 : 0);
+        attribute.offset.Assign(offset);
+        attribute.size.Assign(size);
+        attribute.type.Assign(type);
+        return attribute;
+    };
+    using Size = Attribute::Size;
+    using Type = Attribute::Type;
+    CHECK(format(0, 0, Size::Size_R32, Type::Float, false).DynamicInputTypeClass() == 1);
+    CHECK(format(0, 0, Size::Size_R8, Type::UNorm, false).DynamicInputTypeClass() == 1);
+    CHECK(format(0, 0, Size::Size_R8, Type::SScaled, false).DynamicInputTypeClass() == 1);
+    CHECK(format(0, 0, Size::Size_R32, Type::SInt, false).DynamicInputTypeClass() == 2);
+    CHECK(format(0, 0, Size::Size_R32, Type::UInt, false).DynamicInputTypeClass() == 3);
+    CHECK(format(0, 0, Size::Size_R32, Type::UInt, true).DynamicInputTypeClass() == 0);
+    CHECK(format(0, 0, Size::Size_R32, Type::UnusedEnumDoNotUseBecauseItWillGoAway, false)
+              .DynamicInputTypeClass() == 0);
+
+    FastDrawFixture f;
+    const bool previous = FastDraw::g_dynamic_vertex_input.exchange(true);
+    constexpr u32 method = MAXWELL3D_REG_INDEX(vertex_attrib_format) + 3;
+    const auto light = [&](const Attribute& attribute) {
+        f.DrawArrays(0, 3);
+        f.Write(method, attribute.hex);
+        f.DrawArrays(3, 3);
+        return f.Reusable();
+    };
+    f.Write(method, format(0, 0, Size::Size_R32_G32_B32, Type::Float, false).hex);
+    CHECK(light(format(1, 0x10, Size::Size_R32_G32_B32, Type::Float, false))); // buffer, offset
+    CHECK(light(format(1, 0x10, Size::Size_R8_G8_B8_A8, Type::UNorm, false))); // still a float
+    CHECK_FALSE(light(format(1, 0x10, Size::Size_R8_G8_B8_A8, Type::UInt, false)));
+    CHECK_FALSE(light(format(1, 0x10, Size::Size_R8_G8_B8_A8, Type::UInt, true))); // constant
+    CHECK(light(format(2, 0x20, Size::Size_R32, Type::SInt, true))); // constant either way
+
+    // Pipelines with static vertex input hold the whole format.
+    FastDraw::g_dynamic_vertex_input.store(false);
+    CHECK_FALSE(light(format(3, 0x20, Size::Size_R32, Type::SInt, true)));
+    FastDraw::g_dynamic_vertex_input.store(previous);
+}

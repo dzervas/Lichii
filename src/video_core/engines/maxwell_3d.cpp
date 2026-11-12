@@ -437,6 +437,24 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
            (method >= limits && method < limits + Regs::NumVertexArrays * limit_words);
 }
 
+bool Maxwell3D::IsFastDrawAttributeFormat(u32 method, u32 previous, u32 value) {
+    // With dynamic vertex input a pipeline holds only each attribute's type class: the rest (the
+    // buffer, offset, size and the class itself) is set as dynamic state from the registers on
+    // both paths (UpdateVertexInput), and the vertex buffers are bound again on both.
+    constexpr u32 attributes = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    if (method - attributes >= Regs::NumVertexAttributes ||
+        !VideoCommon::Nx2FastDraw::g_dynamic_vertex_input.load(std::memory_order_relaxed) ||
+        !VideoCommon::Nx2FastDraw::BindDeltaOn(
+            VideoCommon::Nx2FastDraw::BindDelta::AttributeFormats)) {
+        return false;
+    }
+    Regs::VertexAttribute before{};
+    Regs::VertexAttribute after{};
+    before.hex = previous;
+    after.hex = value;
+    return before.DynamicInputTypeClass() == after.DynamicInputTypeClass();
+}
+
 bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method >= cb_data && method < cb_data + Regs::NumCBData) {

@@ -72,19 +72,25 @@ inline std::atomic<bool> g_enabled{true};
 /// stride change then leaves the pipeline as it is.
 inline std::atomic<bool> g_dynamic_strides{false};
 
+/// Whether pipelines take vertex input as dynamic state (set by the renderer): a pipeline then
+/// holds only each attribute's type class (Maxwell3D::IsFastDrawAttributeFormat).
+inline std::atomic<bool> g_dynamic_vertex_input{false};
+
 /// dotfiles-2hg.63 lab switches: the changes that let draws after a bind keep the previous
 /// draw's state, each on unless EDEN_NX2_BIND_DELTA=0 (all of them) or its own
 /// EDEN_NX2_BIND_DELTA_<NAME>=0, read once.
 enum class BindDelta : u8 {
     UpstreamRules,    ///< UPSTREAM: the writes #974 and #1216 keep light or neutral
     UniformIds,       ///< UNIFORM_IDS: a uniform buffer bound again keeps its resolved buffer
+    AttributeFormats, ///< ATTRIBUTES: attribute format writes that keep the type class
     Count,
 };
 
 [[nodiscard]] inline bool BindDeltaOn(BindDelta piece) {
     static const std::array<bool, static_cast<size_t>(BindDelta::Count)> on = [] {
         static constexpr std::array<const char*, static_cast<size_t>(BindDelta::Count)> names{
-            "EDEN_NX2_BIND_DELTA_UPSTREAM", "EDEN_NX2_BIND_DELTA_UNIFORM_IDS"};
+            "EDEN_NX2_BIND_DELTA_UPSTREAM", "EDEN_NX2_BIND_DELTA_UNIFORM_IDS",
+            "EDEN_NX2_BIND_DELTA_ATTRIBUTES"};
         const auto off = [](const char* name) {
             const char* const value = std::getenv(name);
             return value != nullptr && value[0] == '0';

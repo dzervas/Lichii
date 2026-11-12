@@ -604,6 +604,25 @@ public:
                 u32 hex;
             };
 
+            /// All a pipeline with dynamic vertex input holds of the attribute
+            /// (FixedPipelineState::attribute_types): 0 constant or invalid, 1 float (normalized
+            /// and scaled included), 2 signed and 3 unsigned integer.
+            u32 DynamicInputTypeClass() const {
+                if (constant) {
+                    return 0;
+                }
+                switch (type) {
+                case Type::UnusedEnumDoNotUseBecauseItWillGoAway:
+                    return 0;
+                case Type::SInt:
+                    return 2;
+                case Type::UInt:
+                    return 3;
+                default:
+                    return 1;
+                }
+            }
+
             u32 ComponentCount() const {
                 switch (size) {
                 case Size::Size_R32_G32_B32_A32:
@@ -3284,6 +3303,9 @@ public:
     /// A vertex stream's address, size or limit, and its stride and enable word where the host
     /// binds strides as dynamic state (Nx2FastDraw::g_dynamic_strides).
     static bool IsFastDrawVertexBuffer(u32 method);
+    /// A vertex attribute format write that keeps the attribute's DynamicInputTypeClass where
+    /// the host takes vertex input as dynamic state (Nx2FastDraw::g_dynamic_vertex_input).
+    static bool IsFastDrawAttributeFormat(u32 method, u32 previous, u32 value);
     /// Executable methods whose work leaves what a draw resolves to alone (counter resets, the
     /// render enable condition): fast draw records nothing for them.
     static bool IsFastDrawNeutralMethod(u32 method);
@@ -3328,7 +3350,8 @@ private:
         }
         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-            !IsFastDrawParameter(method)) {
+            !IsFastDrawParameter(method) &&
+            !IsFastDrawAttributeFormat(method, regs.reg_array[method], argument)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
         regs.reg_array[method] = argument;
