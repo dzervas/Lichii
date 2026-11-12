@@ -730,6 +730,10 @@ void RasterizerVulkan::ReportFastDraws() {
                  static_cast<double>(stats.view_mismatches) / seconds,
                  static_cast<double>(stats.binding_mismatches) / seconds, stats.verified,
                  stats.pipeline_mismatches, stats.view_mismatches, stats.binding_mismatches);
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw verify: {} uniform buffers bound again kept their buffer, {} of them "
+                 "not the one FindBuffer finds (totals since boot)",
+                 buffer_cache.uniform_id_keeps, buffer_cache.uniform_id_mismatches);
     }
     std::string breaks;
     for (size_t reason = 0; reason < stats.breaks.size(); ++reason) {

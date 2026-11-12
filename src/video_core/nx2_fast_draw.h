@@ -77,13 +77,14 @@ inline std::atomic<bool> g_dynamic_strides{false};
 /// EDEN_NX2_BIND_DELTA_<NAME>=0, read once.
 enum class BindDelta : u8 {
     UpstreamRules,    ///< UPSTREAM: the writes #974 and #1216 keep light or neutral
+    UniformIds,       ///< UNIFORM_IDS: a uniform buffer bound again keeps its resolved buffer
     Count,
 };
 
 [[nodiscard]] inline bool BindDeltaOn(BindDelta piece) {
     static const std::array<bool, static_cast<size_t>(BindDelta::Count)> on = [] {
         static constexpr std::array<const char*, static_cast<size_t>(BindDelta::Count)> names{
-            "EDEN_NX2_BIND_DELTA_UPSTREAM"};
+            "EDEN_NX2_BIND_DELTA_UPSTREAM", "EDEN_NX2_BIND_DELTA_UNIFORM_IDS"};
         const auto off = [](const char* name) {
             const char* const value = std::getenv(name);
             return value != nullptr && value[0] == '0';

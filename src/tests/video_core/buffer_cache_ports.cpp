@@ -2311,3 +2311,54 @@ TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buf
     REQUIRE(resolved != id);
     REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
 }
+
+TEST_CASE("Binding the same uniform buffer again keeps its resolved buffer", "[buffer_ports]") {
+    struct ChannelFixture : Fixture {
+        ChannelFixture() {
+            state.memory_manager = &*memory;
+            state.payload.emplace(system, *memory, state);
+            cache->CreateChannel(state);
+            cache->BindToChannel(0);
+        }
+        ~ChannelFixture() {
+            cache.reset();
+        }
+        Tegra::Control::ChannelState state{0};
+    } f;
+    const auto id = Access::Add(*f.cache, 0x10000, 0x10000);
+    auto& channel = Access::Channel(*f.cache, 0);
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto& binding = channel.uniform_buffers[0][0];
+    f.cache->BindGraphicsUniformBuffer(0, 0, 0x100800, 0x100);
+    REQUIRE(!binding.buffer_id);
+    Access::UpdateUniforms(*f.cache, 0);
+    REQUIRE(binding.buffer_id == id);
+
+    f.cache->BindGraphicsUniformBuffer(0, 0, 0x100800, 0x100);
+    CHECK(binding.buffer_id == id);
+    CHECK(binding.device_addr == 0x10800);
+
+    // Another size or address is resolved again.
+    f.cache->BindGraphicsUniformBuffer(0, 0, 0x100800, 0x80);
+    CHECK(!binding.buffer_id);
+    CHECK(binding.size == 0x80);
+    Access::UpdateUniforms(*f.cache, 0);
+    f.cache->BindGraphicsUniformBuffer(0, 0, 0x100900, 0x80);
+    CHECK(!binding.buffer_id);
+    CHECK(binding.device_addr == 0x10900);
+
+    // A deleted buffer is not kept: the same bind resolves the range again.
+    Access::UpdateUniforms(*f.cache, 0);
+    REQUIRE(binding.buffer_id == id);
+    Access::Delete(*f.cache, id);
+    f.cache->BindGraphicsUniformBuffer(0, 0, 0x100900, 0x80);
+    CHECK(!binding.buffer_id);
+
+    // Accurate GPU fences resolve every bind (FindBuffer waits for the buffer's writes there).
+    Access::UpdateUniforms(*f.cache, 0);
+    REQUIRE(binding.buffer_id);
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    f.cache->BindGraphicsUniformBuffer(0, 0, 0x100900, 0x80);
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default);
+    CHECK(!binding.buffer_id);
+}

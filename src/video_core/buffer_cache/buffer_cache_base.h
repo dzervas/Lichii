@@ -543,6 +543,10 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    /// EDEN_NX2_FAST_DRAW_VERIFY: uniform buffers bound again that kept their resolved buffer,
+    /// and those whose buffer FindBuffer would not have returned.
+    u64 uniform_id_keeps = 0;
+    u64 uniform_id_mismatches = 0;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 

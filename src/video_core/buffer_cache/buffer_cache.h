@@ -1553,6 +1553,23 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
         channel_state->uniform_buffers[stage][index] = NULL_BINDING;
         return;
     }
+    // The same memory bound again keeps its resolved buffer: FindBuffer would return it (a
+    // deleted buffer's id is cleared from every channel's bindings), and the draw consumes the
+    // bytes as before. With accurate GPU fences FindBuffer also waits for the buffer's writes.
+    const Binding& current = channel_state->uniform_buffers[stage][index];
+    if (current.buffer_id && current.device_addr == *device_addr && current.size == size &&
+        !Settings::IsGPUFenceBehaviorAccurate() &&
+        Nx2FastDraw::BindDeltaOn(Nx2FastDraw::BindDelta::UniformIds)) {
+        if (Nx2FastDraw::VerifyEnabled()) [[unlikely]] {
+            ++uniform_id_keeps;
+            const u64 page = *device_addr >> CACHING_PAGEBITS;
+            if (page >= page_table.size() || page_table[page] != current.buffer_id ||
+                !slot_buffers[current.buffer_id].IsInBounds(*device_addr, size)) {
+                ++uniform_id_mismatches;
+            }
+        }
+        return;
+    }
     const Binding binding{
         .device_addr = *device_addr,
         .size = size,
