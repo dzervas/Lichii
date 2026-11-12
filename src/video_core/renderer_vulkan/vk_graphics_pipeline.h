@@ -301,6 +301,18 @@ public:
         return delta_blocker == DeltaBlocker::None && delta_views_valid;
     }
 
+    /// Whether a delta draw can follow writes to the texture handles or binds of the constant
+    /// buffers holding them (RebindTextures): every texture is sampled with a handle a constant
+    /// buffer word holds, and there are no texture buffers or images.
+    [[nodiscard]] bool RebindsTextures() const noexcept {
+        return texture_memo_eligible && TakesDeltaDraws();
+    }
+
+    /// Reads the texture handles again and resolves the views and samplers of those that changed
+    /// since the kept ones were resolved, as Configure resolves them; the next ConfigureDelta
+    /// pushes the image descriptors again if any did. Needs RebindsTextures.
+    void RebindTextures();
+
     /// Why TakesDeltaDraws is false (diagnostics).
     enum class DeltaBlocker : u8 {
         None,
@@ -415,6 +427,13 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// RebindsTextures pipelines: the texture handles (view and sampler indices) delta_views and
+    /// delta_samplers were resolved from, and RebindTextures' scratch.
+    std::vector<std::pair<u32, u32>> delta_handles;
+    std::vector<std::pair<u32, u32>> rebind_handles;
+    std::vector<VideoCommon::ImageViewInOut> rebind_views;
+    std::vector<u32> rebind_elements;
+    void ReadTextureHandles(std::vector<std::pair<u32, u32>>& handles) const;
     /// Delta draws: the image descriptor entries (first entry and count per
     /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
     /// image changed its scale (TextureCache::ScaleEpoch).

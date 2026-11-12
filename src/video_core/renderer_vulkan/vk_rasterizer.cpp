@@ -478,6 +478,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     taken_delta = delta;
     candidate_pipeline = draw.pipeline;
     draw_outcome = DrawStats::Delta;
+    taken_rebind = false;
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
         draw_outcome = static_cast<u8>(DrawStats::Early + static_cast<size_t>(reason));
@@ -518,10 +519,19 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
         return full(FullDraw::DeltaPipeline);
     }
+    // Texture handles written or their constant buffer bound again: a pipeline that reads them
+    // only from constant buffer words reads them all again and resolves those that changed
+    // (RebindTextures); any other takes the full path.
+    const bool rebinds = draw.pipeline->RebindsTextures() &&
+                         FastDraw::BindDeltaOn(FastDraw::BindDelta::TextureRebind);
     const auto& handles = draw.pipeline->HandleConstantBuffers();
-    for (size_t stage = 0; stage < handles.size() && !delta.Empty(); ++stage) {
+    for (size_t stage = 0; stage < handles.size() && !delta.Empty() && !taken_rebind; ++stage) {
         if ((delta.binds[stage] & handles[stage]) != 0) {
-            return full(FullDraw::HandleBind);
+            if (!rebinds) {
+                return full(FullDraw::HandleBind);
+            }
+            taken_rebind = true;
+            break;
         }
         if (delta.num_writes == 0) {
             continue;
@@ -533,7 +543,11 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             FastDraw::DeviceSpans& spans = handle_spans[stage][slot];
             spans.Update(*gpu_memory, cbuf.address, cbuf.size);
             if (delta.Reaches(cbuf.address, cbuf.size, spans)) {
-                return full(FullDraw::HandleData);
+                if (!rebinds) {
+                    return full(FullDraw::HandleData);
+                }
+                taken_rebind = true;
+                break;
             }
         }
     }
@@ -674,11 +688,12 @@ void RasterizerVulkan::ReportFastDraws() {
         return static_cast<double>(stats.full[static_cast<size_t>(reason)]) / seconds;
     };
     LOG_INFO(Render_Vulkan,
-             "Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
-             "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
+             "Fast draw per second: {:.0f} delta ({:.0f} rebinding textures) | full: {:.0f} "
+             "after an ineligible draw, {:.0f} different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
              "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} handle buffer bound, "
              "{:.0f} handle data written, {:.0f} sampled image to prepare",
-             static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
+             static_cast<double>(stats.delta) / seconds,
+             static_cast<double>(stats.rebind) / seconds, per_second(FullDraw::NoCandidate),
              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
              per_second(FullDraw::DeltaPipeline), per_second(FullDraw::HandleBind),
@@ -734,6 +749,10 @@ void RasterizerVulkan::ReportFastDraws() {
                  "Fast draw verify: {} uniform buffers bound again kept their buffer, {} of them "
                  "not the one FindBuffer finds (totals since boot)",
                  buffer_cache.uniform_id_keeps, buffer_cache.uniform_id_mismatches);
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw verify: {} texture rebind draws checked, {} view or sampler "
+                 "mismatches",
+                 stats.rebind_verified, stats.rebind_view_mismatches);
     }
     std::string breaks;
     for (size_t reason = 0; reason < stats.breaks.size(); ++reason) {
@@ -825,6 +844,8 @@ void RasterizerVulkan::ReportDrawStats() {
     const auto outcome_name = [](size_t outcome) -> std::string {
         if (outcome == DrawStats::Delta) return "delta";
         if (outcome == DrawStats::Verified) return "verified";
+        if (outcome == DrawStats::Rebind) return "rebind";
+        if (outcome == DrawStats::VerifiedRebind) return "verified-rebind";
         if (outcome < DrawStats::Late) return fmt::format("full:{}", full_names[outcome - DrawStats::Early]);
         return fmt::format("late:{}", full_names[outcome - DrawStats::Late]);
     };
@@ -1222,6 +1243,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         std::lock(buffer_cache.mutex, texture_cache.mutex);
     }
     std::scoped_lock lock{std::adopt_lock, buffer_cache.mutex, texture_cache.mutex};
+    if (taken_rebind && delta_pipeline == pipeline) {
+        // Before the serial is read: a texture it resolves that deletes or rescales images
+        // breaks it, and the draw takes the full path (DeltaStillHolds).
+        pipeline->SetEngine(maxwell3d, gpu_memory);
+        pipeline->RebindTextures();
+    }
     // What the next draw's TakeReusableDraw compares with, read once the caches are locked: a
     // break from here on, this draw's own resolve included, ends the delta chain.
     const u64 draw_serial = FastDraw::Serial();
@@ -1252,8 +1279,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
-    if (delta_holds && verify_pipeline) {
-        draw_outcome = DrawStats::Verified;
+    if (delta_holds) {
+        draw_outcome = static_cast<u8>(
+            (verify_pipeline ? DrawStats::Verified : DrawStats::Delta) + (taken_rebind ? 2 : 0));
     }
     buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
     if (path == DrawPath::Delta) {
@@ -1263,22 +1291,27 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             return;
         }
         ++fast_draw_stats.delta;
+        fast_draw_stats.rebind += taken_rebind ? 1 : 0;
     } else {
         // What the delta draw would have kept: the texture buffer bindings.
+        // Only draws that would have taken the delta path.
+        const bool verify_delta = verify_views && delta_holds;
         const u64 kept_bindings =
-            verify_views ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
+            verify_delta ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
         if (fast_draw_on) {
-            pipeline->CaptureNextDelta(verify_views);
+            pipeline->CaptureNextDelta(verify_delta);
         }
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
         }
-        if (verify_views && pipeline->DeltaMismatch()) {
+        fast_draw_stats.rebind_verified += verify_delta && taken_rebind ? 1 : 0;
+        if (verify_delta && pipeline->DeltaMismatch()) {
             ++fast_draw_stats.view_mismatches;
+            fast_draw_stats.rebind_view_mismatches += taken_rebind ? 1 : 0;
         }
-        if (verify_views &&
+        if (verify_delta &&
             kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
             ++fast_draw_stats.binding_mismatches;
         }

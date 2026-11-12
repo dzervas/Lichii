@@ -83,6 +83,7 @@ enum class BindDelta : u8 {
     UpstreamRules,    ///< UPSTREAM: the writes #974 and #1216 keep light or neutral
     UniformIds,       ///< UNIFORM_IDS: a uniform buffer bound again keeps its resolved buffer
     AttributeFormats, ///< ATTRIBUTES: attribute format writes that keep the type class
+    TextureRebind,    ///< TEXTURES: delta draws after texture handle writes (RebindTextures)
     Count,
 };
 
@@ -90,7 +91,7 @@ enum class BindDelta : u8 {
     static const std::array<bool, static_cast<size_t>(BindDelta::Count)> on = [] {
         static constexpr std::array<const char*, static_cast<size_t>(BindDelta::Count)> names{
             "EDEN_NX2_BIND_DELTA_UPSTREAM", "EDEN_NX2_BIND_DELTA_UNIFORM_IDS",
-            "EDEN_NX2_BIND_DELTA_ATTRIBUTES"};
+            "EDEN_NX2_BIND_DELTA_ATTRIBUTES", "EDEN_NX2_BIND_DELTA_TEXTURES"};
         const auto off = [](const char* name) {
             const char* const value = std::getenv(name);
             return value != nullptr && value[0] == '0';

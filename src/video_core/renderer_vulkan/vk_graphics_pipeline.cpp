@@ -923,12 +923,38 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             delta_mismatch = !delta_views_valid ||
                              !std::ranges::equal(views, delta_views, same_view) ||
                              !std::ranges::equal(samplers, delta_samplers);
+            static u32 logged{};
+            if (delta_mismatch && delta_views_valid && logged < 16 &&
+                views.size() == delta_views.size() && samplers.size() == delta_samplers.size()) {
+                ++logged;
+                std::string differences;
+                for (size_t i = 0; i < views.size(); ++i) {
+                    if (!same_view(views[i], delta_views[i])) {
+                        differences += fmt::format(" view {}: kept {:#x}/{} full {:#x}/{}", i,
+                                                   delta_views[i].index, delta_views[i].id.index,
+                                                   views[i].index, views[i].id.index);
+                    }
+                }
+                for (size_t i = 0; i < samplers.size(); ++i) {
+                    if (samplers[i] != delta_samplers[i]) {
+                        differences += fmt::format(" sampler {}: kept {} full {}", i,
+                                                   delta_samplers[i].index, samplers[i].index);
+                    }
+                }
+                LOG_ERROR(Render_Vulkan, "Fast draw verify: pipeline {:016x} kept other views or "
+                                         "samplers than a full resolve:{}",
+                          key.Hash(), differences);
+            }
         }
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
         configured_stages = Spec::enabled_stages;
         delta_views_valid = true;
         kept_images_valid = false;
+        if (texture_memo_eligible) {
+            // The words read above, unchanged since.
+            ReadTextureHandles(delta_handles);
+        }
     }
     if (captured_delta) {
         kept_image_entries.clear();
@@ -1112,6 +1138,55 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+void GraphicsPipeline::ReadTextureHandles(std::vector<std::pair<u32, u32>>& handles) const {
+    // As ConfigureImpl reads them for texture_memo_eligible pipelines (no handle programs or
+    // secondary handles).
+    handles.clear();
+    const bool via_header_index{maxwell3d->regs.sampler_binding ==
+                                Maxwell::SamplerBinding::ViaHeaderBinding};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info{stage_infos[stage]};
+        const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                if (VideoCommon::HandleIsStoragePointer(info, desc, index)) {
+                    handles.push_back(VideoCommon::NULL_TEXTURE_HANDLE);
+                    continue;
+                }
+                const GPUVAddr addr{cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                    (index << desc.size_shift)};
+                handles.push_back(TexturePair(gpu_memory->Read<u32>(addr), via_header_index));
+            }
+        }
+    }
+}
+
+void GraphicsPipeline::RebindTextures() {
+    ReadTextureHandles(rebind_handles);
+    rebind_views.clear();
+    rebind_elements.clear();
+    for (u32 element = 0; element < rebind_handles.size(); ++element) {
+        if (rebind_handles[element] != delta_handles[element]) {
+            rebind_views.push_back({.index = rebind_handles[element].first});
+            rebind_elements.push_back(element);
+        }
+    }
+    if (rebind_elements.empty()) {
+        return;
+    }
+    for (const u32 element : rebind_elements) {
+        delta_samplers[element] =
+            texture_cache.GetSamplerId(rebind_handles[element].second, false);
+    }
+    texture_cache.FillImageViews(std::span(rebind_views.data(), rebind_views.size()), false,
+                                 false);
+    for (size_t changed = 0; changed < rebind_elements.size(); ++changed) {
+        delta_views[rebind_elements[changed]] = rebind_views[changed];
+    }
+    std::swap(delta_handles, rebind_handles);
+    kept_images_valid = false;
 }
 
 bool GraphicsPipeline::DeltaReachesHandleWords(const VideoCommon::Nx2FastDraw::Delta& delta) const {

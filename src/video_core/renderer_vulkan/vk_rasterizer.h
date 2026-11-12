@@ -428,6 +428,7 @@ private:
     enum class DrawPath : u8 { Full, Delta, Count };
     struct FastDrawStats {
         u64 delta{};
+        u64 rebind{}; ///< Delta draws that rebound textures (RebindTextures)
         std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
         std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
         /// PrepareDraw time and draws per path.
@@ -438,6 +439,8 @@ private:
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
+        u64 rebind_verified{};
+        u64 rebind_view_mismatches{};
         /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
         /// StateChanged draws by the reason of the last break, and by its 3D method.
@@ -456,6 +459,7 @@ private:
     void ReportFastDraws();
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    bool taken_rebind{}; ///< Its texture handles were written or bound: RebindTextures
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
                Maxwell::MaxShaderStage>
@@ -470,7 +474,9 @@ private:
     struct DrawStats {
         static constexpr size_t Delta = 0;
         static constexpr size_t Verified = 1;
-        static constexpr size_t Early = 2;
+        static constexpr size_t Rebind = 2;         ///< Delta after RebindTextures
+        static constexpr size_t VerifiedRebind = 3;
+        static constexpr size_t Early = 4;
         static constexpr size_t Late = Early + static_cast<size_t>(FullDraw::Count);
         static constexpr size_t Outcomes = Late + static_cast<size_t>(FullDraw::Count);
         static constexpr size_t Buckets = 8; ///< 0 to 6 headers, and 7 or more
