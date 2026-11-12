@@ -798,6 +798,23 @@ void RasterizerVulkan::NoteDrawStats(u64 ns, bool same_pipeline) {
     add(draw_stats.texture[bucket(texture)][draw_outcome]);
     add(draw_stats.buffer[bucket(buffer)][draw_outcome]);
     add(draw_stats.kinds[kinds][draw_outcome][same_pipeline ? 1 : 0]);
+    if (VideoCommon::Nx2Profile::g_zones_enabled) {
+        const u64 ticks = VideoCommon::Nx2Profile::Ticks() - draw_tick_start;
+        const size_t cls = draw_outcome == DrawStats::Delta    ? 0
+                           : draw_outcome == DrawStats::Rebind ? 1
+                           : same_pipeline                     ? 2
+                                                               : 3;
+        auto& zones = draw_stats.zone_ticks[bucket(texture)][cls];
+        const auto& now = VideoCommon::Nx2Profile::t_data.exclusive_ns;
+        for (size_t zone = 0; zone < zones.size(); ++zone) {
+            zones[zone] += now[zone] - draw_zone_start[zone];
+        }
+        auto& cell = draw_stats.class_cells[bucket(texture)][cls];
+        ++cell.draws;
+        cell.ns += ticks;
+        draw_stats.ticks += ticks;
+        draw_stats.ticks_ns += ns;
+    }
     if (draw_outcome != DrawStats::Delta) {
         u32 blockers = draw_blockers;
         if (draw_breaks.reasons == 1U << static_cast<u32>(VideoCommon::Nx2FastDraw::Reason::Register) &&
@@ -889,6 +906,24 @@ void RasterizerVulkan::ReportDrawStats() {
         }
         out += fmt::format("FDS set {} {:#x} {}{}\n", sets[i].first, set.reasons,
                            set.overflow ? 1 : 0, methods);
+    }
+    if (stats.ticks != 0) {
+        out += fmt::format("FDS tsc {} {}\n", stats.ticks, stats.ticks_ns);
+        for (size_t b = 0; b < DrawStats::Buckets; ++b) {
+            for (size_t c = 0; c < DrawStats::Classes; ++c) {
+                const auto& cell = stats.class_cells[b][c];
+                if (cell.draws == 0) {
+                    continue;
+                }
+                out += fmt::format("FDS ztot {} {} {} {}\n", b, c, cell.draws, cell.ns);
+                for (size_t z = 0; z < DrawStats::Zones; ++z) {
+                    if (const u64 t = stats.zone_ticks[b][c][z]; t != 0) {
+                        out += fmt::format("FDS zone {} {} {} {}\n", b, c, t,
+                                           VideoCommon::Nx2Profile::zone_names[z]);
+                    }
+                }
+            }
+        }
     }
     for (const auto& [mask, cell] : stats.blockers) {
         out += fmt::format("FDS blockers {:#x} {} {}\n", mask, cell.draws, cell.ns);
@@ -1026,6 +1061,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     fast_draw_verify = fast_draw_on && FastDraw::VerifyEnabled();
     const u64 fast_draw_start = fast_draw_on ? Profile::Now() : 0;
+    if (FastDraw::Stats::g_enabled && Profile::g_zones_enabled) [[unlikely]] {
+        draw_zone_start = Profile::t_data.exclusive_ns;
+        draw_tick_start = Profile::Ticks();
+    }
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();

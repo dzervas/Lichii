@@ -505,10 +505,22 @@ private:
         std::map<u32, Cell> blockers;
         std::array<u64, 0x1000> method_draws{}; ///< Draws whose breaks include the method
         std::array<u64, 0x1000> sole_method_draws{}; ///< Draws broken by that method only
+        /// With EDEN_NX2_GPU_PROFILE's zones: PrepareDraw's zones per texture bind bucket and
+        /// class (delta, delta rebinding textures, full with the previous draw's pipeline, full
+        /// with another), in time stamp counter ticks, and PrepareDraw's own ticks and ns.
+        static constexpr size_t Classes = 4;
+        static constexpr size_t Zones = static_cast<size_t>(VideoCommon::Nx2Profile::Zone::Count);
+        std::array<std::array<std::array<u64, Zones>, Classes>, Buckets> zone_ticks{};
+        std::array<std::array<Cell, Classes>, Buckets> class_cells{};
+        u64 ticks{};
+        u64 ticks_ns{};
         u64 frames{};
         u64 window_start{};
     };
     void NoteDrawStats(u64 ns, bool same_pipeline);
+    /// The zone times and tick count at the start of the draw being prepared (DrawStats).
+    std::array<u64, DrawStats::Zones> draw_zone_start{};
+    u64 draw_tick_start{};
     u32 DrawBlockers(const ReusableDraw& draw, const VideoCommon::Nx2FastDraw::Delta& delta);
     void ReportDrawStats();
     DrawStats draw_stats;
