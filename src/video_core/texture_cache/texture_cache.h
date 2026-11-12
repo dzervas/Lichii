@@ -2190,11 +2190,6 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         }
         ++tc_stale_gpu_written;
     }
-    if (Common::MemCensus::g_enabled) [[unlikely]] {
-        Common::MemCensus::Note(Common::MemCensus::Event::Upload,
-                                static_cast<u8>(Common::MemCensus::Bind::Texture), image.cpu_addr,
-                                image.guest_size_bytes, image.guest_size_bytes);
-    }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
         RefreshSparseLayers(image);
@@ -2220,6 +2215,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         LOG_WARNING(HW_GPU, "MSAA image uploads are not implemented");
         runtime.TransitionImageLayout(image);
         return;
+    }
+    // Whole uploads only: sparse images and dirty layers upload parts of their guest size.
+    if (Common::MemCensus::g_enabled) [[unlikely]] {
+        Common::MemCensus::Note(Common::MemCensus::Event::Upload,
+                                static_cast<u8>(Common::MemCensus::Bind::Texture), image.cpu_addr,
+                                image.guest_size_bytes, image.guest_size_bytes);
     }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);
