@@ -15,6 +15,7 @@
 #include <fmt/ranges.h>
 
 #include "common/logging.h"
+#include "common/mem_census.h"
 #include <ranges>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -227,6 +228,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     };
 
     VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::Present);
+    if (Common::MemCensus::g_enabled) {
+        Common::MemCensus::Present();
+    }
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
