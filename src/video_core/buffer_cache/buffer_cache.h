@@ -29,11 +29,20 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_idle_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
+
+/// dotfiles-2hg.58: the 4 MiB memory tracker managers a range spans.
+inline u32 TrackerManagersSpanned(DAddr device_addr, u32 size) {
+    if (size == 0) {
+        return 0;
+    }
+    return static_cast<u32>(((device_addr + size - 1) >> 22) - (device_addr >> 22) + 1);
+}
 
 using Core::DEVICE_PAGESIZE;
 
@@ -2721,12 +2730,15 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
+            IdleTrace::Note(IdleTrace::Event::StorageSyncBegin, 2, binding.size);
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
+        IdleTrace::Note(IdleTrace::Event::StorageSyncBegin, 0, size);
         SynchronizeBuffer(buffer, binding.device_addr, size);
+        IdleTrace::Note(IdleTrace::Event::StorageSyncEnd, TrackerManagersSpanned(binding.device_addr, size));
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -2876,12 +2888,15 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u64 write_mark_limit =
             native ? u64{channel_state->compute_storage_write_marks[index]} : ~u64{0};
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
+            IdleTrace::Note(IdleTrace::Event::StorageSyncBegin, 3, binding.size);
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
+        IdleTrace::Note(IdleTrace::Event::StorageSyncBegin, 1, size);
         SynchronizeBuffer(buffer, binding.device_addr, size);
+        IdleTrace::Note(IdleTrace::Event::StorageSyncEnd, TrackerManagersSpanned(binding.device_addr, size));
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);

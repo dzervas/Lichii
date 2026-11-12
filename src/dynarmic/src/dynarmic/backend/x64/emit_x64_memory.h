@@ -383,6 +383,15 @@ const void* EmitWriteMemoryMov(BlockOfCode& code, const Xbyak::RegExp& addr, int
     }
 }
 
+// dotfiles-2hg.58 diagnostic: per guest core (one cache line each), exclusive reads LL/SC, LSE,
+// exclusive writes LL/SC, LSE, failed exclusive writes.
+extern "C" std::uint64_t dynarmic_nx2_exclusive_counts[8][8];
+
+inline void EmitExclusiveCount(BlockOfCode& code, Xbyak::Reg64 pointer, std::uint8_t processor_id, std::size_t kind) {
+    code.mov(pointer, std::bit_cast<u64>(&dynarmic_nx2_exclusive_counts[processor_id & 7][kind]));
+    code.inc(code.qword[pointer]);
+}
+
 template<typename UserConfig>
 void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {

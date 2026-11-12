@@ -73,8 +73,10 @@ static bool AtomicFinish(TranslatorVisitor& v, IR::U32 status) {
     return false;
 }
 
-static IR::AccType AtomicAccType(bool acquire, bool release) {
-    return acquire || release ? IR::AccType::ORDERED : IR::AccType::ATOMIC;
+// dotfiles-2hg.58 diagnostic: ORDEREDRW tags LSE operations so the x64 backend counts them apart
+// from LL/SC (its inline exclusive accesses are ordered regardless of the access type).
+static IR::AccType AtomicAccType(bool, bool) {
+    return IR::AccType::ORDEREDRW;
 }
 
 bool TranslatorVisitor::AtomicMemOp(Imm<2> size, bool A, bool R, Reg Rs, Imm<4> op, Reg Rn, Reg Rt) {

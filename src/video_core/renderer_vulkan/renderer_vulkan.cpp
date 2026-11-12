@@ -51,6 +51,9 @@
 #ifdef __ANDROID__
 #include <jni.h>
 #endif
+// dotfiles-2hg.58 diagnostic counters of the JIT (dynarmic x64 emit_x64_memory.h).
+extern "C" std::uint64_t dynarmic_nx2_exclusive_counts[8][8];
+
 namespace Vulkan {
 namespace {
 
@@ -227,6 +230,17 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     };
 
     VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::Present);
+    if (VideoCommon::IdleTrace::g_enabled) {
+        for (u32 core = 0; core < 6; ++core) {
+            for (u32 kind = 0; kind < 5; ++kind) {
+                const u64 count =
+                    __atomic_load_n(&dynarmic_nx2_exclusive_counts[core][kind], __ATOMIC_RELAXED);
+                VideoCommon::IdleTrace::Write(VideoCommon::IdleTrace::Event::ExclCount,
+                                              static_cast<u16>(core << 8 | kind),
+                                              static_cast<u32>(count));
+            }
+        }
+    }
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {

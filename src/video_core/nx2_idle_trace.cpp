@@ -198,6 +198,20 @@ void ReadSwitch() {
     g_enabled = true;
 }
 
+u16 FileId(const char* file_name) {
+    static std::mutex mutex;
+    static std::vector<const char*> names;
+    std::scoped_lock lock{mutex};
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (names[i] == file_name || std::strcmp(names[i], file_name) == 0) {
+            return static_cast<u16>(i);
+        }
+    }
+    names.push_back(file_name);
+    LOG_INFO(HW_GPU, "Idle trace: file id {} = {}", names.size() - 1, file_name);
+    return static_cast<u16>(names.size() - 1);
+}
+
 void Write(Event event, u16 aux, u32 arg) {
     WriteAt(Nx2Profile::Ticks(), event, aux, arg);
 }

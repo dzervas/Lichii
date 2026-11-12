@@ -25,6 +25,10 @@
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 
+extern "C" {
+alignas(64) std::uint64_t dynarmic_nx2_exclusive_counts[8][8]{};
+}
+
 namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;

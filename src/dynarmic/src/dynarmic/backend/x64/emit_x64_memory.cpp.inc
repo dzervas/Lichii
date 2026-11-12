@@ -362,6 +362,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+    EmitExclusiveCount(code, tmp, conf.processor_id, args[2].GetImmediateAccType() == IR::AccType::ORDEREDRW ? 1 : 0);
 
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
     code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
@@ -436,6 +437,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     const auto wrapped_fn = exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value.getIdx())];
 
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+    EmitExclusiveCount(code, tmp, conf.processor_id, args[3].GetImmediateAccType() == IR::AccType::ORDEREDRW ? 3 : 2);
 
     SharedLabel end = ctx.GenSharedLabel();
 
@@ -522,6 +524,8 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     }
 
     code.L(*end);
+    code.mov(tmp, std::bit_cast<u64>(&dynarmic_nx2_exclusive_counts[conf.processor_id & 7][4]));
+    code.add(code.qword[tmp], status.cvt64());
     EmitExclusiveUnlock(code, conf, tmp, eax);
     ctx.reg_alloc.DefineValue(code, inst, status);
     EmitCheckMemoryAbort(ctx, inst);

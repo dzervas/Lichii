@@ -23,6 +23,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_server_port.h"
+#include "video_core/nx2_idle_trace.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_session.h"
 #include "core/hle/kernel/k_thread.h"
@@ -1259,14 +1260,19 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
     }
     const auto& scheduler = kernel.Scheduler(core);
     const auto deadline = std::chrono::steady_clock::now() + hold;
+    const u32 trace_thread_id = static_cast<u32>(client_thread->GetThreadId());
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::HoldBegin, 0, trace_thread_id);
     while (std::chrono::steady_clock::now() < deadline) {
         // Stop as soon as the core has nothing else to run.
         const KThread* running = scheduler.GetSchedulerCurrentThread();
         if (running == client_thread || running == scheduler.GetIdleThread()) {
+            VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::HoldEnd,
+                                         running == client_thread ? 0 : 1, trace_thread_id);
             return;
         }
         std::this_thread::yield();
     }
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::HoldEnd, 2, trace_thread_id);
 }
 } // namespace
 

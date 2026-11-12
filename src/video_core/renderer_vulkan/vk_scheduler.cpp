@@ -196,6 +196,11 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
+    if (VideoCommon::IdleTrace::g_enabled) {
+        VideoCommon::IdleTrace::Write(VideoCommon::IdleTrace::Event::SchedFlush,
+                                      VideoCommon::IdleTrace::FileId(location.file_name()),
+                                      location.line());
+    }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
@@ -291,6 +296,12 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
+    }
+    if (VideoCommon::IdleTrace::g_enabled) {
+        VideoCommon::IdleTrace::Write(
+            VideoCommon::IdleTrace::Event::SchedFlush,
+            static_cast<u16>(VideoCommon::IdleTrace::FileId(location.file_name()) | 0x8000),
+            location.line());
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};

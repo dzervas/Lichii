@@ -16,6 +16,7 @@
 #include "core/cpu_manager.h"
 #include "core/hle/kernel/k_interrupt_manager.h"
 #include "core/hle/kernel/k_process.h"
+#include "video_core/nx2_idle_trace.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_thread.h"
@@ -373,6 +374,10 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     // Set the new thread.
     SetCurrentThread(kernel, next_thread);
     m_current_thread = next_thread;
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::GuestSwitch,
+                                 static_cast<u32>(m_core_id) |
+                                     (next_thread == m_idle_thread ? 0x100U : 0U),
+                                 static_cast<u32>(next_thread->GetThreadId()));
 
     // Set the new Thread Local region.
     // cpu::SwitchThreadLocalRegion(GetInteger(next_thread->GetThreadLocalRegionAddress()));

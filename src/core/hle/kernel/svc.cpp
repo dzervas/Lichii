@@ -16,6 +16,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "video_core/nx2_idle_trace.h"
 
 namespace Kernel::Svc {
 
@@ -2506,6 +2507,8 @@ void Call(Core::System& system, u32 imm) {
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
     GetCurrentThread(kernel).SetEnteredKernel();
+    const u32 trace_thread_id = static_cast<u32>(GetCurrentThread(kernel).GetThreadId());
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::SvcEnter, imm, trace_thread_id);
     //kernel.EnterSVCProfile();
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
@@ -2580,6 +2583,7 @@ void Call(Core::System& system, u32 imm) {
                  GetArg64(args, 2));
     }
     //kernel.ExitSVCProfile();
+    VideoCommon::IdleTrace::Note(VideoCommon::IdleTrace::Event::SvcExit, imm, trace_thread_id);
     kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
 }
 

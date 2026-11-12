@@ -43,6 +43,8 @@ EVENTS = [
     "ListResume", "Publish", "EarlyPublish", "SettleIdle", "HookRequest",
     "Present", "GuestSubmit",
     "GpuSubmitStart", "GpuProducer", "GpuCopy", "GpuSubmitEnd",
+    "GuestSwitch", "SvcEnter", "SvcExit", "HoldBegin", "HoldEnd", "SchedFlush",
+    "StorageSyncBegin", "StorageSyncEnd", "ExclCount",
 ]
 GPU_EVENTS = ("GpuSubmitStart", "GpuProducer", "GpuCopy", "GpuSubmitEnd")
 E = {name: index for index, name in enumerate(EVENTS)}

@@ -58,7 +58,20 @@ enum class Event : u16 {
     GpuProducer,    ///< Bottom of pipe before the dispatch that writes command list pages
     GpuCopy,        ///< Bottom of pipe before the command list page copies
     GpuSubmitEnd,   ///< Bottom of pipe at the end of the submission
+    // dotfiles-2hg.58 diagnostics (CPU cores and the back)
+    GuestSwitch, ///< A core switched guest threads (aux: core | 0x100 idle thread, arg: thread id)
+    SvcEnter,    ///< aux: SVC number, arg: guest thread id
+    SvcExit,     ///< aux: SVC number, arg: guest thread id
+    HoldBegin,   ///< HoldHleReply starts holding (arg: client thread id)
+    HoldEnd,     ///< aux: 0 client running again, 1 core idle, 2 budget used up
+    SchedFlush,  ///< Scheduler::Flush/Finish (aux: caller file id | 0x8000 Finish, arg: line)
+    StorageSyncBegin, ///< Storage buffer bind (aux: 1 compute | 2 multi-range, arg: bytes)
+    StorageSyncEnd,   ///< ...synchronized (aux: 4 MiB tracker managers the range spans)
+    ExclCount,   ///< Per present: aux core << 8 | kind, arg: cumulative count (low 32 bits)
 };
+
+/// SchedFlush's file id for a source file name (logged once per new name).
+u16 FileId(const char* file_name);
 
 enum class AcquirePollResult : u32 {
     Met,
