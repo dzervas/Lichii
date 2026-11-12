@@ -72,6 +72,31 @@ inline std::atomic<bool> g_enabled{true};
 /// stride change then leaves the pipeline as it is.
 inline std::atomic<bool> g_dynamic_strides{false};
 
+/// dotfiles-2hg.63 lab switches: the changes that let draws after a bind keep the previous
+/// draw's state, each on unless EDEN_NX2_BIND_DELTA=0 (all of them) or its own
+/// EDEN_NX2_BIND_DELTA_<NAME>=0, read once.
+enum class BindDelta : u8 {
+    UpstreamRules,    ///< UPSTREAM: the writes #974 and #1216 keep light or neutral
+    Count,
+};
+
+[[nodiscard]] inline bool BindDeltaOn(BindDelta piece) {
+    static const std::array<bool, static_cast<size_t>(BindDelta::Count)> on = [] {
+        static constexpr std::array<const char*, static_cast<size_t>(BindDelta::Count)> names{
+            "EDEN_NX2_BIND_DELTA_UPSTREAM"};
+        const auto off = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] == '0';
+        };
+        std::array<bool, static_cast<size_t>(BindDelta::Count)> result{};
+        for (size_t index = 0; index < result.size(); ++index) {
+            result[index] = !off("EDEN_NX2_BIND_DELTA") && !off(names[index]);
+        }
+        return result;
+    }();
+    return on[static_cast<size_t>(piece)];
+}
+
 /// Tests only.
 inline void SetEnabledForTest(bool on) {
     g_enabled.store(on, std::memory_order_relaxed);

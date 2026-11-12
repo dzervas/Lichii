@@ -354,14 +354,16 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(const_buffer.offset):
     case MAXWELL3D_REG_INDEX(global_base_vertex_index):
     case MAXWELL3D_REG_INDEX(global_base_instance_index):
-    // Written with the first vertex before each draw; nothing a draw resolves reads it.
-    case MAXWELL3D_REG_INDEX(vertex_id_base):
     case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
     case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
     case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
     case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
     case MAXWELL3D_REG_INDEX(index_buffer.format):
         return true;
+    // Written with the first vertex before each draw; nothing a draw resolves reads it.
+    case MAXWELL3D_REG_INDEX(vertex_id_base):
+        return VideoCommon::Nx2FastDraw::BindDeltaOn(
+            VideoCommon::Nx2FastDraw::BindDelta::UpstreamRules);
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
                IsFastDrawVertexBuffer(method) || IsFastDrawNeutralMethod(method) ||
@@ -370,6 +372,9 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
 }
 
 bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
+    if (!VideoCommon::Nx2FastDraw::BindDeltaOn(VideoCommon::Nx2FastDraw::BindDelta::UpstreamRules)) {
+        return false;
+    }
     switch (method) {
     // A counter reset only touches the query cache. The render enable condition decides whether
     // the next draws run (ShouldExecute, or host conditional rendering), not what they bind; a
@@ -390,6 +395,9 @@ bool Maxwell3D::IsFastDrawReportOperand(u32 method) {
     // them, and what a macro does with the words reaches the engine as writes of its own.
     constexpr u32 MmeMemAddressA = 0x154;
     constexpr u32 MmeDataRamAddress = 0x156;
+    if (!VideoCommon::Nx2FastDraw::BindDeltaOn(VideoCommon::Nx2FastDraw::BindDelta::UpstreamRules)) {
+        return false;
+    }
     if (method >= MmeMemAddressA && method <= MmeDataRamAddress) {
         return true;
     }
@@ -416,7 +424,9 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
         // buffers are bound again with their strides on both paths (UpdateGraphicsBuffers), and
         // the pipeline key holds strides only without extended dynamic state.
         if (word == 0) {
-            return VideoCommon::Nx2FastDraw::g_dynamic_strides.load(std::memory_order_relaxed);
+            return VideoCommon::Nx2FastDraw::g_dynamic_strides.load(std::memory_order_relaxed) &&
+                   VideoCommon::Nx2FastDraw::BindDeltaOn(
+                       VideoCommon::Nx2FastDraw::BindDelta::UpstreamRules);
         }
         return word == 1 || word == 2; // address_high, address_low
     }
@@ -2017,7 +2027,9 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
         // The call itself does not end the fast draw path: the methods the macro calls end it
         // or not, as any method does.
         fs.parameters, VideoCommon::GpuSplit::Writes::Anywhere,
-        VideoCommon::GpuSplit::FastDrawNeutral);
+        VideoCommon::Nx2FastDraw::BindDeltaOn(VideoCommon::Nx2FastDraw::BindDelta::UpstreamRules)
+            ? VideoCommon::GpuSplit::FastDrawNeutral
+            : 0);
     const u64 position = split.Position();
     fs.back_last = position;
     const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
