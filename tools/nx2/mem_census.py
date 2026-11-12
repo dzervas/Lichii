@@ -4,7 +4,7 @@
 EDEN_NX2_MEM_CENSUS file.
 
   mem_census.py <census> [--frames FIRST:LAST | --marks marks.json] [--top N] [--exact]
-                [--stream-share S] [--json OUT]
+                [--stream-share S] [--max-group-mib M] [--json OUT]
 
 The census sums each thread's events per frame (a frame ends at a present) and per (event,
 detail, range) (src/common/mem_census.h). Frames are counted from the first present after the
@@ -15,7 +15,8 @@ the census's frame numbers follow from boot).
 Ranges are grouped: the ranges the buffer and texture caches name (bind ranges of uploads and GPU
 writes, images, download pieces, waits) are merged where they overlap, and the page-sized events
 (CPU write traps, protection changes) go to the group holding their page; pages no group holds
-form groups of their own, adjacent pages together. --exact keeps every range the census named
+form groups of their own, adjacent pages together. Ranges over --max-group-mib (default 64;
+sparse images name gigabytes) are groups of their own that take nothing in. --exact keeps every range the census named
 apart instead (page events then stay per page or protection run).
 
 Printed: the top groups by upload bytes, protection changes, CPU write traps and read waits; a
@@ -53,6 +54,7 @@ TEXTURE_BIND = BINDS.index("texture")
 REASONS = ["other", "guest-read", "early-read", "command-list", "query", "macro-read", "flush",
            "texture-gc", "cpu-write-over-gpu"]
 PAGE = 4096
+MAX_GROUP = 64 << 20
 
 CLASSES = ["cpu-streamed", "cpu-static", "gpu-written-cpu-read", "gpu-written-gpu-read", "mixed"]
 
@@ -71,54 +73,76 @@ def detail_name(event, detail):
     return name_of(REASONS, detail)
 
 
+class Entry:
+    """One (thread, event, detail, range)'s sums over the frames read, and the frames (bit sets)
+    it was seen in and, for uploads, had changed bytes in."""
+
+    __slots__ = ("count", "bytes", "ns", "aux", "frames", "changed")
+
+    def __init__(self):
+        self.count = self.bytes = self.ns = self.aux = 0
+        self.frames = self.changed = 0
+
+
 class Census:
-    """A census file's records within a span of frames."""
+    """A census file's records within a span of frames, summed per (thread, event, detail, addr,
+    size): a run has millions of records over a few thousand ranges."""
 
     def __init__(self):
         self.threads = {}  # index -> name
         self.presents = {}  # frame -> steady clock ns
-        # (frame, thread, event, detail, addr, size, count, bytes, ns, aux)
-        self.records = []
+        self.entries = collections.defaultdict(Entry)  # (thread, event, detail, addr, size)
+        self.records = 0
         self.frames = set()
 
 
 def read_census(path, first=None, last=None):
     census = Census()
     with open(path, "rb") as handle:
-        data = handle.read()
-    if data[:8] != FILE_MAGIC:
-        raise ValueError(f"{path}: not a memory census file")
-    record_size = struct.unpack_from("<I", data, 8)[0]
-    if record_size != RECORD.size:
-        raise ValueError(f"{path}: records of {record_size} bytes, expected {RECORD.size}")
-    offset = 16
-    while offset + BLOCK.size <= len(data):
-        magic, kind, thread, frame, count = BLOCK.unpack_from(data, offset)
-        if magic != BLOCK_MAGIC:
-            raise ValueError(f"{path}: bad block at {offset}")
-        offset += BLOCK.size
-        if kind == THREAD_NAME:
-            name = data[offset:offset + 16].split(b"\0", 1)[0].decode(errors="replace")
-            census.threads[thread] = name or f"thread{thread}"
-            offset += 16
-        elif kind == PRESENT:
-            if offset + 8 > len(data):
+        header = handle.read(16)
+        if header[:8] != FILE_MAGIC:
+            raise ValueError(f"{path}: not a memory census file")
+        record_size = struct.unpack_from("<I", header, 8)[0]
+        if record_size != RECORD.size:
+            raise ValueError(f"{path}: records of {record_size} bytes, expected {RECORD.size}")
+        while True:
+            block = handle.read(BLOCK.size)
+            if len(block) < BLOCK.size:
                 break
-            census.presents[frame] = struct.unpack_from("<Q", data, offset)[0]
-            offset += 8
-        elif kind == RECORDS:
-            end = offset + count * RECORD.size
-            if end > len(data):
-                break  # a block the writer had not finished
-            if (first is None or frame >= first) and (last is None or frame <= last):
+            magic, kind, thread, frame, count = BLOCK.unpack(block)
+            if magic != BLOCK_MAGIC:
+                raise ValueError(f"{path}: bad block at {handle.tell() - BLOCK.size}")
+            if kind == THREAD_NAME:
+                name = handle.read(16).split(b"\0", 1)[0].decode(errors="replace")
+                census.threads[thread] = name or f"thread{thread}"
+            elif kind == PRESENT:
+                payload = handle.read(8)
+                if len(payload) < 8:
+                    break
+                census.presents[frame] = struct.unpack("<Q", payload)[0]
+            elif kind == RECORDS:
+                if (first is not None and frame < first) or (last is not None and frame > last):
+                    handle.seek(count * RECORD.size, 1)
+                    continue
+                payload = handle.read(count * RECORD.size)
+                if len(payload) < count * RECORD.size:
+                    break  # a block the writer had not finished
                 census.frames.add(frame)
+                census.records += count
+                bit = 1 << frame
+                entries = census.entries
                 for addr, size_bytes, ns, aux, size, n, event, detail in RECORD.iter_unpack(
-                        data[offset:end]):
-                    census.records.append(
-                        (frame, thread, event, detail, addr, size, n, size_bytes, ns, aux))
-            offset = end
-        else:
-            raise ValueError(f"{path}: unknown block type {kind} at {offset}")
+                        payload):
+                    entry = entries[(thread, event, detail, addr, size)]
+                    entry.count += n
+                    entry.bytes += size_bytes
+                    entry.ns += ns
+                    entry.aux += aux
+                    entry.frames |= bit
+                    if aux < size_bytes:
+                        entry.changed |= bit
+            else:
+                raise ValueError(f"{path}: unknown block type {kind}")
     return census
 
 
@@ -131,8 +155,8 @@ def frame_span(census, first, last):
     return max(1, len(census.frames))
 
 
-def is_page_event(event, detail):
-    return event in (PROTECT, UNPROTECT) or (event == CPU_WRITE and detail != INLINE_ENGINE)
+def is_page_event(event):
+    return event in (CPU_WRITE, PROTECT, UNPROTECT)
 
 
 class Groups:
@@ -155,23 +179,27 @@ class Groups:
         return None
 
 
-def group_records(census, exact=False):
-    """The records of each group, {(begin, end): [(record, share)]}. A page event over several
-    pages is split per page, `share` its fraction on each."""
+def group_records(census, exact=False, max_group=MAX_GROUP):
+    """The entries of each group, {(begin, end): [(key, entry, share)]}. A page event over several
+    pages is split per page, `share` its fraction on each. Ranges over `max_group` bytes (sparse
+    images) stay groups of their own and take in nothing."""
     out = collections.defaultdict(list)
     if exact:
-        for record in census.records:
-            out[(record[4], record[4] + max(record[5], 1))].append((record, 1.0))
+        for key, entry in census.entries.items():
+            out[(key[3], key[3] + max(key[4], 1))].append((key, entry, 1.0))
         return out
-    groups = Groups((r[4], r[4] + max(r[5], 1)) for r in census.records
-                    if not is_page_event(r[2], r[3]))
+    groups = Groups((key[3], key[3] + max(key[4], 1)) for key in census.entries
+                    if not is_page_event(key[1]) and key[4] <= max_group)
     orphan_pages = set()
     page_hits = []
-    for record in census.records:
-        event, detail, addr, size = record[2:6]
-        if not is_page_event(event, detail):
+    for key, entry in census.entries.items():
+        thread, event, detail, addr, size = key
+        if not is_page_event(event):
+            if size > max_group:
+                out[(addr, addr + size)].append((key, entry, 1.0))
+                continue
             begin, end = groups.ranges[groups.find(addr)]
-            out[(begin, end)].append((record, 1.0))
+            out[(begin, end)].append((key, entry, 1.0))
             continue
         first_page = addr // PAGE
         pages = (addr + max(size, 1) - 1) // PAGE - first_page + 1
@@ -181,7 +209,7 @@ def group_records(census, exact=False):
                 index = groups.find(page * PAGE + PAGE - 1)
             if index is None:
                 orphan_pages.add(page)
-            page_hits.append((index, page, record, 1.0 / pages))
+            page_hits.append((index, page, key, entry, 1.0 / pages))
     # Runs of adjacent pages no group holds.
     run_of = {}
     run_end = {}
@@ -191,13 +219,13 @@ def group_records(census, exact=False):
         run_of[page] = begin
         run_end[begin] = page + 1
         previous = page
-    for index, page, record, share in page_hits:
+    for index, page, key, entry, share in page_hits:
         if index is None:
             begin = run_of[page]
-            key = (begin * PAGE, run_end[begin] * PAGE)
+            group = (begin * PAGE, run_end[begin] * PAGE)
         else:
-            key = tuple(groups.ranges[index])
-        out[key].append((record, share))
+            group = tuple(groups.ranges[index])
+        out[group].append((key, entry, share))
     return out
 
 
@@ -209,10 +237,12 @@ class GroupStats:
         self.sums = collections.Counter()
         self.binds = collections.Counter()  # upload and GPU write bytes by bind
         self.reasons = collections.Counter()  # download bytes and wait ns by reason
-        self.frames = collections.defaultdict(set)  # what happened in which frames
+        self.frames = collections.Counter()  # bit sets: what happened in which frames
 
-    def add(self, record, share):
-        frame, thread, event, detail, addr, size, count, size_bytes, ns, aux = record
+    def add(self, key, entry, share):
+        thread, event, detail, addr, size = key
+        count, size_bytes, ns, aux = entry.count, entry.bytes, entry.ns, entry.aux
+        frame = entry.frames
         sums = self.sums
         frames = self.frames
         if event == CPU_WRITE:
@@ -224,9 +254,9 @@ class GroupStats:
                 sums["invalidate_ns"] += ns * share
                 sums["collected"] += aux * share
             else:
-                sums["inline_engine"] += count
-                sums["inline_engine_bytes"] += size_bytes
-            frames["cpu_write"].add(frame)
+                sums["inline_engine"] += count * share
+                sums["inline_engine_bytes"] += size_bytes * share
+            frames["cpu_write"] |= frame
         elif event in (PROTECT, UNPROTECT):
             kind = "protect" if event == PROTECT else "unprotect"
             sums[kind + "_calls"] += count * share
@@ -234,31 +264,30 @@ class GroupStats:
             sums[kind + "_ns"] += ns * share
             if event == UNPROTECT and detail == 1:
                 sums["deferred_unprotect_pages"] += size_bytes / PAGE * share
-            frames[kind].add(frame)
+            frames[kind] |= frame
         elif event == UPLOAD:
             sums["uploads"] += count
             sums["upload_bytes"] += size_bytes
             unchanged = 0 if detail == TEXTURE_BIND else aux
             sums["unchanged_bytes"] += unchanged
             self.binds["upload " + name_of(BINDS, detail)] += size_bytes
-            frames["upload"].add(frame)
-            if unchanged < size_bytes:
-                frames["changed_upload"].add(frame)
+            frames["upload"] |= frame
+            frames["changed_upload"] |= frame if detail == TEXTURE_BIND else entry.changed
         elif event == GPU_WRITE:
             sums["gpu_writes"] += count
             sums["gpu_write_bytes"] += size_bytes
             self.binds["gpu " + name_of(BINDS, detail)] += size_bytes
-            frames["gpu_write"].add(frame)
+            frames["gpu_write"] |= frame
         elif event == DOWNLOAD:
             sums["downloads"] += count
             sums["download_bytes"] += size_bytes
             self.reasons["download " + name_of(REASONS, detail)] += size_bytes
-            frames["cpu_read"].add(frame)
+            frames["cpu_read"] |= frame
         elif event == READ_WAIT:
             sums["waits"] += count
             sums["wait_ns"] += ns
             self.reasons["wait " + name_of(REASONS, detail)] += ns
-            frames["cpu_read"].add(frame)
+            frames["cpu_read"] |= frame
 
     def label(self):
         top = [name for name, _ in self.binds.most_common(2)]
@@ -281,24 +310,24 @@ def classify(stats, stream_share=0.5):
     """
     frames = stats.frames
     gpu_written = bool(frames["gpu_write"])
-    cpu_written = bool(frames["cpu_write"]) or bool(frames["changed_upload"])
+    cpu_written = bool(frames["cpu_write"] | frames["changed_upload"])
     if gpu_written:
         if cpu_written:
             return "mixed"
         return "gpu-written-cpu-read" if frames["cpu_read"] else "gpu-written-gpu-read"
     active = frames["upload"] | frames["cpu_write"]
     rewritten = frames["changed_upload"] | frames["cpu_write"]
-    if active and len(rewritten) >= stream_share * len(active):
+    if active and rewritten.bit_count() >= stream_share * active.bit_count():
         return "cpu-streamed"
     return "cpu-static"
 
 
-def analyze(census, exact=False, stream_share=0.5):
+def analyze(census, exact=False, stream_share=0.5, max_group=MAX_GROUP):
     groups = {}
-    for (begin, end), entries in group_records(census, exact).items():
+    for (begin, end), entries in group_records(census, exact, max_group).items():
         stats = GroupStats(begin, end)
-        for record, share in entries:
-            stats.add(record, share)
+        for key, entry, share in entries:
+            stats.add(key, entry, share)
         stats.klass = classify(stats, stream_share)
         groups[(begin, end)] = stats
     return groups
@@ -308,11 +337,11 @@ def thread_costs(census):
     """Event counts and ns per (thread name, event, detail) over the frames read."""
     costs = collections.Counter()
     counts = collections.Counter()
-    for frame, thread, event, detail, addr, size, count, size_bytes, ns, aux in census.records:
+    for (thread, event, detail, addr, size), entry in census.entries.items():
         key = (census.threads.get(thread, f"thread{thread}"), name_of(EVENTS, event),
                detail_name(event, detail))
-        costs[key] += ns
-        counts[key] += count
+        costs[key] += entry.ns
+        counts[key] += entry.count
     return costs, counts
 
 
@@ -329,7 +358,8 @@ def print_report(census, groups, frames, top, out=None):
     def per_frame_ms(ns):
         return ns / frames / 1e6
 
-    p(f"{frames} frames, {len(census.records)} records, {len(groups)} groups")
+    p(f"{frames} frames, {census.records} records, {len(census.entries)} ranges per thread and "
+      f"kind, {len(groups)} groups")
     ranked = [
         ("upload bytes", lambda s: s.sums["upload_bytes"],
          lambda s: f"{mib(s.sums['upload_bytes']) / frames:8.3f} MiB/f "
@@ -396,7 +426,7 @@ def to_json(groups, frames):
             "begin": stats.begin, "end": stats.end, "class": stats.klass, "label": stats.label(),
             "per_frame": {key: value / frames for key, value in stats.sums.items()},
             "binds": dict(stats.binds), "reasons": dict(stats.reasons),
-            "frames": {key: len(value) for key, value in stats.frames.items()},
+            "frames": {key: value.bit_count() for key, value in stats.frames.items()},
         } for stats in sorted(groups.values(), key=lambda s: s.begin)],
     }
 
@@ -414,6 +444,8 @@ def main(argv=None):
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--exact", action="store_true", help="keep every range apart")
     parser.add_argument("--stream-share", type=float, default=0.5)
+    parser.add_argument("--max-group-mib", type=float, default=MAX_GROUP / (1 << 20),
+                        help="ranges larger than this are not merged with others")
     parser.add_argument("--json")
     options = parser.parse_args(argv)
     first = last = None
@@ -425,7 +457,8 @@ def main(argv=None):
         first, last = parse_frames(options.frames)
     census = read_census(options.census, first, last)
     frames = frame_span(census, first, last)
-    groups = analyze(census, options.exact, options.stream_share)
+    groups = analyze(census, options.exact, options.stream_share,
+                     int(options.max_group_mib * (1 << 20)))
     print_report(census, groups, frames, options.top)
     if options.json:
         with open(options.json, "w") as handle:

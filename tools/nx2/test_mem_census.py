@@ -71,6 +71,7 @@ def frame_records(frame):
         record(mc.CPU_WRITE, mc.TRAP, MIXED, 0x1000, count=4, size_bytes=16),
         record(mc.CPU_WRITE, mc.TRAP, ORPHAN, 0x1000, count=2, size_bytes=8),
         record(mc.CPU_WRITE, mc.TRAP, ORPHAN + 0x1000, 0x1000, count=2, size_bytes=8),
+        record(mc.CPU_WRITE, mc.INLINE_ENGINE, MIXED, 0x1000, count=3, size_bytes=12),
         record(mc.READ_WAIT, REASON["guest-read"], READ_BACK, 0x1000, ns=500000),
         record(mc.DOWNLOAD, REASON["guest-read"], READ_BACK, 0x1000),
     ]
@@ -108,12 +109,19 @@ class MemCensusTest(unittest.TestCase):
         census = mc.read_census(self.path)
         self.assertEqual(census.threads, {0: "GPUBack", 1: "CPUCore_0"})
         self.assertEqual(sorted(census.presents), [0, 1, 2, 3])
-        self.assertEqual(len(census.records), 4 * 16)
+        self.assertEqual(census.records, 4 * 17)
+        # Summed per (thread, event, detail, range), with the frames each was seen in.
+        self.assertEqual(len(census.entries), 17)
+        entry = census.entries[(1, mc.CPU_WRITE, mc.TRAP, STREAMED, 0x1000)]
+        self.assertEqual((entry.count, entry.bytes, entry.frames), (400, 3200, 0b1111))
+        static = census.entries[(0, mc.UPLOAD, BIND["uniform-stream"], STATIC, 0x100)]
+        self.assertEqual(static.changed, 0b0001)
         self.assertEqual(mc.frame_span(census, None, None), 4)
 
     def test_frame_span_selects_records(self):
         census = mc.read_census(self.path, 1, 2)
-        self.assertEqual({entry[0] for entry in census.records}, {1, 2})
+        self.assertEqual(census.frames, {1, 2})
+        self.assertEqual(census.records, 2 * 17)
         self.assertEqual(mc.frame_span(census, 1, 2), 2)
         self.assertEqual(mc.parse_frames("5:"), (5, None))
         self.assertEqual(mc.parse_frames(":7"), (None, 7))
@@ -129,6 +137,18 @@ class MemCensusTest(unittest.TestCase):
         self.assertEqual(static.sums["uploads"], 4 * 11)
         # Orphan pages: one group for the two adjacent ones.
         self.assertIn((ORPHAN, ORPHAN + 0x2000), groups)
+        # Inline engine writes are page events too.
+        self.assertEqual(groups[(MIXED, MIXED + 0x1000)].sums["inline_engine"], 4 * 3)
+
+    def test_large_ranges_take_nothing_in(self):
+        census = mc.read_census(self.path)
+        huge = mc.Entry()
+        huge.count, huge.bytes, huge.frames = 1, 1 << 30, 0b1
+        census.entries[(0, mc.UPLOAD, BIND["texture"], 0, 1 << 30)] = huge
+        groups = mc.analyze(census)
+        self.assertIn((0, 1 << 30), groups)
+        self.assertIn((STREAMED, STREAMED + 0x2000), groups)
+        self.assertEqual(groups[(0, 1 << 30)].sums["traps"], 0)
 
     def test_exact_keeps_ranges_apart(self):
         _, groups = self.groups(exact=True)
@@ -147,16 +167,20 @@ class MemCensusTest(unittest.TestCase):
 
     def test_stream_share_threshold(self):
         stats = mc.GroupStats(0, 0x1000)
-        for frame in range(4):
-            stats.add((frame, 0, mc.UPLOAD, BIND["uniform"], 0, 0x100, 1, 0x100, 0,
-                       0 if frame == 0 else 0x100), 1.0)
+        entry = mc.Entry()
+        entry.count, entry.bytes, entry.aux = 4, 0x400, 0x300
+        entry.frames, entry.changed = 0b1111, 0b0001
+        stats.add((0, mc.UPLOAD, BIND["uniform"], 0, 0x100), entry, 1.0)
         self.assertEqual(mc.classify(stats, 0.5), "cpu-static")
         self.assertEqual(mc.classify(stats, 0.25), "cpu-streamed")
 
     def test_texture_uploads_count_as_changed(self):
         stats = mc.GroupStats(0, 0x1000)
-        stats.add((0, 0, mc.UPLOAD, BIND["texture"], 0, 0x1000, 1, 0x1000, 0, 0x1000), 1.0)
+        entry = mc.Entry()
+        entry.count, entry.bytes, entry.aux, entry.frames = 1, 0x1000, 0x1000, 0b1
+        stats.add((0, mc.UPLOAD, BIND["texture"], 0, 0x1000), entry, 1.0)
         self.assertEqual(stats.sums["unchanged_bytes"], 0)
+        self.assertEqual(stats.frames["changed_upload"], 0b1)
 
     def test_report_and_json(self):
         out = io.StringIO()
