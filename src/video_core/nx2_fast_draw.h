@@ -82,6 +82,77 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
+/// EDEN_NX2_FAST_DRAW_STATS=1 (diagnostics): per draw, the path it took and why it left the
+/// delta path, by the bind headers the front parsed since the previous draw, with every break
+/// since then (not only the last).
+namespace Stats {
+
+/// The NVN binds MKW's command stream carries, by the 3D header (subchannel 0) that starts them.
+enum class Bind : u8 {
+    Texture,      ///< macro 0xe1c (BindTexture)
+    Uniform,      ///< macro 0xe02 (BindUniformBuffer)
+    Storage,      ///< constant buffer data header starting at 0x8e4 (BindStorageBuffer)
+    Program,      ///< macro 0xe3a (BindProgram)
+    VertexAttrib, ///< macro 0xe94 (BindVertexAttribState)
+    VertexStream, ///< macro 0xe96 (BindVertexStreamState)
+    Count,
+};
+
+inline const bool g_enabled = [] {
+    const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_STATS");
+    return value != nullptr && value[0] == '1';
+}();
+
+[[nodiscard]] inline int BindOfHeader(u32 subchannel, u32 method) {
+    if (subchannel != 0) {
+        return -1;
+    }
+    switch (method) {
+    case 0xe1c: return static_cast<int>(Bind::Texture);
+    case 0xe02: return static_cast<int>(Bind::Uniform);
+    case 0x8e4: return static_cast<int>(Bind::Storage);
+    case 0xe3a: return static_cast<int>(Bind::Program);
+    case 0xe94: return static_cast<int>(Bind::VertexAttrib);
+    case 0xe96: return static_cast<int>(Bind::VertexStream);
+    default: return -1;
+    }
+}
+
+/// Bind headers since the previous draw. Written and read on the thread that draws (the split's
+/// back gets them in GpuSplit tags).
+inline std::array<u32, static_cast<size_t>(Bind::Count)> g_binds{};
+
+/// Break reasons since the previous draw, from any thread.
+inline std::atomic<u32> g_reasons{};
+/// Register and Method breaks since the previous draw on this thread: their 3D methods.
+struct Methods {
+    static constexpr size_t Max = 8;
+    std::array<u16, Max> list{};
+    u32 count{};
+    bool overflow{};
+};
+inline thread_local Methods t_methods;
+
+inline void NoteBreak(Reason reason, u32 method) {
+    g_reasons.fetch_or(1U << static_cast<u32>(reason), std::memory_order_relaxed);
+    if (reason != Reason::Register && reason != Reason::Method) {
+        return;
+    }
+    Methods& methods = t_methods;
+    for (u32 i = 0; i < methods.count; ++i) {
+        if (methods.list[i] == method) {
+            return;
+        }
+    }
+    if (methods.count == Methods::Max) {
+        methods.overflow = true;
+        return;
+    }
+    methods.list[methods.count++] = static_cast<u16>(method);
+}
+
+} // namespace Stats
+
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
@@ -90,6 +161,9 @@ inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+        if (Stats::g_enabled) [[unlikely]] {
+            Stats::NoteBreak(reason, method);
+        }
     }
 }
 

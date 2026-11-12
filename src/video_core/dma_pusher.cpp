@@ -18,6 +18,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/memory.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
@@ -38,6 +39,21 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+
+// EDEN_NX2_FAST_DRAW_STATS: counted where the draws run (the split's back, or here).
+static void NoteBindHeader(u32 subchannel, u32 method) {
+    namespace Stats = VideoCommon::Nx2FastDraw::Stats;
+    const int bind = Stats::BindOfHeader(subchannel, method);
+    if (bind < 0) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (split.Active()) {
+        split.NoteBindHeader(static_cast<u32>(bind));
+    } else {
+        ++Stats::g_binds[bind];
+    }
+}
 
 bool DmaPusher::IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
                               u32 method) {
@@ -471,6 +487,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
         } else {
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
+            if (VideoCommon::Nx2FastDraw::Stats::g_enabled) [[unlikely]] {
+                NoteBindHeader(command_header.subchannel.Value(), command_header.method.Value());
+            }
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
                 SetState(command_header);

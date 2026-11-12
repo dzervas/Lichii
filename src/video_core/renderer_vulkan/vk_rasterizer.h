@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <optional>
 #include <string_view>
 
@@ -462,6 +463,53 @@ private:
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
     FastDrawStats fast_draw_stats;
+    /// EDEN_NX2_FAST_DRAW_STATS (Nx2FastDraw::Stats): each recorded draw's outcome (delta, delta
+    /// resolved in full by EDEN_NX2_FAST_DRAW_VERIFY, or the FullDraw reason TakeReusableDraw or,
+    /// late, DeltaStillHolds gave) with its PrepareDraw time, by the bind headers since the
+    /// previous draw; and, for draws a break sent to the full path, every break since then.
+    struct DrawStats {
+        static constexpr size_t Delta = 0;
+        static constexpr size_t Verified = 1;
+        static constexpr size_t Early = 2;
+        static constexpr size_t Late = Early + static_cast<size_t>(FullDraw::Count);
+        static constexpr size_t Outcomes = Late + static_cast<size_t>(FullDraw::Count);
+        static constexpr size_t Buckets = 8; ///< 0 to 6 headers, and 7 or more
+        static constexpr size_t Kinds = size_t{1}
+                                        << static_cast<size_t>(VideoCommon::Nx2FastDraw::Stats::Bind::Count);
+        struct Cell {
+            u64 draws{};
+            u64 ns{};
+        };
+        std::array<std::array<Cell, Outcomes>, Buckets> texture{};
+        std::array<std::array<Cell, Outcomes>, Buckets> buffer{}; ///< Uniform and storage
+        /// By the kinds of bind since the previous draw, and whether the draw's pipeline is the
+        /// previous draw's.
+        std::array<std::array<std::array<Cell, 2>, Outcomes>, Kinds> kinds{};
+        /// Full draws after a break (early StateChanged): the breaks' reasons and 3D methods.
+        struct BreakSet {
+            u32 reasons{};
+            std::array<u16, VideoCommon::Nx2FastDraw::Stats::Methods::Max> methods{};
+            bool overflow{};
+            auto operator<=>(const BreakSet&) const = default;
+        };
+        std::map<BreakSet, u64> sets;
+        /// Draws that took the full path, by every FullDraw reason TakeReusableDraw would give
+        /// (bits 0-8), with bit 9: the data written reaches a handle word itself (not only its
+        /// constant buffer), bit 10: the breaks are only register vertex_id_base (0x446).
+        std::map<u32, Cell> blockers;
+        std::array<u64, 0x1000> method_draws{}; ///< Draws whose breaks include the method
+        std::array<u64, 0x1000> sole_method_draws{}; ///< Draws broken by that method only
+        u64 frames{};
+        u64 window_start{};
+    };
+    void NoteDrawStats(u64 ns, bool same_pipeline);
+    u32 DrawBlockers(const ReusableDraw& draw, const VideoCommon::Nx2FastDraw::Delta& delta);
+    void ReportDrawStats();
+    DrawStats draw_stats;
+    u8 draw_outcome{}; ///< DrawStats outcome of the draw being prepared
+    u32 draw_blockers{}; ///< DrawStats::blockers mask of the draw being prepared
+    DrawStats::BreakSet draw_breaks; ///< Breaks the draw being prepared was compared after
+    GraphicsPipeline* candidate_pipeline{}; ///< The previous draw's, for DrawStats
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};

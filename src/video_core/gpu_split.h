@@ -229,6 +229,13 @@ public:
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
 
+    /// EDEN_NX2_FAST_DRAW_STATS, front: a bind header (Nx2FastDraw::Stats::Bind) parsed. The
+    /// back counts it before the entries sent after it.
+    void NoteBindHeader(u32 bind) {
+        ++bind_headers[bind];
+        bind_headers_pending = true;
+    }
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
@@ -375,6 +382,7 @@ private:
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
         ConstBufferWrites, ///< Bits 8-31 count; then ConstBufferWrite's writes, a word each
+        BindHeaders, ///< EDEN_NX2_FAST_DRAW_STATS: bits 16-63 a byte per bind kind, counts
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -426,6 +434,9 @@ private:
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
         SendOpenWrites();
+        if (bind_headers_pending) [[unlikely]] {
+            SendBindHeaders();
+        }
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -434,6 +445,18 @@ private:
         return ReserveSlow(words);
     }
     u64* ReserveSlow(size_t words);
+    void SendBindHeaders() {
+        bind_headers_pending = false;
+        u64* const entry = Reserve(1);
+        entry[0] = static_cast<u64>(Kind::BindHeaders);
+        for (size_t bind = 0; bind < bind_headers.size(); ++bind) {
+            entry[0] |= u64{(std::min)(bind_headers[bind], 0xffU)} << (16 + 8 * bind);
+            bind_headers[bind] = 0;
+        }
+        Commit(1);
+    }
+    std::array<u32, 6> bind_headers{};
+    bool bind_headers_pending{};
     void Commit(size_t words) {
         write_position += words;
         const u64 unpublished = write_position - published_local;

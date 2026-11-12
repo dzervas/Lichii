@@ -20,6 +20,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/evicted_pointer_slots.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -319,6 +320,10 @@ public:
     [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
         return handle_constant_buffers;
     }
+
+    /// EDEN_NX2_FAST_DRAW_STATS: whether the delta's constant buffer data reaches one of the
+    /// handle words the pipeline reads (at their GPU address, or the device address it maps).
+    [[nodiscard]] bool DeltaReachesHandleWords(const VideoCommon::Nx2FastDraw::Delta& delta) const;
 
     /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
     /// the constant buffers again) and records the draw's descriptors with the image views,

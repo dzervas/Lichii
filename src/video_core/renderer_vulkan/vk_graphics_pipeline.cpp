@@ -1114,6 +1114,53 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return ConfigureDraw(rescaling, render_area);
 }
 
+bool GraphicsPipeline::DeltaReachesHandleWords(const VideoCommon::Nx2FastDraw::Delta& delta) const {
+    const auto reaches = [&](GPUVAddr address) {
+        for (u32 write = 0; write < delta.num_writes; ++write) {
+            if (delta.write_begin[write] < address + 4 && address < delta.write_end[write]) {
+                return true;
+            }
+        }
+        if (delta.num_device_writes == 0) {
+            return false;
+        }
+        const auto device = gpu_memory->GpuToCpuAddress(address);
+        for (u32 write = 0; device && write < delta.num_device_writes; ++write) {
+            if (delta.device_begin[write] < *device + 4 && *device < delta.device_end[write]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+        const Shader::Info& info = stage_infos[stage];
+        const auto words = [&](const auto& descriptors) {
+            for (const auto& desc : descriptors) {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    if (reaches(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                (index << desc.size_shift))) {
+                        return true;
+                    }
+                }
+                if constexpr (requires { desc.has_secondary; }) {
+                    if (desc.has_secondary &&
+                        reaches(cbufs[desc.secondary_cbuf_index].address +
+                                desc.secondary_cbuf_offset)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        if (words(info.texture_buffer_descriptors) || words(info.image_buffer_descriptors) ||
+            words(info.texture_descriptors) || words(info.image_descriptors)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool GraphicsPipeline::DeltaImagesChange() const noexcept {
     return texture_cache.SampledViewsChange(delta_views);
 }

@@ -756,6 +756,11 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                                                                                    count);
         return 1 + count;
     }
+    case Kind::BindHeaders:
+        for (size_t bind = 0; bind < Nx2FastDraw::Stats::g_binds.size(); ++bind) {
+            Nx2FastDraw::Stats::g_binds[bind] += static_cast<u32>((head >> (16 + 8 * bind)) & 0xff);
+        }
+        return 1;
     case Kind::Call: {
         if (Nx2Profile::Enabled()) {
             g_cb_pattern.Entry();
