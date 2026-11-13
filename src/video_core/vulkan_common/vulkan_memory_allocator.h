@@ -8,6 +8,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -107,10 +108,12 @@ namespace Vulkan {
 
         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
         /// images would otherwise leave holes in the shared blocks).
-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                              std::source_location where = std::source_location::current()) const;
 
         /// CreateImage, but a null image instead of an exception when there is no memory for it.
-        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                                 std::source_location where = std::source_location::current()) const;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
@@ -125,7 +128,8 @@ namespace Vulkan {
                                         VmaAllocationInfo& alloc_info) const;
 
         VmaAllocation AllocateSparseMemory(const VkMemoryRequirements &requirements,
-                                           VkDeviceMemory &memory, VkDeviceSize &offset) const;
+                                           VkDeviceMemory &memory, VkDeviceSize &offset,
+                                           std::source_location where = std::source_location::current()) const;
 
         void FreeSparseMemory(VmaAllocation allocation) const;
 
@@ -141,10 +145,12 @@ namespace Vulkan {
             return failed_images.load(std::memory_order_relaxed);
         }
 
-        vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
+        vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                std::source_location where = std::source_location::current()) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
-                                VkDeviceSize min_alignment) const;
+                                VkDeviceSize min_alignment,
+                                std::source_location where = std::source_location::current()) const;
 
         /**
          * Commits a memory with the specified requirements.
@@ -154,10 +160,12 @@ namespace Vulkan {
          *
          * @returns A memory commit.
          */
-        MemoryCommit Commit(const VkMemoryRequirements &requirements, MemoryUsage usage);
+        MemoryCommit Commit(const VkMemoryRequirements &requirements, MemoryUsage usage,
+                            std::source_location where = std::source_location::current());
 
         /// Commits memory required by the buffer and binds it (for buffers created outside VMA).
-        MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage);
+        MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage,
+                            std::source_location where = std::source_location::current());
 
     private:
         static bool IsAutoUsage(VmaMemoryUsage u) noexcept {
@@ -174,7 +182,7 @@ namespace Vulkan {
         /// CreateImage's fallbacks; the image is left null when the result is an error.
         /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                               vk::Image &image) const;
+                               vk::Image &image, const std::source_location& where) const;
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
@@ -190,6 +198,12 @@ namespace Vulkan {
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
     void LogMemoryStatistics(const Device& device);
+
+    /// EDEN_NX2_CENSUS: counts an allocation's bytes under the source line that asked for it
+    /// (logged per caller by LogMemoryStatistics) until CensusUntrackAllocation.
+    void CensusTrackAllocation(VmaAllocator allocator, VmaAllocation allocation,
+                               const std::source_location& where);
+    void CensusUntrackAllocation(VmaAllocator allocator, VmaAllocation allocation);
 
     /// One line each for the process's memory, what DXGI counts for the GPU (Windows), and VMA's
     /// heaps and memory types against what the driver reports (EDEN_NX2_MEM_TRACE).
