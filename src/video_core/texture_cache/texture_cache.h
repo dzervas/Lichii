@@ -34,6 +34,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
+#include "video_core/texture_cache/collector_policy.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/host_mip_limits.h"
@@ -152,7 +153,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
             allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
-        ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+        ticks_to_destroy = CollectableAge(aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL,
+                                          total_used_memory >= device_limit_memory, out_of_memory);
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
@@ -324,23 +326,25 @@ template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
-    // MaxCriticalMemory on rather than near the card's budget. Larger cards get 5/8 of the
-    // driver's budget (GetDeviceLocalMemory is capped near 7 GiB): at 5 GiB title 1's races
-    // recreate and upload ~8 MiB of render targets a frame (16 GB card: 53 -> 59 fps at 10 GiB).
+    // CriticalMemoryCap on rather than near the card's budget (GetDeviceLocalMemory is capped
+    // near 7 GiB, so the driver's budget sizes it). Images used in the last RecentUseFrames
+    // frames stay until the usage reaches device_limit_memory (DeviceLimitMemory).
     // What the device budget allows (budget minus margins), before that cap.
     const u64 budget_critical = critical_memory;
     const u64 budget_expected = expected_memory;
-    u64 max_critical = MaxCriticalMemory;
+    device_limit_memory = budget_critical;
+    u64 budget = 0;
     if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-        max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
+        budget = runtime.GetDeviceMemoryBudget();
     }
+    const u64 max_critical = CriticalMemoryCap(budget);
     critical_memory = (std::min)(critical_memory, max_critical);
     expected_memory =
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB raise the collector's thresholds past
-    // MaxCriticalMemory, but never past what the device budget allows: set outright, they kept
+    // CriticalMemoryCap, but never past what the device budget allows: set outright, they kept
     // the cache above a shrinking budget (other programs' video memory, out-of-memory margins) and
     // the driver paged (drops to 9 fps on an 8 GB card in Ocarina's Kokiri Forest).
     for (const auto& [name, target, limit] :
@@ -441,6 +445,10 @@ void TextureCache<P>::TickFrame() {
                     critical_memory = (std::min)(critical_memory, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
+                    device_limit_memory = (std::max)(
+                        device_limit_memory,
+                        (std::min)(DeviceLimitMemory(budget, pressure_margin + slack_margin),
+                                   host_critical));
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the cap: before it, every check differed from
                     // the capped value by more than 256 MiB and logged twice a second. Compared
@@ -552,6 +560,11 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
                  image_bytes >> 20);
+        LOG_INFO(HW_GPU,
+                 "Texture cache: device limit {} MiB (block slack {} MiB), reached in {} of the "
+                 "last 600 frames",
+                 device_limit_memory >> 20, slack_margin >> 20, device_limit_frames);
+        device_limit_frames = 0;
         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
@@ -609,6 +622,9 @@ void TextureCache<P>::TickFrame() {
         const u32 failed = runtime.FailedImages();
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
+    }
+    if (total_used_memory >= device_limit_memory) {
+        ++device_limit_frames;
     }
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);

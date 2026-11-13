@@ -192,9 +192,6 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
-    /// The most device memory the collector lets the cache fill before it collects in earnest on
-    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
-    static constexpr u64 MaxCriticalMemory = 5_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;
@@ -673,6 +670,11 @@ private:
     u64 minimum_memory;
     u64 expected_memory;
     u64 critical_memory;
+    /// Past this usage the collector deletes images however recently they were used
+    /// (CollectableAge): the critical threshold before CriticalMemoryCap, or with the driver's
+    /// budget, DeviceLimitMemory (TickFrame).
+    u64 device_limit_memory = 0;
+    u64 device_limit_frames{}; ///< Frames with the usage at device_limit_memory (last 600)
     size_t gpu_unswizzle_maxsize = 0;
     size_t swizzle_chunk_size = 0;
     u32 swizzle_slices_per_batch = 0;
