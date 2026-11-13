@@ -142,6 +142,7 @@ struct ImageBase {
     u32 census_use_frames = 0;
     u8 census_creator = 0;
     u8 census_first_later_use = 0;
+    u8 census_use_kinds = 0; ///< bit per Census::Kind used in a later frame
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 
