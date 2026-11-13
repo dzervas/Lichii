@@ -165,6 +165,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
     u64 superseded_deletes{};  ///< Bad overlaps JoinImages deleted (SupersededByNewerImage)
+    u64 covered_deletes{};     ///< Bad overlaps covered whole that TickFrame deleted (the same)
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -490,6 +491,13 @@ private:
 
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
+
+    /// Deletes the bad overlaps of supersede_candidates that newer GPU-written images cover whole
+    /// (SupersededByNewerImage, GuestRangeCovered).
+    void DeleteCoveredBadOverlaps();
+
+    /// Images with bad overlaps the GPU wrote this frame, for DeleteCoveredBadOverlaps.
+    std::vector<ImageId> supersede_candidates;
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);

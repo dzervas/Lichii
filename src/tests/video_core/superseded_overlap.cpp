@@ -74,3 +74,29 @@ TEST_CASE("Images of another shape, used this frame or holding other data stay",
     REQUIRE_FALSE(SupersededByNewerImage(Written, OlderWritten & ~ImageFlagBits::Registered, true,
                                          940, 1000));
 }
+
+TEST_CASE("Newer images must cover every byte of an older one of another shape",
+          "[video_core][texture_cache][superseded_overlap]") {
+    using VideoCommon::GuestRangeCovered;
+    // A 1872x1048 RGBA8 target (7.5 MiB) at 0x1000000, rendered over by targets of other sizes.
+    constexpr u64 begin = 0x1000000;
+    constexpr u64 end = begin + 1872 * 1048 * 4;
+    std::vector<std::pair<u64, u64>> ranges{{begin, end + 4096}};
+    REQUIRE(GuestRangeCovered(begin, end, ranges));
+    // Together, in any order, overlapping or touching.
+    ranges = {{begin + 0x400000, end}, {begin - 0x1000, begin + 0x200000},
+              {begin + 0x200000, begin + 0x500000}};
+    REQUIRE(GuestRangeCovered(begin, end, ranges));
+    // A gap: those bytes may still be read through the older image.
+    ranges = {{begin, begin + 0x200000}, {begin + 0x200001, end}};
+    REQUIRE_FALSE(GuestRangeCovered(begin, end, ranges));
+    // Short of either end.
+    ranges = {{begin + 1, end}};
+    REQUIRE_FALSE(GuestRangeCovered(begin, end, ranges));
+    ranges = {{begin, end - 1}};
+    REQUIRE_FALSE(GuestRangeCovered(begin, end, ranges));
+    ranges.clear();
+    REQUIRE_FALSE(GuestRangeCovered(begin, end, ranges));
+    // Covered whole, the policy applies as for the same shape.
+    REQUIRE(SupersededByNewerImage(Written, OlderWritten, true, 940, 1000));
+}

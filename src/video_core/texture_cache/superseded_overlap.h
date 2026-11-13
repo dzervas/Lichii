@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 #include "common/common_types.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
@@ -25,25 +29,47 @@ namespace VideoCommon {
            lhs.astc_opaque == rhs.astc_opaque;
 }
 
-/// Whether JoinImages deletes `older`, a bad overlap of the image it just made (they overlap, and
-/// neither fits in the other, so nothing keeps their contents coherent), as soon as the new one
-/// holds GPU-written data. Mario Kart World renders its 2048x2048 3-layer shadow map at 39-46
+/// Whether `older`, a bad overlap of a newer GPU-written image (they overlap, and neither fits in
+/// the other, so nothing keeps their contents coherent), is deleted now rather than by the
+/// collector later. `replaced`: it has the newer image's shape (JoinImages, on making the newer
+/// one), or newer GPU-written images cover every byte of its guest range (TickFrame, see
+/// GuestRangeCovered). Mario Kart World renders its 2048x2048 3-layer shadow map at 39-46
 /// addresses within ~9.5 MiB, 96-144 KiB apart, and comes back to each one ~50-90 frames later:
 /// about 30 of these 24 MiB arrays stayed resident on top of each other (0.7-1 GiB for ~34 MiB of
 /// guest memory), only for the collector to delete them in its heavy mode and make them again
-/// within 120 frames. Only an image of the same shape, written by the GPU and nothing since, with
+/// within 120 frames. Its dynamic-resolution targets of other sizes over one transient pool held
+/// 3.8-4.3 GiB of bad overlaps for 1.3-1.4 GiB of guest memory in the heavy stretch: those go
+/// once covered whole, as a part no newer image covers may still be read through. Only an image
+/// written by the GPU and nothing since, with
 /// many overlaps (BadOverlap: the collector deletes those without a download), no aliases and not
 /// used this frame goes; DeleteImage keeps it until the GPU is done with it.
 [[nodiscard]] constexpr bool SupersededByNewerImage(ImageFlagBits newer, ImageFlagBits older,
-                                                    bool same_info, u64 older_last_use,
+                                                    bool replaced, u64 older_last_use,
                                                     u64 frame_tick) {
     constexpr ImageFlagBits kept = ImageFlagBits::CpuModified | ImageFlagBits::Alias |
                                    ImageFlagBits::Sparse | ImageFlagBits::IsDecoding |
                                    ImageFlagBits::CostlyLoad;
-    return same_info && True(newer & ImageFlagBits::GpuModified) &&
+    return replaced && True(newer & ImageFlagBits::GpuModified) &&
            True(older & ImageFlagBits::GpuModified) && True(older & ImageFlagBits::BadOverlap) &&
            True(older & ImageFlagBits::Registered) && False(older & kept) &&
            older_last_use < frame_tick;
+}
+
+/// Whether the ranges [first, second) cover every byte of [begin, end). Sorts `ranges`.
+[[nodiscard]] inline bool GuestRangeCovered(u64 begin, u64 end,
+                                            std::vector<std::pair<u64, u64>>& ranges) {
+    std::ranges::sort(ranges);
+    u64 covered = begin;
+    for (const auto& [range_begin, range_end] : ranges) {
+        if (range_begin > covered) {
+            break;
+        }
+        covered = (std::max)(covered, range_end);
+        if (covered >= end) {
+            return true;
+        }
+    }
+    return covered >= end;
 }
 
 } // namespace VideoCommon

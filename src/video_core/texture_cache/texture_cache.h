@@ -281,6 +281,60 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
 }
 
 template <class P>
+void TextureCache<P>::DeleteCoveredBadOverlaps() {
+    std::ranges::sort(supersede_candidates);
+    const auto [last, end] = std::ranges::unique(supersede_candidates);
+    supersede_candidates.erase(last, end);
+    std::vector<std::pair<u64, u64>> ranges;
+    std::vector<ImageId> covered;
+    for (const ImageId newer_id : supersede_candidates) {
+        // Deleted since (or deleted and the slot reused: the checks below hold for any image).
+        if (!slot_images.contains(newer_id)) {
+            continue;
+        }
+        const Image& newer = slot_images[newer_id];
+        if (False(newer.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        for (const ImageId older_id : newer.overlapping_images) {
+            const Image& older = slot_images[older_id];
+            if (older.modification_tick >= newer.modification_tick) {
+                continue;
+            }
+            ranges.clear();
+            for (const ImageId other_id : older.overlapping_images) {
+                const Image& other = slot_images[other_id];
+                if (True(other.flags & ImageFlagBits::GpuModified) &&
+                    other.modification_tick > older.modification_tick) {
+                    ranges.emplace_back(other.cpu_addr, other.cpu_addr + other.guest_size_bytes);
+                }
+            }
+            if (SupersededByNewerImage(
+                    newer.flags, older.flags,
+                    GuestRangeCovered(older.cpu_addr, older.cpu_addr + older.guest_size_bytes,
+                                      ranges),
+                    lru_cache.Tick(older.lru_index), frame_tick)) {
+                covered.push_back(older_id);
+            }
+        }
+    }
+    supersede_candidates.clear();
+    std::ranges::sort(covered);
+    const auto [covered_last, covered_end] = std::ranges::unique(covered);
+    covered.erase(covered_last, covered_end);
+    for (const ImageId older_id : covered) {
+        Image& older = slot_images[older_id];
+        MarkStale(older); // before UntrackImage (see MarkStale)
+        if (True(older.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(older, older_id);
+        }
+        UnregisterImage(older_id);
+        DeleteImage(older_id);
+        ++covered_deletes;
+    }
+}
+
+template <class P>
 void TextureCache<P>::MarkStale(const ImageBase& image) {
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
         False(image.flags & ImageFlagBits::GpuModified) ||
@@ -582,10 +636,11 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha, {} superseded bad overlaps",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha, {} superseded bad overlaps ({} covered whole)",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
-                 async_decodes_queued, astc_opaque_images, astc_alpha_images, superseded_deletes);
+                 async_decodes_queued, astc_opaque_images, astc_alpha_images, superseded_deletes + covered_deletes,
+                 covered_deletes);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
@@ -610,7 +665,7 @@ void TextureCache<P>::TickFrame() {
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
-        superseded_deletes = 0;
+        superseded_deletes = covered_deletes = 0;
         images_created = images_deleted = 0;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -621,6 +676,7 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
+    DeleteCoveredBadOverlaps();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
@@ -3425,6 +3481,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(overlap_id);
         ++superseded_deletes;
     }
+    if (True(new_image.flags & ImageFlagBits::GpuModified) &&
+        !new_image.overlapping_images.empty()) {
+        supersede_candidates.push_back(new_image_id);
+    }
 
     RegisterImage(new_image_id);
     return new_image_id;
@@ -4366,6 +4426,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
         }
         MarkModification(image);
+        if (!image.overlapping_images.empty()) {
+            supersede_candidates.push_back(image_id);
+        }
     }
     lru_cache.Touch(image.lru_index, frame_tick);
 }
