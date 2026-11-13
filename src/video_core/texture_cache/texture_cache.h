@@ -4872,7 +4872,8 @@ void TextureCache<P>::LogCensus() {
     std::array<u64, Census::age_limits.size() + 1> age_bytes{};
     std::array<u64, Census::age_limits.size() + 1> age_count{};
     u64 resident{}, images{}, dedicated{}, dedicated_count{}, unused{}, aliased{},
-        aliased_count{}, gpu_written{}, guest{}, bad_overlap{}, bad_overlap_count{};
+        aliased_count{}, gpu_written{}, guest{}, bad_overlap{}, bad_overlap_count{},
+        estimated{};
     std::vector<std::pair<u64, u64>> guest_ranges;
     std::map<u32, std::array<u64, 3>> by_format; ///< host bytes, guest bytes, images
     for (const auto [image_id, image] : slot_images) {
@@ -4912,6 +4913,11 @@ void TextureCache<P>::LogCensus() {
             bad_overlap += bytes;
             ++bad_overlap_count;
         }
+        if constexpr (requires(const Image& i) { i.MemoryBlock(); }) {
+            if (image->MemoryBlock().size == 0) {
+                estimated += bytes;
+            }
+        }
     }
     {
         // Guest bytes: what the images' guest ranges hold, counted once where they overlap
@@ -4938,10 +4944,10 @@ void TextureCache<P>::LogCensus() {
                                 MiB(totals[1]), totals[2]);
         }
         LOG_INFO(HW_GPU,
-                 "Census guest vs host: host {} MiB, guest {} MiB summed over images, {} MiB "
+                 "Census guest vs host: host {} MiB ({} MiB of it estimated: images without an allocation of their own, sparse or unbacked), guest {} MiB summed over images, {} MiB "
                  "distinct (union of guest ranges); bad-overlap images {} MiB host ({}); by "
                  "format host/guest MiB (images):{}",
-                 MiB(resident), MiB(guest), MiB(guest_union), MiB(bad_overlap),
+                 MiB(resident), MiB(estimated), MiB(guest), MiB(guest_union), MiB(bad_overlap),
                  bad_overlap_count, text);
     }
     const auto ages = [&](const auto& bytes, const auto& counts) {

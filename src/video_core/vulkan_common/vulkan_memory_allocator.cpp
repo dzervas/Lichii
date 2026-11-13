@@ -9,6 +9,10 @@
 #include <array>
 #include <bit>
 #include <limits>
+#include <map>
+#include <tuple>
+#include <mutex>
+#include <source_location>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -193,6 +197,7 @@ void MemoryCommit::Release() {
             vmaUnmapMemory(allocator, allocation);
             mapped_ptr = nullptr;
         }
+        CensusUntrackAllocation(allocator, allocation);
         vmaFreeMemory(allocator, allocation);
     }
     allocation = nullptr;
@@ -226,16 +231,18 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       std::source_location where) const
 {
     vk::Image image;
-    vk::Check(AllocateImage(ci, dedicated, false, image));
+    vk::Check(AllocateImage(ci, dedicated, false, image, where));
     return image;
 }
 
-vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
+vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                          std::source_location where) const {
     vk::Image image;
-    const VkResult result = AllocateImage(ci, dedicated, true, image);
+    const VkResult result = AllocateImage(ci, dedicated, true, image, where);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
     }
@@ -243,7 +250,8 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
 }
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                                        vk::Image &image) const {
+                                        vk::Image &image,
+                                        const std::source_location& where) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -352,6 +360,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         );
     }
 
+    CensusTrackAllocation(allocator, allocation, where);
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
     return VK_SUCCESS;
@@ -377,7 +386,8 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
 
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                                    VkDeviceMemory &memory,
-                                                   VkDeviceSize &offset) const {
+                                                   VkDeviceSize &offset,
+                                                   std::source_location where) const {
     const VmaAllocationCreateInfo alloc_ci{
         .flags = 0,
         .usage = VMA_MEMORY_USAGE_UNKNOWN,
@@ -411,6 +421,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
             pool_ci.pool = pool;
             if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
                 VK_SUCCESS) {
+                CensusTrackAllocation(allocator, allocation, where);
                 memory = info.deviceMemory;
                 offset = info.offset;
                 return allocation;
@@ -420,6 +431,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
+    CensusTrackAllocation(allocator, allocation, where);
     memory = info.deviceMemory;
     offset = info.offset;
     return allocation;
@@ -427,6 +439,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
 
 void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     if (allocation != VK_NULL_HANDLE) {
+        CensusUntrackAllocation(allocator, allocation);
         vmaFreeMemory(allocator, allocation);
     }
 }
@@ -464,7 +477,8 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
            VK_SUCCESS;
 }
 
-vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                         std::source_location where) const {
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
@@ -513,6 +527,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         }
         vk::Check(result);
     }
+    CensusTrackAllocation(allocator, allocation, where);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     // Log GPU memory allocation for buffers
@@ -539,9 +554,10 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
-                                         VkDeviceSize min_alignment) const {
+                                         VkDeviceSize min_alignment,
+                                         std::source_location where) const {
     if (min_alignment <= 1) {
-        return CreateBuffer(ci, usage);
+        return CreateBuffer(ci, usage, where);
     }
     VkMemoryPropertyFlags anv_flags = 0;
     if (usage == MemoryUsage::Stream &&
@@ -570,6 +586,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 
     vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
                                            &allocation, &alloc_info));
+    CensusTrackAllocation(allocator, allocation, where);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -588,7 +605,8 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
                       location, device.GetDispatchLoader());
 }
 
-MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)
+MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage,
+                                     std::source_location where)
 {
     const auto vma_usage = MemoryUsageVma(usage);
     VmaAllocationCreateInfo ci{};
@@ -618,10 +636,12 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     }
 
     vk::Check(res);
+    CensusTrackAllocation(allocator, a, where);
     return MemoryCommit(allocator, a, info);
 }
 
-MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage) {
+MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage,
+                                     std::source_location where) {
     // Allocate memory appropriate for this buffer automatically
     const auto vma_usage = MemoryUsageVma(usage);
 
@@ -656,6 +676,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
 
     vk::Check(res);
     vk::Check(vmaBindBufferMemory2(allocator, a, 0, raw, nullptr));
+    CensusTrackAllocation(allocator, a, where);
     return MemoryCommit(allocator, a, info);
 }
 
@@ -765,6 +786,66 @@ void LogMemoryTrace(const Device& device) {
     LOG_INFO(Render_Vulkan, "Memory trace: types {}", types);
 }
 
+namespace {
+// EDEN_NX2_CENSUS: live allocation bytes per source line (CensusTrackAllocation).
+struct CensusSite {
+    std::string name;
+    std::atomic<s64> heap0_bytes{};
+    std::atomic<s64> other_bytes{};
+    std::atomic<s64> count{};
+};
+std::mutex census_sites_mutex;
+std::map<std::pair<std::string, u32>, std::unique_ptr<CensusSite>> census_sites;
+
+bool CensusHeap0(VmaAllocator allocator, u32 memory_type) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    return properties->memoryTypes[memory_type].heapIndex == 0;
+}
+} // Anonymous namespace
+
+void CensusTrackAllocation(VmaAllocator allocator, VmaAllocation allocation,
+                           const std::source_location& where) {
+    if (!VideoCommon::Census::Enabled() || allocation == VK_NULL_HANDLE) {
+        return;
+    }
+    CensusSite* site{};
+    {
+        std::string file = where.file_name();
+        if (const size_t at = file.find("video_core/"); at != std::string::npos) {
+            file = file.substr(at + 11);
+        }
+        std::scoped_lock lock{census_sites_mutex};
+        auto& entry = census_sites[{file, where.line()}];
+        if (!entry) {
+            entry = std::make_unique<CensusSite>();
+            entry->name = fmt::format("{}:{}", file, where.line());
+        }
+        site = entry.get();
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    (CensusHeap0(allocator, info.memoryType) ? site->heap0_bytes : site->other_bytes)
+        .fetch_add(static_cast<s64>(info.size), std::memory_order_relaxed);
+    site->count.fetch_add(1, std::memory_order_relaxed);
+    vmaSetAllocationUserData(allocator, allocation, site);
+}
+
+void CensusUntrackAllocation(VmaAllocator allocator, VmaAllocation allocation) {
+    if (!VideoCommon::Census::Enabled() || allocation == VK_NULL_HANDLE) {
+        return;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    auto* const site = static_cast<CensusSite*>(info.pUserData);
+    if (site == nullptr) {
+        return;
+    }
+    (CensusHeap0(allocator, info.memoryType) ? site->heap0_bytes : site->other_bytes)
+        .fetch_sub(static_cast<s64>(info.size), std::memory_order_relaxed);
+    site->count.fetch_sub(1, std::memory_order_relaxed);
+}
+
 void LogMemoryStatistics(const Device& device) {
     const VmaAllocator allocator = device.GetAllocator();
     const VkPhysicalDeviceMemoryProperties* properties{};
@@ -804,6 +885,32 @@ void LogMemoryStatistics(const Device& device) {
                      kind == Device::SeparatePool::SparsePages ? "sparse pages" : "device buffers",
                      type, s.blockCount, s.blockBytes >> 20, s.allocationCount,
                      s.allocationBytes >> 20, (s.blockBytes - s.allocationBytes) >> 20);
+        }
+        {
+            // Live allocations by the source line that asked for them, heap 0 first.
+            std::vector<std::tuple<s64, s64, s64, std::string>> sites;
+            s64 total{};
+            {
+                std::scoped_lock lock{census_sites_mutex};
+                for (const auto& [key, site] : census_sites) {
+                    const s64 heap0 = site->heap0_bytes.load(std::memory_order_relaxed);
+                    total += heap0;
+                    sites.emplace_back(heap0, site->other_bytes.load(std::memory_order_relaxed),
+                                       site->count.load(std::memory_order_relaxed), site->name);
+                }
+            }
+            std::ranges::sort(sites, std::greater{});
+            std::string text;
+            for (size_t i = 0; i < (std::min)(sites.size(), size_t{24}); ++i) {
+                const auto& [heap0, other, count, name] = sites[i];
+                if (heap0 == 0 && other == 0) {
+                    break;
+                }
+                text += fmt::format(" {} {}/{}({})", name, heap0 >> 20, other >> 20, count);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Census VMA by caller, heap 0 {} MiB in all; heap 0/other MiB (allocations):{}",
+                     total >> 20, text);
         }
         const auto calls = Device::TakeMemoryCallTimes();
         LOG_INFO(Render_Vulkan,
