@@ -44,10 +44,11 @@ enum class Delete : u8 {
     Join,         ///< Replaced by a new image that JoinImages copied it into
     JoinRemapped, ///< Remapped overlap JoinImages discarded
     Unmap,        ///< Guest memory unmapped
+    Superseded,   ///< A bad overlap JoinImages deleted (SupersededByNewerImage)
     Count,
 };
 inline constexpr std::array<std::string_view, static_cast<size_t>(Delete::Count)> delete_names{
-    "gc", "join", "remap", "unmap"};
+    "gc", "join", "remap", "unmap", "superseded"};
 
 /// format, type, width, height, depth, levels, layers, samples
 using ClassKey = std::array<u32, 8>;

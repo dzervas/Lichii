@@ -3538,6 +3538,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, overlap_id);
         }
         UnregisterImage(overlap_id);
+        census_delete = Census::Delete::Superseded;
         DeleteImage(overlap_id);
         ++superseded_deletes;
     }
