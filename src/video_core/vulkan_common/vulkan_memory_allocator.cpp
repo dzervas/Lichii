@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <limits>
@@ -31,6 +33,7 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include <ranges>
+#include "video_core/texture_cache/census.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -40,6 +43,11 @@
 #include "common/settings.h"
 
 namespace Vulkan {
+
+// EDEN_NX2_CENSUS: vmaCreateImage calls since the last LogMemoryStatistics.
+static std::atomic<u64> census_image_creates{};
+static std::atomic<u64> census_image_create_ns{};
+static std::atomic<u64> census_image_create_max_ns{};
 namespace {
 
 // Helpers translating MemoryUsage to flags/usage
@@ -269,8 +277,21 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     const bool huge = IsTooLargeToBack(texels, bytes);
+    const bool census = VideoCommon::Census::Enabled();
+    const auto census_start = census ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (census && !huge) {
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - census_start)
+                                            .count());
+        census_image_creates.fetch_add(1, std::memory_order_relaxed);
+        census_image_create_ns.fetch_add(ns, std::memory_order_relaxed);
+        u64 max = census_image_create_max_ns.load(std::memory_order_relaxed);
+        while (ns > max && !census_image_create_max_ns.compare_exchange_weak(max, ns)) {
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -742,15 +763,48 @@ void LogMemoryStatistics(const Device& device) {
     vmaGetMemoryProperties(allocator, &properties);
     VmaTotalStatistics stats{};
     vmaCalculateStatistics(allocator, &stats);
+    const bool census = VideoCommon::Census::Enabled();
     for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
         const VmaStatistics& s = stats.memoryType[type].statistics;
         if (s.blockCount == 0) {
+            continue;
+        }
+        if (census) {
+            // Blocks include dedicated allocations (one block each, no slack).
+            LOG_INFO(Render_Vulkan,
+                     "Census VMA type {} (heap {}, flags {:#x}): {} blocks {} MiB, {} allocations "
+                     "{} MiB, slack {} MiB",
+                     type, properties->memoryTypes[type].heapIndex,
+                     static_cast<u32>(properties->memoryTypes[type].propertyFlags), s.blockCount,
+                     s.blockBytes >> 20, s.allocationCount, s.allocationBytes >> 20,
+                     (s.blockBytes - s.allocationBytes) >> 20);
             continue;
         }
         LOG_DEBUG(Render_Vulkan, "VMA type {} (heap {}, flags {:#x}): {} blocks {} MiB, {} allocations {} MiB",
                  type, properties->memoryTypes[type].heapIndex,
                  static_cast<u32>(properties->memoryTypes[type].propertyFlags), s.blockCount,
                  s.blockBytes >> 20, s.allocationCount, s.allocationBytes >> 20);
+    }
+    if (census) {
+        // The separate pools (buffers, sparse pages); the default pools hold the rest.
+        for (const auto& [kind, type, pool] : device.SeparatePools()) {
+            VmaStatistics s{};
+            vmaGetPoolStatistics(allocator, pool, &s);
+            LOG_INFO(Render_Vulkan,
+                     "Census VMA pool {} type {}: {} blocks {} MiB, {} allocations {} MiB, slack "
+                     "{} MiB",
+                     kind == Device::SeparatePool::SparsePages ? "sparse pages" : "device buffers",
+                     type, s.blockCount, s.blockBytes >> 20, s.allocationCount,
+                     s.allocationBytes >> 20, (s.blockBytes - s.allocationBytes) >> 20);
+        }
+        const auto calls = Device::TakeMemoryCallTimes();
+        LOG_INFO(Render_Vulkan,
+                 "Census VMA calls since last: {} images created in {} ms (max {} us); {} "
+                 "vkAllocateMemory {} MiB in {} ms (max {} us); {} vkFreeMemory in {} ms",
+                 census_image_creates.exchange(0), census_image_create_ns.exchange(0) / 1000000,
+                 census_image_create_max_ns.exchange(0) / 1000, calls.allocations,
+                 calls.allocated_bytes >> 20, calls.allocate_ns / 1000000,
+                 calls.allocate_max_ns / 1000, calls.frees, calls.free_ns / 1000000);
     }
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
     vmaGetHeapBudgets(allocator, budgets.data());

@@ -329,6 +329,7 @@ add_library(video_core STATIC
     surface.h
     texture_cache/accelerated_swizzle.cpp
     texture_cache/accelerated_swizzle.h
+    texture_cache/census.h
     texture_cache/collector_policy.h
     texture_cache/decode_bc.cpp
     texture_cache/decode_bc.h

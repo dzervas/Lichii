@@ -14,6 +14,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <tuple>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -287,6 +288,20 @@ public:
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
+
+    /// EDEN_NX2_CENSUS: the separate pools created so far, as (kind, memory type, pool).
+    std::vector<std::tuple<SeparatePool, u32, VmaPool>> SeparatePools() const;
+
+    /// EDEN_NX2_CENSUS: the device memory calls VMA made since the last call.
+    struct MemoryCallTimes {
+        u64 allocations;
+        u64 allocated_bytes;
+        u64 allocate_ns;
+        u64 allocate_max_ns;
+        u64 frees;
+        u64 free_ns;
+    };
+    static MemoryCallTimes TakeMemoryCallTimes();
 
     /// Returns the logical device.
     const vk::Device& GetLogical() const {

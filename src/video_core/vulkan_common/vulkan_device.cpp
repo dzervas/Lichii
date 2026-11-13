@@ -28,6 +28,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/texture_cache/census.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -434,20 +435,53 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
 PFN_vkAllocateMemory g_vma_allocate_memory{};
 PFN_vkFreeMemory g_vma_free_memory{};
 
+// EDEN_NX2_CENSUS: those calls' counts and times (Device::TakeMemoryCallTimes).
+std::atomic<u64> g_census_allocations{};
+std::atomic<u64> g_census_allocated_bytes{};
+std::atomic<u64> g_census_allocate_ns{};
+std::atomic<u64> g_census_allocate_max_ns{};
+std::atomic<u64> g_census_frees{};
+std::atomic<u64> g_census_free_ns{};
+
+u64 CensusNow() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
                                                    const VkMemoryAllocateInfo* allocate_info,
                                                    const VkAllocationCallbacks* allocator,
                                                    VkDeviceMemory* memory) {
     using namespace VideoCommon::StutterTrace;
     const SiteScope site{Site::MemoryAllocate};
-    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    if (!VideoCommon::Census::Enabled()) {
+        return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    const u64 start = CensusNow();
+    const VkResult result = g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    const u64 ns = CensusNow() - start;
+    g_census_allocations.fetch_add(1, std::memory_order_relaxed);
+    g_census_allocated_bytes.fetch_add(allocate_info->allocationSize, std::memory_order_relaxed);
+    g_census_allocate_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 max = g_census_allocate_max_ns.load(std::memory_order_relaxed);
+    while (ns > max && !g_census_allocate_max_ns.compare_exchange_weak(max, ns)) {
+    }
+    return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
                                            const VkAllocationCallbacks* allocator) {
     using namespace VideoCommon::StutterTrace;
     const SiteScope site{Site::MemoryFree};
+    if (!VideoCommon::Census::Enabled()) {
+        g_vma_free_memory(device, memory, allocator);
+        return;
+    }
+    const u64 start = CensusNow();
     g_vma_free_memory(device, memory, allocator);
+    g_census_frees.fetch_add(1, std::memory_order_relaxed);
+    g_census_free_ns.fetch_add(CensusNow() - start, std::memory_order_relaxed);
 }
 
 } // Anonymous namespace
@@ -938,6 +972,25 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         }
     }
     return pool;
+}
+
+std::vector<std::tuple<Device::SeparatePool, u32, VmaPool>> Device::SeparatePools() const {
+    std::scoped_lock lk{separate_pools_mutex};
+    std::vector<std::tuple<SeparatePool, u32, VmaPool>> pools;
+    for (u32 kind = 0; kind < separate_pools.size(); ++kind) {
+        for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
+            if (const VmaPool pool = separate_pools[kind][type]; pool != VK_NULL_HANDLE) {
+                pools.emplace_back(static_cast<SeparatePool>(kind), type, pool);
+            }
+        }
+    }
+    return pools;
+}
+
+Device::MemoryCallTimes Device::TakeMemoryCallTimes() {
+    return {g_census_allocations.exchange(0), g_census_allocated_bytes.exchange(0),
+            g_census_allocate_ns.exchange(0),  g_census_allocate_max_ns.exchange(0),
+            g_census_frees.exchange(0),        g_census_free_ns.exchange(0)};
 }
 
 void Device::LoadStaticPipelineCache() {

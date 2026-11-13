@@ -2889,6 +2889,32 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
 
 void TextureCacheRuntime::LogMemoryStatistics() const {
     Vulkan::LogMemoryStatistics(device);
+    if (VideoCommon::Census::Enabled()) {
+        // Dedicated RGBA8 ASTC decode images (TranscodeAstcToBcn), in flight and kept for reuse.
+        const auto decode_bytes = [](const PendingTranscode& t) {
+            u64 bytes{};
+            for (u32 level = 0; level < t.levels; ++level) {
+                bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+            }
+            return bytes * t.layers;
+        };
+        u64 pending{};
+        u64 free{};
+        for (const PendingTranscode& t : pending_transcodes) {
+            pending += decode_bytes(t);
+        }
+        for (const PendingTranscode& t : free_transcodes) {
+            free += decode_bytes(t);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Census runtime: ASTC decode scratch {} in flight {} MiB, {} kept {} MiB; {} MSAA "
+                 "scratch images; staging upload {} MiB, download {} MiB, device {} MiB",
+                 pending_transcodes.size(), pending >> 20, free_transcodes.size(), free >> 20,
+                 msaa_scratch_images.size(),
+                 staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
+                 staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
+                 staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
+    }
 }
 
 void TextureCacheRuntime::LogMemoryTrace() {
