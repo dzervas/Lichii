@@ -4798,7 +4798,9 @@ void TextureCache<P>::LogCensus() {
     std::array<u64, Census::age_limits.size() + 1> age_bytes{};
     std::array<u64, Census::age_limits.size() + 1> age_count{};
     u64 resident{}, images{}, dedicated{}, dedicated_count{}, unused{}, aliased{},
-        aliased_count{}, gpu_written{};
+        aliased_count{}, gpu_written{}, guest{}, bad_overlap{}, bad_overlap_count{};
+    std::vector<std::pair<u64, u64>> guest_ranges;
+    std::map<u32, std::array<u64, 3>> by_format; ///< host bytes, guest bytes, images
     for (const auto [image_id, image] : slot_images) {
         if (image->census_bytes == 0) {
             continue; // the null image
@@ -4826,6 +4828,47 @@ void TextureCache<P>::LogCensus() {
         if (True(image->flags & ImageFlagBits::GpuModified)) {
             gpu_written += bytes;
         }
+        guest += image->guest_size_bytes;
+        guest_ranges.emplace_back(image->cpu_addr, image->cpu_addr + image->guest_size_bytes);
+        auto& format = by_format[static_cast<u32>(image->info.format)];
+        format[0] += bytes;
+        format[1] += image->guest_size_bytes;
+        ++format[2];
+        if (True(image->flags & ImageFlagBits::BadOverlap)) {
+            bad_overlap += bytes;
+            ++bad_overlap_count;
+        }
+    }
+    {
+        // Guest bytes: what the images' guest ranges hold, counted once where they overlap
+        // (union) and per image (sum); host bytes are the allocations.
+        std::ranges::sort(guest_ranges);
+        u64 guest_union = 0;
+        u64 end = 0;
+        for (const auto& [begin, range_end] : guest_ranges) {
+            if (range_end <= end) {
+                continue;
+            }
+            guest_union += range_end - (std::max)(begin, end);
+            end = range_end;
+        }
+        std::vector<std::pair<u64, u32>> formats;
+        for (const auto& [format, totals] : by_format) {
+            formats.emplace_back(totals[0], format);
+        }
+        std::ranges::sort(formats, std::greater{});
+        std::string text;
+        for (size_t i = 0; i < (std::min)(formats.size(), size_t{16}); ++i) {
+            const auto& totals = by_format[formats[i].second];
+            text += fmt::format(" {}:{}/{}({})", formats[i].second, MiB(totals[0]),
+                                MiB(totals[1]), totals[2]);
+        }
+        LOG_INFO(HW_GPU,
+                 "Census guest vs host: host {} MiB, guest {} MiB summed over images, {} MiB "
+                 "distinct (union of guest ranges); bad-overlap images {} MiB host ({}); by "
+                 "format host/guest MiB (images):{}",
+                 MiB(resident), MiB(guest), MiB(guest_union), MiB(bad_overlap),
+                 bad_overlap_count, text);
     }
     const auto ages = [&](const auto& bytes, const auto& counts) {
         std::string text;
