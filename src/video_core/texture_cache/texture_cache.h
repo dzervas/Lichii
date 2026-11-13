@@ -331,6 +331,7 @@ void TextureCache<P>::DeleteCoveredBadOverlaps() {
             UntrackImage(older, older_id);
         }
         UnregisterImage(older_id);
+        census_delete = Census::Delete::Covered;
         DeleteImage(older_id);
         ++covered_deletes;
     }
