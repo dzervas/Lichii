@@ -33,6 +33,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
+#include "video_core/textures/astc.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/eviction_age.h"
 #include "video_core/texture_cache/host_memory_limit.h"
@@ -194,6 +195,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
+        census_delete = Census::Delete::Collector;
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
@@ -580,6 +582,9 @@ void TextureCache<P>::TickFrame() {
         }
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
+        }
+        if (Census::Enabled()) {
+            LogCensus();
         }
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
@@ -1105,6 +1110,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
 template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
+    const CensusScope census_kind{*this, Census::Kind::RenderTarget};
     struct ClearingScope {
         bool& flag;
         ~ClearingScope() {
@@ -1390,6 +1396,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, id);
         }
         UnregisterImage(id);
+        census_delete = Census::Delete::Unmap;
         DeleteImage(id);
     }
     ClearStale(cpu_addr, size);
@@ -1428,6 +1435,7 @@ bool TextureCache<P>::CopyVolumeSlice(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Engines::Fermi2D::Surface& src,
                                       const Tegra::Engines::Fermi2D::Config& copy) {
     using Tegra::Engines::Fermi2D;
+    const CensusScope census_kind{*this, Census::Kind::Blit};
     const auto is_volume = [](const Fermi2D::Surface& surface) {
         return surface.depth > 1 && surface.linear == Fermi2D::MemoryLayout::BlockLinear &&
                surface.layer == 0;
@@ -1502,6 +1510,7 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
+    const CensusScope census_kind{*this, Census::Kind::Blit};
     // A deferred clear parked before this copy has to land before it: realizing it afterwards
     // starts its clear pass after the copy and wipes what the copy wrote. That is what made
     // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
@@ -2034,6 +2043,7 @@ void TextureCache<P>::PopAsyncFlushes() {
 
 template <class P>
 ImageId TextureCache<P>::DmaImageId(const Tegra::DMA::ImageOperand& operand, bool is_upload) {
+    const CensusScope census_kind{*this, Census::Kind::Dma};
     const ImageInfo dst_info(operand);
     const ImageId dst_id = FindDMAImage(dst_info, operand.address);
     if (!dst_id) {
@@ -3075,6 +3085,22 @@ template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageCreate};
+    struct CensusTimer {
+        Census::Window& window;
+        const bool on = Census::Enabled();
+        const std::chrono::steady_clock::time_point start =
+            on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~CensusTimer() {
+            if (on) {
+                const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now() - start)
+                                                    .count());
+                window.insert_ns += ns;
+                window.insert_max_ns = (std::max)(window.insert_max_ns, ns);
+                ++window.inserts;
+            }
+        }
+    } census_timer{census};
     std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
@@ -3216,6 +3242,32 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 new_info.astc_opaque =
                     AstcDataLooksOpaque(std::span<const u8>{scan_data.data(), scan_data.size()});
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+                if (Census::Enabled() && !new_info.astc_opaque &&
+                    census.astc_alpha_sampled < 64) {
+                    // Value-aware check of an "alpha" image: every block decoded until one
+                    // texel has alpha under 255. Those that never have one could be BC1 too.
+                    ++census.astc_alpha_sampled;
+                    const u32 bw = VideoCore::Surface::DefaultBlockWidth(new_info.format);
+                    const u32 bh = VideoCore::Surface::DefaultBlockHeight(new_info.format);
+                    std::vector<u8> texels(size_t{bw} * bh * 4);
+                    bool alpha_255 = true;
+                    for (size_t offset = 0; alpha_255 && offset + 16 <= scan_data.size();
+                         offset += 16) {
+                        Tegra::Texture::ASTC::Decompress(
+                            std::span<const u8>{scan_data.data() + offset, 16}, bw, bh, 1, bw, bh,
+                            texels);
+                        for (size_t texel = 3; texel < texels.size(); texel += 4) {
+                            if (texels[texel] != 255) {
+                                alpha_255 = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (alpha_255) {
+                        ++census.astc_alpha_255;
+                        census.astc_alpha_255_bytes += scan_bytes;
+                    }
+                }
             }
         }
     }
@@ -3237,6 +3289,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     Image& new_image = slot_images[new_image_id];
 
     new_image.allocation_tick = frame_tick;
+    if (Census::Enabled()) {
+        CensusCreated(new_image);
+    }
     {
         // Which shapes are being created (periodic log): format, type, levels, layers, size.
         const u64 key = (u64{static_cast<u32>(new_info.format)} << 56) |
@@ -3271,6 +3326,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, overlap_id);
         }
         UnregisterImage(overlap_id);
+        census_delete = Census::Delete::JoinRemapped;
         DeleteImage(overlap_id);
     }
 
@@ -3469,6 +3525,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, copy_object.id);
         }
         UnregisterImage(copy_object.id);
+        census_delete = Census::Delete::Join;
         DeleteImage(copy_object.id);
     }
 
@@ -3619,6 +3676,7 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
 template <class P>
 std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                      bool mark_as_modified) {
+    const CensusScope census_kind{*this, Census::Kind::Dma};
     // As in BlitImage: land a parked deferred clear before the DMA write, but only when the
     // write happens (mark_as_modified); a read-only access writes nothing.
     if (mark_as_modified) {
@@ -3678,6 +3736,7 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
 
 template <class P>
 ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr) {
+    const CensusScope census_kind{*this, Census::Kind::RenderTarget};
     static constexpr u32 MaxRenderTargetSize = 32768;
     static constexpr s32 MaxRenderTargetLayers = 2048;
     if (info.size.width == 0 || info.size.height == 0 || info.size.width > MaxRenderTargetSize ||
@@ -4131,6 +4190,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     ++churn.deleted;
+    if (Census::Enabled()) {
+        CensusDeleted(slot_images[image_id]);
+    }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -4414,6 +4476,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    if (Census::Enabled()) {
+        CensusUse(image, census_scope);
+    }
 }
 
 template <class P>
@@ -4440,6 +4505,10 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
     runtime.FlushDeferredClear();
+    if (Census::Enabled()) {
+        CensusUse(dst, Census::Kind::AliasCopy);
+        CensusUse(src, Census::Kind::AliasCopy);
+    }
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
@@ -4627,6 +4696,243 @@ template <class P>
 void TextureCache<P>::OnGPUASRegister([[maybe_unused]] size_t map_id) {
     gpu_page_table_storage.emplace_back();
     gpu_page_table_storage.emplace_back();
+}
+
+// EDEN_NX2_CENSUS (census.h)
+inline Census::ClassKey CensusKey(const ImageInfo& info) {
+    return {static_cast<u32>(info.format), static_cast<u32>(info.type), info.size.width,
+            info.size.height, info.size.depth, static_cast<u32>(info.resources.levels),
+            static_cast<u32>(info.resources.layers), info.num_samples};
+}
+
+template <class P>
+void TextureCache<P>::CensusCreated(Image& image) {
+    // The allocation's size; images without one (unbacked, sparse) count their estimate.
+    u64 bytes = 0;
+    if constexpr (requires(const Image& i) { i.MemoryBlock(); }) {
+        bytes = image.MemoryBlock().size;
+    }
+    if (bytes == 0) {
+        bytes = ImageMemoryBytes(image);
+    }
+    image.census_bytes = bytes;
+    image.census_last_use = frame_tick;
+    image.census_use_frames = 0;
+    image.census_creator = static_cast<u8>(census_scope);
+    image.census_first_later_use = static_cast<u8>(Census::Kind::None);
+    Census::Class& c = census.classes[CensusKey(image.info)];
+    ++c.created;
+    c.created_bytes += bytes;
+    ++c.creators[image.census_creator];
+    c.live_bytes += bytes;
+    ++c.live_count;
+    c.live_peak = (std::max)(c.live_peak, c.live_bytes);
+}
+
+template <class P>
+void TextureCache<P>::CensusUse(Image& image, Census::Kind kind) {
+    if (image.census_last_use == frame_tick) {
+        return; // the creation frame, or this frame again
+    }
+    if (image.census_use_frames++ == 0) {
+        image.census_first_later_use = static_cast<u8>(kind);
+    }
+    image.census_last_use = frame_tick;
+}
+
+template <class P>
+void TextureCache<P>::CensusDeleted(Image& image) {
+    const auto reason = static_cast<size_t>(census_delete);
+    census_delete = Census::Delete::Unmap;
+    const u64 bytes = image.census_bytes;
+    const u64 life = frame_tick - image.allocation_tick;
+    const u64 idle = frame_tick - image.census_last_use;
+    const Census::ClassKey key = CensusKey(image.info);
+    Census::Class& c = census.classes[key];
+    ++c.deleted[reason];
+    c.deleted_bytes += bytes;
+    c.deleted_byte_frames += static_cast<double>(bytes) * static_cast<double>(life);
+    if (image.census_use_frames == 0) {
+        ++c.deleted_unused;
+    }
+    ++c.first_later_use[image.census_first_later_use];
+    c.live_bytes -= (std::min)(c.live_bytes, bytes);
+    c.live_count -= (std::min)(c.live_count, u64{1});
+    const size_t bucket = Census::AgeBucket(idle);
+    census.deleted_bytes_by_age[reason][bucket] += bytes;
+    ++census.deleted_count_by_age[reason][bucket];
+    census.deleted_bytes_by_kind[image.census_creator][image.census_first_later_use] += bytes;
+    if (Census::IsShadowClass(key, static_cast<u32>(VideoCore::Surface::PixelFormat::D16_UNORM)) &&
+        census.identities_logged < 24) {
+        ++census.identities_logged;
+        u64 block = 0;
+        if constexpr (requires(const Image& i) { i.MemoryBlock(); }) {
+            block = image.MemoryBlock().block;
+        }
+        LOG_INFO(HW_GPU,
+                 "Census D16 2048x2048 delete ({}): {} layers {} levels at gpu {:#x} cpu {:#x}, "
+                 "block {:#x} ({}), {} bytes, alive {} frames, last use {} frames ago, used in "
+                 "{} later frames, created by {}, first later use {}",
+                 Census::delete_names[reason], image.info.resources.layers,
+                 image.info.resources.levels, image.gpu_addr, image.cpu_addr, block,
+                 block == 0 ? "dedicated or none" : "shared", bytes, life, idle,
+                 image.census_use_frames, Census::kind_names[image.census_creator],
+                 Census::kind_names[image.census_first_later_use]);
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogCensus() {
+    constexpr auto MiB = [](u64 bytes) { return bytes >> 20; };
+    u64 adjusted = 0;
+    u64 slack = 0;
+    if constexpr (requires { runtime.GetDeviceMemoryUsage(); }) {
+        adjusted = runtime.GetDeviceMemoryUsage();
+    }
+    if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
+        slack = runtime.GetDeviceMemorySlack();
+    }
+    const u64 sentenced = std::accumulate(sentenced_image_bytes.begin(),
+                                          sentenced_image_bytes.end(), gpu_sentenced_bytes);
+    LOG_INFO(HW_GPU,
+             "Census usage: physical {} MiB (allocator-adjusted {} + raw main-heap slack {}), "
+             "collector {} MiB (adjusted minus sentenced {} MiB), slack reserve {} MiB",
+             MiB(adjusted + slack), MiB(adjusted), MiB(slack), MiB(total_used_memory),
+             MiB(sentenced), MiB(slack_margin));
+
+    std::array<u64, Census::age_limits.size() + 1> age_bytes{};
+    std::array<u64, Census::age_limits.size() + 1> age_count{};
+    u64 resident{}, images{}, dedicated{}, dedicated_count{}, unused{}, aliased{},
+        aliased_count{}, gpu_written{};
+    for (const auto [image_id, image] : slot_images) {
+        if (image->census_bytes == 0) {
+            continue; // the null image
+        }
+        const u64 bytes = image->census_bytes;
+        ++images;
+        resident += bytes;
+        const size_t bucket = Census::AgeBucket(frame_tick - image->census_last_use);
+        age_bytes[bucket] += bytes;
+        ++age_count[bucket];
+        if constexpr (requires(const Image& i) { i.MemoryBlock(); }) {
+            const auto block = image->MemoryBlock();
+            if (block.block == 0 && block.size != 0) {
+                dedicated += block.size;
+                ++dedicated_count;
+            }
+        }
+        if (image->census_use_frames == 0) {
+            unused += bytes;
+        }
+        if (!image->aliased_images.empty()) {
+            aliased += bytes;
+            ++aliased_count;
+        }
+        if (True(image->flags & ImageFlagBits::GpuModified)) {
+            gpu_written += bytes;
+        }
+    }
+    const auto ages = [&](const auto& bytes, const auto& counts) {
+        std::string text;
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            text += fmt::format("{}{} {} MiB ({})", i == 0 ? "" : ", ",
+                                i < Census::age_limits.size()
+                                    ? fmt::format("<={}", Census::age_limits[i])
+                                    : std::string{"older"},
+                                MiB(bytes[i]), counts[i]);
+        }
+        return text;
+    };
+    LOG_INFO(HW_GPU,
+             "Census resident: {} images {} MiB, dedicated {} MiB ({}), GPU-written {} MiB, unused "
+             "after their creation frame {} MiB, with aliases (same guest range held twice) {} MiB "
+             "({}); by frames since last use: {}",
+             images, MiB(resident), MiB(dedicated), dedicated_count, MiB(gpu_written), MiB(unused),
+             MiB(aliased), aliased_count, ages(age_bytes, age_count));
+    for (size_t reason = 0; reason < Census::delete_names.size(); ++reason) {
+        u64 total{};
+        for (const u64 bytes : census.deleted_bytes_by_age[reason]) {
+            total += bytes;
+        }
+        if (total != 0) {
+            LOG_INFO(HW_GPU, "Census deleted ({}): {} MiB; by frames since last use: {}",
+                     Census::delete_names[reason], MiB(total),
+                     ages(census.deleted_bytes_by_age[reason], census.deleted_count_by_age[reason]));
+        }
+    }
+    std::string kinds;
+    for (size_t creator = 0; creator < Census::kind_names.size(); ++creator) {
+        for (size_t use = 0; use < Census::kind_names.size(); ++use) {
+            if (const u64 bytes = census.deleted_bytes_by_kind[creator][use]; bytes != 0) {
+                kinds += fmt::format(" {}>{} {}", Census::kind_names[creator],
+                                     Census::kind_names[use], MiB(bytes));
+            }
+        }
+    }
+    LOG_INFO(HW_GPU, "Census deleted MiB by creator>first later use:{}", kinds);
+    LOG_INFO(HW_GPU, "Census image inserts: {}, {} ms, max {} us", census.inserts,
+             census.insert_ns / 1000000, census.insert_max_ns / 1000);
+    LOG_INFO(HW_GPU,
+             "Census ASTC alpha images: {} sampled, {} with alpha 255 everywhere ({} MiB guest)",
+             census.astc_alpha_sampled, census.astc_alpha_255, MiB(census.astc_alpha_255_bytes));
+
+    // Classes by the memory their deleted images held over the window (bytes x frames / 600 =
+    // their mean resident MiB), the D16 2048x2048 shadow layers and arrays first.
+    const u32 d16 = static_cast<u32>(VideoCore::Surface::PixelFormat::D16_UNORM);
+    std::vector<std::pair<double, const Census::ClassKey*>> ranked;
+    for (const auto& [key, c] : census.classes) {
+        const double weight = Census::IsShadowClass(key, d16)
+                                  ? std::numeric_limits<double>::max()
+                                  : c.deleted_byte_frames + static_cast<double>(c.live_bytes) * 600.0;
+        ranked.emplace_back(weight, &key);
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    const auto counts = [](const auto& values) {
+        std::string text;
+        for (size_t i = 0; i < values.size(); ++i) {
+            text += fmt::format("{}{}", i == 0 ? "" : "/", values[i]);
+        }
+        return text;
+    };
+    for (size_t i = 0; i < (std::min)(ranked.size(), size_t{16}); ++i) {
+        const Census::ClassKey& key = *ranked[i].second;
+        const Census::Class& c = census.classes[key];
+        if (c.created == 0 && c.deleted_bytes == 0 && i >= 2) {
+            continue;
+        }
+        u64 deleted{};
+        for (const u64 n : c.deleted) {
+            deleted += n;
+        }
+        LOG_INFO(HW_GPU,
+                 "Census class format {} type {} {}x{}x{} levels {} layers {} samples {}: created "
+                 "{} ({} MiB), deleted {} gc/join/remap/unmap {} ({} MiB), held {:.0f} MiB x frames "
+                 "(mean resident {:.1f} MiB, mean life {:.0f} frames), unused after creation {}, "
+                 "live {} ({} MiB, peak {} MiB), creators none/draw/rt/blit/dma/alias {}, first "
+                 "later use {}",
+                 key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], c.created,
+                 MiB(c.created_bytes), deleted, counts(c.deleted), MiB(c.deleted_bytes),
+                 c.deleted_byte_frames / 1048576.0, c.deleted_byte_frames / 1048576.0 / 600.0,
+                 c.deleted_bytes != 0 ? c.deleted_byte_frames / static_cast<double>(c.deleted_bytes)
+                                      : 0.0,
+                 c.deleted_unused, c.live_count, MiB(c.live_bytes), MiB(c.live_peak),
+                 counts(c.creators), counts(c.first_later_use));
+    }
+    std::erase_if(census.classes, [](auto& entry) { return entry.second.live_count == 0; });
+    for (auto& [key, c] : census.classes) {
+        const u64 live_bytes = c.live_bytes;
+        const u64 live_count = c.live_count;
+        c = Census::Class{};
+        c.live_bytes = c.live_peak = live_bytes;
+        c.live_count = live_count;
+    }
+    census.deleted_bytes_by_age = {};
+    census.deleted_count_by_age = {};
+    census.deleted_bytes_by_kind = {};
+    census.insert_ns = census.insert_max_ns = census.inserts = 0;
+    census.identities_logged = 0;
+    census.astc_alpha_sampled = census.astc_alpha_255 = census.astc_alpha_255_bytes = 0;
 }
 
 } // namespace VideoCommon

@@ -135,6 +135,14 @@ struct ImageBase {
     u64 newest_alias_tick = 0;
     size_t lru_index = SIZE_MAX;
 
+    // EDEN_NX2_CENSUS (census.h): the image's allocation bytes, the frame of its latest actual
+    // use, how many later frames used it, who created it and the first later use's kind.
+    u64 census_bytes = 0;
+    u64 census_last_use = 0;
+    u32 census_use_frames = 0;
+    u8 census_creator = 0;
+    u8 census_first_later_use = 0;
+
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 
     std::vector<ImageViewInfo> image_view_infos;
