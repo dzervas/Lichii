@@ -39,6 +39,7 @@
 #include "video_core/texture_cache/host_mip_limits.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/superseded_overlap.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/decoders.h"
@@ -581,10 +582,10 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha, {} superseded bad overlaps",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
-                 async_decodes_queued, astc_opaque_images, astc_alpha_images);
+                 async_decodes_queued, astc_opaque_images, astc_alpha_images, superseded_deletes);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
@@ -609,6 +610,7 @@ void TextureCache<P>::TickFrame() {
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+        superseded_deletes = 0;
         images_created = images_deleted = 0;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -3404,6 +3406,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         UnregisterImage(copy_object.id);
         DeleteImage(copy_object.id);
+    }
+
+    // Older bad overlaps of the same shape the new image's GPU-written data supersedes go now, as
+    // the collector would delete them (without a download) once they aged (SupersededByNewerImage).
+    for (const ImageId overlap_id : join_bad_overlap_ids) {
+        Image& overlap = slot_images[overlap_id];
+        if (!SupersededByNewerImage(new_image.flags, overlap.flags,
+                                    SameImageInfo(new_image.info, overlap.info),
+                                    lru_cache.Tick(overlap.lru_index), frame_tick)) {
+            continue;
+        }
+        MarkStale(overlap); // before UntrackImage (see MarkStale)
+        if (True(overlap.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(overlap, overlap_id);
+        }
+        UnregisterImage(overlap_id);
+        DeleteImage(overlap_id);
+        ++superseded_deletes;
     }
 
     RegisterImage(new_image_id);
