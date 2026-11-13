@@ -3514,6 +3514,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
             const u32 down_shift = can_rescale ? resolution.down_shift : 0;
             auto copies = MakeShrinkImageCopies(new_info, overlap.info, base, up_scale, down_shift);
+            if (Census::Enabled()) {
+                CensusUse(overlap, Census::Kind::JoinCopy);
+            }
             if (overlap.info.num_samples != new_image.info.num_samples) {
                 runtime.CopyImageMSAA(new_image, overlap, copies);
             } else {
@@ -3530,6 +3533,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
 
     RegisterImage(new_image_id);
+    if (Census::Enabled()) {
+        CensusShadowRegistered(new_image);
+    }
     return new_image_id;
 }
 
@@ -4699,6 +4705,16 @@ void TextureCache<P>::OnGPUASRegister([[maybe_unused]] size_t map_id) {
 }
 
 // EDEN_NX2_CENSUS (census.h)
+inline std::string CensusKindNames(u8 kinds) {
+    std::string text;
+    for (size_t kind = 1; kind < Census::kind_names.size(); ++kind) {
+        if ((kinds >> kind) & 1) {
+            text += fmt::format("{}{}", text.empty() ? "" : "+", Census::kind_names[kind]);
+        }
+    }
+    return text.empty() ? std::string{"none"} : text;
+}
+
 inline Census::ClassKey CensusKey(const ImageInfo& info) {
     return {static_cast<u32>(info.format), static_cast<u32>(info.type), info.size.width,
             info.size.height, info.size.depth, static_cast<u32>(info.resources.levels),
@@ -4731,6 +4747,9 @@ void TextureCache<P>::CensusCreated(Image& image) {
 
 template <class P>
 void TextureCache<P>::CensusUse(Image& image, Census::Kind kind) {
+    if (image.allocation_tick != frame_tick) {
+        image.census_use_kinds |= static_cast<u8>(1u << static_cast<u32>(kind));
+    }
     if (image.census_last_use == frame_tick) {
         return; // the creation frame, or this frame again
     }
@@ -4762,8 +4781,14 @@ void TextureCache<P>::CensusDeleted(Image& image) {
     census.deleted_bytes_by_age[reason][bucket] += bytes;
     ++census.deleted_count_by_age[reason][bucket];
     census.deleted_bytes_by_kind[image.census_creator][image.census_first_later_use] += bytes;
-    if (Census::IsShadowClass(key, static_cast<u32>(VideoCore::Surface::PixelFormat::D16_UNORM)) &&
-        census.identities_logged < 24) {
+    const bool shadow =
+        Census::IsShadowClass(key, static_cast<u32>(VideoCore::Surface::PixelFormat::D16_UNORM));
+    if (shadow && image.info.resources.layers == 3) {
+        census_shadow_deleted[image.gpu_addr] = {frame_tick, static_cast<Census::Delete>(reason)};
+        ++census.shadow_deleted_use_kinds[image.census_use_kinds];
+    }
+    if (shadow && (image.info.resources.layers == 3 ? census.identities_logged < 40
+                                                    : census.identities_logged < 8)) {
         ++census.identities_logged;
         u64 block = 0;
         if constexpr (requires(const Image& i) { i.MemoryBlock(); }) {
@@ -4772,12 +4797,48 @@ void TextureCache<P>::CensusDeleted(Image& image) {
         LOG_INFO(HW_GPU,
                  "Census D16 2048x2048 delete ({}): {} layers {} levels at gpu {:#x} cpu {:#x}, "
                  "block {:#x} ({}), {} bytes, alive {} frames, last use {} frames ago, used in "
-                 "{} later frames, created by {}, first later use {}",
+                 "{} later frames, created by {}, first later use {}, later use kinds {}, "
+                 "flags{}{}{}, {} bad overlaps, {} aliases",
                  Census::delete_names[reason], image.info.resources.layers,
                  image.info.resources.levels, image.gpu_addr, image.cpu_addr, block,
                  block == 0 ? "dedicated or none" : "shared", bytes, life, idle,
                  image.census_use_frames, Census::kind_names[image.census_creator],
-                 Census::kind_names[image.census_first_later_use]);
+                 Census::kind_names[image.census_first_later_use],
+                 CensusKindNames(image.census_use_kinds),
+                 True(image.flags & ImageFlagBits::GpuModified) ? " gpu-modified" : "",
+                 True(image.flags & ImageFlagBits::BadOverlap) ? " bad-overlap" : "",
+                 True(image.flags & ImageFlagBits::Alias) ? " alias" : "",
+                 image.overlapping_images.size(), image.aliased_images.size());
+    }
+}
+
+template <class P>
+void TextureCache<P>::CensusShadowRegistered(Image& image) {
+    if (!Census::IsShadowClass(CensusKey(image.info),
+                               static_cast<u32>(VideoCore::Surface::PixelFormat::D16_UNORM)) ||
+        image.info.resources.layers != 3) {
+        return;
+    }
+    ++census.shadow_addresses[image.gpu_addr];
+    census.shadow_bad_overlaps += image.overlapping_images.size();
+    census.shadow_aliases += image.aliased_images.size();
+    const auto it = census_shadow_deleted.find(image.gpu_addr);
+    u64 since = 0;
+    std::string_view reason = "none";
+    if (it == census_shadow_deleted.end()) {
+        ++census.shadow_created_fresh;
+    } else {
+        since = frame_tick - it->second.first;
+        reason = Census::delete_names[static_cast<size_t>(it->second.second)];
+        ++census.shadow_recreated[static_cast<size_t>(it->second.second)][Census::AgeBucket(since)];
+    }
+    if (census.shadow_creations_logged < 24) {
+        ++census.shadow_creations_logged;
+        LOG_INFO(HW_GPU,
+                 "Census D16 2048x2048 array create: gpu {:#x}, created by {}, {} bad overlaps, {} "
+                 "aliases, previous array here deleted ({}) {} frames ago",
+                 image.gpu_addr, Census::kind_names[image.census_creator],
+                 image.overlapping_images.size(), image.aliased_images.size(), reason, since);
     }
 }
 
@@ -4870,6 +4931,34 @@ void TextureCache<P>::LogCensus() {
         }
     }
     LOG_INFO(HW_GPU, "Census deleted MiB by creator>first later use:{}", kinds);
+    {
+        std::string recreated;
+        for (size_t reason = 0; reason < Census::delete_names.size(); ++reason) {
+            std::string buckets;
+            for (size_t bucket = 0; bucket < census.shadow_recreated[reason].size(); ++bucket) {
+                buckets += fmt::format("{}{}", bucket == 0 ? "" : "/",
+                                       census.shadow_recreated[reason][bucket]);
+            }
+            recreated += fmt::format(" {} {}", Census::delete_names[reason], buckets);
+        }
+        std::string kinds;
+        for (size_t mask = 0; mask < census.shadow_deleted_use_kinds.size(); ++mask) {
+            if (const u64 n = census.shadow_deleted_use_kinds[mask]; n != 0) {
+                kinds += fmt::format(" {}:{}", CensusKindNames(static_cast<u8>(mask)), n);
+            }
+        }
+        u64 reused_addresses = 0;
+        for (const auto& [address, n] : census.shadow_addresses) {
+            reused_addresses += n > 1 ? 1 : 0;
+        }
+        LOG_INFO(HW_GPU,
+                 "Census D16 2048x2048 arrays: created at a new address {}, again after a "
+                 "deletion there (reason, frames since <=1/10/120/600/1800/older):{}; {} bad "
+                 "overlaps and {} aliases at creation; {} distinct addresses ({} created more than "
+                 "once); deleted by later use kinds:{}",
+                 census.shadow_created_fresh, recreated, census.shadow_bad_overlaps,
+                 census.shadow_aliases, census.shadow_addresses.size(), reused_addresses, kinds);
+    }
     LOG_INFO(HW_GPU, "Census image inserts: {}, {} ms, max {} us", census.inserts,
              census.insert_ns / 1000000, census.insert_max_ns / 1000);
     LOG_INFO(HW_GPU,
@@ -4909,7 +4998,7 @@ void TextureCache<P>::LogCensus() {
                  "Census class format {} type {} {}x{}x{} levels {} layers {} samples {}: created "
                  "{} ({} MiB), deleted {} gc/join/remap/unmap {} ({} MiB), held {:.0f} MiB x frames "
                  "(mean resident {:.1f} MiB, mean life {:.0f} frames), unused after creation {}, "
-                 "live {} ({} MiB, peak {} MiB), creators none/draw/rt/blit/dma/alias {}, first "
+                 "live {} ({} MiB, peak {} MiB), creators none/draw/rt/blit/dma/alias/join {}, first "
                  "later use {}",
                  key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], c.created,
                  MiB(c.created_bytes), deleted, counts(c.deleted), MiB(c.deleted_bytes),
@@ -4932,6 +5021,11 @@ void TextureCache<P>::LogCensus() {
     census.deleted_bytes_by_kind = {};
     census.insert_ns = census.insert_max_ns = census.inserts = 0;
     census.identities_logged = 0;
+    census.shadow_created_fresh = census.shadow_bad_overlaps = census.shadow_aliases = 0;
+    census.shadow_recreated = {};
+    census.shadow_addresses.clear();
+    census.shadow_creations_logged = 0;
+    census.shadow_deleted_use_kinds = {};
     census.astc_alpha_sampled = census.astc_alpha_255 = census.astc_alpha_255_bytes = 0;
 }
 

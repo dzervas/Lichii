@@ -220,7 +220,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     void CensusUse(Image& image, Census::Kind kind);
     void CensusCreated(Image& image);
     void CensusDeleted(Image& image);
+    void CensusShadowRegistered(Image& image);
     void LogCensus();
+    /// D16 2048x2048 3-layer arrays deleted, kept across windows: gpu address -> (frame, reason).
+    std::unordered_map<u64, std::pair<u64, Census::Delete>> census_shadow_deleted;
     /// Sets census_scope for a lookup or use path, restoring the outer one after.
     struct CensusScope {
         CensusScope(TextureCache& cache_, Census::Kind kind)
