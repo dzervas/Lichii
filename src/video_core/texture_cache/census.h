@@ -32,10 +32,11 @@ enum class Kind : u8 {
     Blit,         ///< Fermi 2D blits and volume slice copies
     Dma,          ///< Maxwell DMA image <-> buffer copies
     AliasCopy,    ///< Alias synchronization copies (CopyImage), which never touch the LRU
+    JoinCopy,     ///< JoinImages' direct copies out of the overlaps it replaces
     Count,
 };
 inline constexpr std::array<std::string_view, static_cast<size_t>(Kind::Count)> kind_names{
-    "none", "draw", "rt", "blit", "dma", "alias"};
+    "none", "draw", "rt", "blit", "dma", "alias", "join"};
 
 /// Why an image was deleted.
 enum class Delete : u8 {
@@ -89,6 +90,19 @@ struct Window {
     u64 insert_max_ns{};
     u64 inserts{};
     u32 identities_logged{}; ///< D16 2048x2048 deletions logged with their allocation
+    /// D16 2048x2048 3-layer arrays created: at an address no array was deleted at before, or
+    /// after one was deleted there (by reason, by frames since that deletion: <=1/10/120/600/
+    /// 1800/older); with the resident images they overlap without fitting (bad overlaps) and
+    /// aliases at creation, and the distinct addresses.
+    u64 shadow_created_fresh{};
+    std::array<std::array<u64, age_limits.size() + 1>, static_cast<size_t>(Delete::Count)>
+        shadow_recreated{};
+    u64 shadow_bad_overlaps{};
+    u64 shadow_aliases{};
+    std::map<u64, u64> shadow_addresses; ///< gpu address -> arrays created there this window
+    u32 shadow_creations_logged{};
+    /// Use kinds seen in later frames (bit per Kind) over the deleted D16 2048x2048 arrays.
+    std::array<u64, 1u << static_cast<size_t>(Kind::Count)> shadow_deleted_use_kinds{};
     u64 astc_alpha_sampled{}; ///< "alpha" ASTC images decoded on the CPU (at most 64)
     u64 astc_alpha_255{};     ///< of them, alpha 255 in every texel
     u64 astc_alpha_255_bytes{};
