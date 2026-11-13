@@ -34,6 +34,7 @@
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
 #include "video_core/texture_cache/pending_download.h"
+#include "video_core/texture_cache/census.h"
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
@@ -213,6 +214,27 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     using Framebuffer = typename P::Framebuffer;
     using AsyncBuffer = typename P::AsyncBuffer;
     using BufferType = typename P::BufferType;
+
+    // EDEN_NX2_CENSUS (census.h)
+    Census::Window census;
+    Census::Kind census_scope = Census::Kind::Draw;      ///< What the current lookup/use is for
+    Census::Delete census_delete = Census::Delete::Unmap; ///< Why the next DeleteImage deletes
+    void CensusUse(Image& image, Census::Kind kind);
+    void CensusCreated(Image& image);
+    void CensusDeleted(Image& image);
+    void LogCensus();
+    /// Sets census_scope for a lookup or use path, restoring the outer one after.
+    struct CensusScope {
+        CensusScope(TextureCache& cache_, Census::Kind kind)
+            : cache{cache_}, outer{cache_.census_scope} {
+            cache.census_scope = kind;
+        }
+        ~CensusScope() {
+            cache.census_scope = outer;
+        }
+        TextureCache& cache;
+        Census::Kind outer;
+    };
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
