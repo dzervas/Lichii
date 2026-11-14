@@ -480,6 +480,11 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
 
     // Ensure the copy is fully completed before saving the capture
     scheduler.Finish();
+    // Every capture starts from a new frame, which makes blit_capture set up its passes and
+    // layers again, so keeping them between captures saves nothing: they would hold a second set
+    // of anti-aliasing and scaling filter images for good (SMAA's are 75 MiB at Mario Kart World's
+    // 2560x1440).
+    blit_capture.ReleaseLayers();
 
     // Copy backing image data to the capture buffer
     dst_buffer.Invalidate();

@@ -186,6 +186,10 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
     }
 }
 
+void BlitScreen::ReleaseLayers() {
+    layers.clear();
+}
+
 vk::Framebuffer BlitScreen::CreateFramebuffer(const Device& device, const Layout::FramebufferLayout& layout,
                                               VkImageView image_view,
                                               VkFormat current_view_format) {

@@ -66,6 +66,10 @@ public:
 
     void PrepareFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
 
+    /// Frees the layers and their images (anti-aliasing, scaling filter) once the GPU is done
+    /// with them; the next DrawToFrame makes them again.
+    void ReleaseLayers();
+
     [[nodiscard]] vk::Framebuffer CreateFramebuffer(const Device& device, const Layout::FramebufferLayout& layout,
                                                     VkImageView image_view,
                                                     VkFormat current_view_format);
