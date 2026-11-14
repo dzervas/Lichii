@@ -2498,6 +2498,41 @@ void TextureCache<P>::RefreshSparseLayers(Image& image) {
                      static_cast<u32>(image.info.format), image.info.resources.levels, num_layers,
                      bound.size(), ImageMemoryBytes(image) >> 20, data >> 20,
                      (u64{stride} * bound.size()) >> 20);
+            if constexpr (requires { &Image::BindLayerTiles; }) {
+                // Host bytes binding by sparse block would take for the bound layers, without
+                // the half rule (SparseLayerRects), and how many layers that rule binds whole.
+                u64 by_block = 0;
+                u32 half_rule = 0, full = 0, no_data = 0;
+                for (const u32 layer : bound) {
+                    const auto ranges =
+                        Tegra::Nx2SparseDataRanges(image.gpu_addr + layer * stride, stride);
+                    if (ranges.empty()) {
+                        ++no_data;
+                        continue;
+                    }
+                    u64 bytes = 0;
+                    for (const LevelRect& rect : SparseLayerTileRects(
+                             image.info, ranges, image.SparseTileWidth(),
+                             image.SparseTileHeight(), image.SparseTailLevel(),
+                             image.host_level_offset)) {
+                        if (rect.level < image.SparseTailLevel()) {
+                            bytes += u64{Common::DivCeil(rect.width, image.SparseTileWidth())} *
+                                     Common::DivCeil(rect.height, image.SparseTileHeight()) *
+                                     image.SparseTileBytes();
+                        }
+                    }
+                    by_block += bytes;
+                    half_rule += bytes * 2 >= image.SparseLayerBytes() ? 1 : 0;
+                    full += bytes >= image.SparseLayerBytes() ? 1 : 0;
+                }
+                LOG_INFO(HW_GPU,
+                         "Census sparse layers {:#x} by block: {} KiB for {} layers of {} KiB "
+                         "each (host level offset {}, tail level {}); {} at least half, {} "
+                         "whole, {} without data ranges",
+                         image.gpu_addr, by_block >> 10, bound.size() - no_data,
+                         image.SparseLayerBytes() >> 10, image.host_level_offset,
+                         image.SparseTailLevel(), half_rule, full, no_data);
+            }
         }
         if (bound.empty()) {
             runtime.TransitionImageLayout(image);

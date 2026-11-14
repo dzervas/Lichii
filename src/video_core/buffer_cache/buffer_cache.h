@@ -30,6 +30,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/texture_cache/census.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -184,6 +185,36 @@ void BufferCache<P>::TickFrame() {
                           largest.end(), std::greater<>{});
         LOG_INFO(HW_GPU, "Buffer cache: {} buffers {} MiB; largest {}", count, total >> 20,
                  fmt::join(largest.begin(), largest.begin() + std::min<size_t>(6, largest.size()), ", "));
+        if (Census::Enabled()) {
+            // How long the buffers have gone unused (LRU ticks), and of the ones idle 600+ frames
+            // the GPU-written bytes (the collector downloads those before deleting them).
+            static constexpr std::array<u64, 6> idle_frames{60, 120, 600, 1800, 3600, 7200};
+            std::array<u64, idle_frames.size()> idle_bytes{};
+            std::array<size_t, idle_frames.size()> idle_count{};
+            u64 idle_gpu_written = 0;
+            for (size_t i = 0; i < idle_frames.size(); ++i) {
+                if (frame_tick <= idle_frames[i]) {
+                    continue;
+                }
+                lru_cache.ForEachItemBelow(frame_tick - idle_frames[i], [&](BufferId buffer_id) {
+                    const Buffer& buffer = slot_buffers[buffer_id];
+                    idle_bytes[i] += buffer.SizeBytes();
+                    ++idle_count[i];
+                    if (idle_frames[i] == 600 &&
+                        gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
+                        idle_gpu_written += buffer.SizeBytes();
+                    }
+                });
+            }
+            LOG_INFO(HW_GPU,
+                     "Census buffers unused for at least 60/120/600/1800/3600/7200 frames: "
+                     "{}/{}/{}/{}/{}/{} MiB ({}/{}/{}/{}/{}/{} buffers); GPU-written of the "
+                     "600+: {} MiB; {} MiB in all, collector at 512 MiB",
+                     idle_bytes[0] >> 20, idle_bytes[1] >> 20, idle_bytes[2] >> 20,
+                     idle_bytes[3] >> 20, idle_bytes[4] >> 20, idle_bytes[5] >> 20, idle_count[0],
+                     idle_count[1], idle_count[2], idle_count[3], idle_count[4], idle_count[5],
+                     idle_gpu_written >> 20, buffer_bytes >> 20);
+        }
     }
 
     // Calculate hits and shots and move hit bits to the right

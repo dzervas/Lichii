@@ -409,6 +409,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         dedicated_ci.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
         if (vmaAllocateMemory(allocator, &requirements, &dedicated_ci, &allocation, &info) ==
             VK_SUCCESS) {
+            CensusTrackAllocation(allocator, allocation, where);
             memory = info.deviceMemory;
             offset = info.offset;
             return allocation;
