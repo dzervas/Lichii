@@ -10,6 +10,11 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/hardware_properties.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
+#include <map>
 #include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
@@ -265,6 +270,50 @@ bool Puller::PendingAcquire::WaitsToReach() const {
     return static_cast<GpuSemaphoreOperation>(operation) == GpuSemaphoreOperation::AcquireGequal;
 }
 
+namespace {
+// Lab-only (dotfiles-vvt.10, EDEN_NX2_GPU_PROFILE): a suspended acquire the word in memory now
+// meets, i.e. a release the guest CPU wrote: which guest threads were on the cores then, how long
+// the channel waited, by word. Front thread only. Logged every 10 s.
+void NoteCpuRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    struct Tally {
+        u64 releases{};
+        double wait_ms{};
+        std::map<u64, u64> on_core; ///< thread id -> releases it was on a core for
+    };
+    static std::map<u64, Tally> by_word; // device address
+    static auto last_log = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const u64 word = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address).value_or(0);
+    Tally& tally = by_word[word];
+    ++tally.releases;
+    tally.wait_ms +=
+        std::chrono::duration<double, std::milli>(now - acquire.since).count();
+    auto& kernel = dma_pusher.system.Kernel();
+    for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+        if (const Kernel::KThread* thread = kernel.Scheduler(core).GetSchedulerCurrentThread()) {
+            ++tally.on_core[thread->GetThreadId()];
+        }
+    }
+    if (now - last_log < std::chrono::seconds{10}) {
+        return;
+    }
+    last_log = now;
+    for (auto& [address, t] : by_word) {
+        std::vector<std::pair<u64, u64>> threads(t.on_core.begin(), t.on_core.end());
+        std::ranges::sort(threads, [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string text;
+        for (size_t i = 0; i < (std::min)(threads.size(), size_t{8}); ++i) {
+            text += fmt::format(" t{} {}", threads[i].first, threads[i].second);
+        }
+        LOG_INFO(HW_GPU,
+                 "CPU releases of {:#x} in 10 s: {}, the channel waited {:.1f} ms in all; guest "
+                 "threads on a core then (thread releases):{}",
+                 address, t.releases, t.wait_ms, text);
+    }
+    by_word.clear();
+}
+} // Anonymous namespace
+
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
@@ -281,6 +330,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     case AcquireCheck::Met:
         VideoCommon::Count(stats.passed);
         VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
+        if (check == AcquireCheck::Met && VideoCommon::g_acquire_counting) {
+            NoteCpuRelease(dma_pusher, *pending_acquire);
+        }
         return true;
     case AcquireCheck::NotMet: {
         // A release the back ran latches the waiter. Otherwise poll again later, without waiting
