@@ -979,14 +979,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .flags = flags,
             .physicalDevice = physical,
             .device = *logical,
-            // 16 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
+            // 8 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
             // texture sizes left ~38% of the image blocks empty (2 GB of an 8 GB card in title
             // 1), which the texture cache counted as used and kept evicting textures for. With
             // 64 MiB ones textures created and deleted by the thousand still left ~1.7 GB of holes
-            // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
-            // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
-            // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
+            // after ten minutes, with 32 MiB ones ~0.5 GB, with 16 MiB ones 0.4-1.5 GiB in Mario
+            // Kart World: a block drains only once all of its images are gone, and fewer per block
+            // drain sooner. VMA gives allocations over half a block (4 MiB) their own memory,
+            // which goes back to the driver when they are freed. The buffer and sparse page pools
+            // keep their own 16 MiB blocks (SeparatePoolBlockSize).
+            .preferredLargeHeapBlockSize = 8u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
