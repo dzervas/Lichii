@@ -511,8 +511,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         auto& stats = VideoCommon::g_acquire_stats;
         VideoCommon::AcquireDrainPath drain_path{};
-        if (const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire, drain_path);
-            without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
+        const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire, drain_path);
+        if (without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
             if (without_drain == AcquireCheck::MetByQueued) {
                 // What the front reads after the acquire waits for the work sent before the
                 // release (GpuSplit::NoteSync).
