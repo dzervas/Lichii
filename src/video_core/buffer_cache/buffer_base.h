@@ -114,6 +114,17 @@ public:
 
     void setLRUID(size_t lru_id_) {
         lru_id = lru_id_;
+        lru_tick = 0;
+    }
+
+    /// The latest tick the buffer's LRU entry was touched with, as far as BufferCache::TouchBuffer
+    /// knows: touching it again with that tick changes nothing.
+    u64 getLRUTick() const noexcept {
+        return lru_tick;
+    }
+
+    void setLRUTick(u64 lru_tick_) noexcept {
+        lru_tick = lru_tick_;
     }
 
     size_t SizeBytes() const {
@@ -133,6 +144,7 @@ private:
     BufferFlagBits flags{};
     int stream_score = 0;
     size_t lru_id = SIZE_MAX;
+    u64 lru_tick = 0;
     size_t size_bytes = 0;
     u64 write_tick = 0;
 };
