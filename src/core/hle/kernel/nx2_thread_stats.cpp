@@ -15,6 +15,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
+#include "core/hle/kernel/nx2_release_trace.h"
 
 namespace Kernel::Nx2ThreadStats {
 
@@ -300,6 +301,9 @@ void EndRun(KThread* thread, size_t core, u64 start, u64 end, Exit exit, u32 svc
         if (exit == Exit::Svc) {
             Add(t[Svcs], 1);
             counters->svc.store(svc, std::memory_order_relaxed);
+            if (Nx2ReleaseTrace::g_enabled) {
+                Nx2ReleaseTrace::OnSvcWait(thread->GetThreadId(), svc, 0);
+            }
         }
     }
     if (end >= g_next_report.load(std::memory_order_relaxed)) {

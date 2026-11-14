@@ -14,6 +14,8 @@
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_release_trace.h"
+#include "video_core/host1x/host1x.h"
 #include <map>
 #include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
@@ -284,6 +286,16 @@ void NoteCpuRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire
     static auto last_log = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const u64 word = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address).value_or(0);
+    if (Kernel::Nx2ReleaseTrace::g_enabled) {
+        // The traced page goes to the slow write path once, from here (the GPU thread).
+        static const bool cached = [&] {
+            dma_pusher.system.Host1x().MemoryManager().UpdatePagesCachedCount(
+                Kernel::Nx2ReleaseTrace::g_page, 0x1000, 1);
+            return true;
+        }();
+        (void)cached;
+        Kernel::Nx2ReleaseTrace::FrontSeen(word);
+    }
     Tally& tally = by_word[word];
     ++tally.releases;
     tally.wait_ms +=

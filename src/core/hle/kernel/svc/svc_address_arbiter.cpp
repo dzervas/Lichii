@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/kernel/nx2_release_trace.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
@@ -46,6 +47,9 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
     LOG_TRACE(Kernel_SVC, "called, address={:#x}, arb_type={:#x}, value={:#x}, timeout_ns={}",
               address, arb_type, value, timeout_ns);
 
+    if (Nx2ReleaseTrace::g_enabled) {
+        Nx2ReleaseTrace::OnSvcWait(GetCurrentThread(system.Kernel()).GetThreadId(), 0x34, address);
+    }
     // Validate input.
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     const size_t alignment = arb_type == ArbitrationType::WaitIfEqual64 ? sizeof(s64) : sizeof(s32);

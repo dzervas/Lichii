@@ -16,6 +16,8 @@
 #include "core/hle/kernel/k_interrupt_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/nx2_release_trace.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
@@ -354,6 +356,9 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
         cur_process->AddCpuTime(tick_diff);
     }
     m_last_context_switch_time = cur_tick;
+    if (Nx2ReleaseTrace::g_enabled && next_thread != nullptr) {
+        Nx2ReleaseTrace::OnRun(next_thread->GetThreadId());
+    }
     if (Nx2ThreadStats::g_enabled) {
         Nx2ThreadStats::OnSwitch(cur_thread, next_thread, cur_tick, tick_diff);
     }
@@ -532,6 +537,22 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
     ASSERT(IsSchedulerLockedByCurrentThread(kernel));
     // Check if the state has changed, because if it hasn't there's nothing to do.
     if (const ThreadState cur_state = thread->GetRawState(); cur_state != old_state) {
+        if (Nx2ReleaseTrace::g_enabled) {
+            if ((cur_state & ThreadState::Mask) == ThreadState::Waiting) {
+                Nx2ReleaseTrace::OnWaitBegin(thread->GetThreadId());
+            } else if ((old_state & ThreadState::Mask) == ThreadState::Waiting &&
+                       cur_state == ThreadState::Runnable) {
+                Nx2ReleaseTrace::Waker waker{};
+                KThread* const current = GetCurrentThreadPointer(kernel);
+                if (kernel.System().GetCurrentHostThreadID() < Core::Hardware::NUM_CPU_CORES &&
+                    current != nullptr && !current->IsDummyThread()) {
+                    waker.tid = current->GetThreadId();
+                } else {
+                    waker = Nx2ReleaseTrace::HostWaker();
+                }
+                Nx2ReleaseTrace::OnWake(thread->GetThreadId(), waker);
+            }
+        }
         if (Nx2ThreadStats::g_enabled) {
             Nx2ThreadStats::OnStateChanged(
                 thread, kernel.System().CoreTiming().GetClockTicks(),

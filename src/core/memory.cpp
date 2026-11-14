@@ -35,6 +35,8 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/nx2_release_trace.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -972,6 +974,14 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            if (Kernel::Nx2ReleaseTrace::g_enabled &&
+                (address & ~DAddr{0xFFF}) == Kernel::Nx2ReleaseTrace::g_page &&
+                core < Core::Hardware::NUM_CPU_CORES) {
+                if (const Kernel::KThread* writer =
+                        Kernel::GetCurrentThreadPointer(system.Kernel())) {
+                    Kernel::Nx2ReleaseTrace::OnWrite(writer->GetThreadId(), address);
+                }
+            }
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> LICHII_PAGEBITS;
             // Performance note:
