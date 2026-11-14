@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging.h"
+#include "video_core/texture_cache/census.h"
 #include <ranges>
 #include <vulkan/vulkan_core.h>
 #include "video_core/renderer_vulkan/present/util.h"
@@ -24,7 +26,12 @@ vk::Buffer CreateWrappedBuffer(MemoryAllocator& allocator, VkDeviceSize size, Me
     return allocator.CreateBuffer(dst_buffer_info, usage);
 }
 
-vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, VkFormat format) {
+vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, VkFormat format,
+                             std::source_location where) {
+    if (VideoCommon::Census::Enabled()) {
+        LOG_INFO(Render_Vulkan, "Census present image: {}x{} format {} for {}:{}", dimensions.width,
+                 dimensions.height, static_cast<u32>(format), where.file_name(), where.line());
+    }
     const VkImageCreateInfo image_ci{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -43,7 +50,7 @@ vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, 
         .pQueueFamilyIndices = nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
-    return allocator.CreateImage(image_ci);
+    return allocator.CreateImage(image_ci, false, where);
 }
 
 void TransitionImageLayout(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayout target_layout,
