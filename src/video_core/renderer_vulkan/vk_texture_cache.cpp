@@ -531,7 +531,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  bool may_fail = false) {
+                                  bool may_fail = false, TextureCacheRuntime* recycler = nullptr,
+                                  std::optional<ImageRecycleKey>* recycle_key = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -563,6 +564,31 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
             return image;
         }
+    }
+    if (recycler != nullptr) {
+        ImageRecycleKey key{
+            .flags = image_ci.flags,
+            .type = image_ci.imageType,
+            .format = image_ci.format,
+            .extent = image_ci.extent,
+            .levels = image_ci.mipLevels,
+            .layers = image_ci.arrayLayers,
+            .samples = image_ci.samples,
+            .tiling = image_ci.tiling,
+            .usage = image_ci.usage,
+            .view_formats = {},
+        };
+        if (image_ci.pNext != nullptr) {
+            key.view_formats.assign(view_formats.begin(), view_formats.end());
+        }
+        vk::Image image = recycler->TakeRecycledImage(key);
+        if (!image) {
+            image = may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+        }
+        if (image) {
+            *recycle_key = std::move(key);
+        }
+        return image;
     }
     return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
 }
@@ -2955,7 +2981,20 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+vk::Image TextureCacheRuntime::TakeRecycledImage(const ImageRecycleKey& key) {
+    std::optional<vk::Image> image = recycled_images.Take(key);
+    return image ? std::move(*image) : vk::Image{};
+}
+
+void TextureCacheRuntime::RecycleImage(ImageRecycleKey&& key, vk::Image&& image) {
+    const u64 bytes = image.GetMemoryBlock().size;
+    if (bytes != 0) {
+        recycled_images.Put(std::move(key), std::move(image), bytes);
+    }
+}
+
 void TextureCacheRuntime::TickFrame() {
+    recycled_images.Tick();
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
@@ -3017,7 +3056,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true)),
+                               true, &runtime_, &recycle_key)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -3105,6 +3144,11 @@ Image::~Image() {
         if (scaled_image) {
             runtime->EraseResolveShadow(*scaled_image);
         }
+    }
+    // Whatever the image held is never read again: the next image made from it starts
+    // undefined, as a new one does (its first layout transition starts from UNDEFINED).
+    if (recycle_key && original_image && !original_image.IsUnbacked() && runtime != nullptr) {
+        runtime->RecycleImage(std::move(*recycle_key), std::move(original_image));
     }
 }
 

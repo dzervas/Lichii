@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/recycle_pool.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -74,6 +75,29 @@ struct ByteAddressedRange {
     return VkExtent2D{width / 2, height};
 }
 
+/// What makes two backed texture cache images interchangeable: everything their VkImage was made
+/// with (MakeImage).
+struct ImageRecycleKey {
+    VkImageCreateFlags flags{};
+    VkImageType type{};
+    VkFormat format{};
+    VkExtent3D extent{};
+    u32 levels{};
+    u32 layers{};
+    VkSampleCountFlagBits samples{};
+    VkImageTiling tiling{};
+    VkImageUsageFlags usage{};
+    std::vector<VkFormat> view_formats; ///< The format list chained to it, if one
+
+    [[nodiscard]] bool operator==(const ImageRecycleKey& other) const noexcept {
+        return flags == other.flags && type == other.type && format == other.format &&
+               extent.width == other.extent.width && extent.height == other.extent.height &&
+               extent.depth == other.extent.depth && levels == other.levels &&
+               layers == other.layers && samples == other.samples && tiling == other.tiling &&
+               usage == other.usage && view_formats == other.view_formats;
+    }
+};
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -93,6 +117,21 @@ public:
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void TickFrame();
+
+    /// The VkImage (and its memory) of a deleted image made with `key`, once the GPU is done with
+    /// it, or a null image. Under memory pressure the texture cache deletes and makes ~20k images
+    /// every 600 frames (Mario Kart World), mostly of shapes it just deleted; making each again
+    /// cost an image, often its own device memory, and freeing them.
+    vk::Image TakeRecycledImage(const ImageRecycleKey& key);
+
+    /// Keeps a deleted image's VkImage for TakeRecycledImage for a few frames (Image's destructor,
+    /// which runs once the GPU is done with it).
+    void RecycleImage(ImageRecycleKey&& key, vk::Image&& image);
+
+    /// Images TakeRecycledImage gave and was asked for, and their bytes, since the last call.
+    VideoCommon::RecyclePool<ImageRecycleKey, vk::Image>::Stats TakeRecycleStats() {
+        return recycled_images.TakeStats();
+    }
 
     void FlushDeferredClear();
 
@@ -249,6 +288,10 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+
+    /// Kept for 8 frames and up to 256 MiB: memory held here counts as used, and the texture
+    /// cache deleted these images to have it free.
+    VideoCommon::RecyclePool<ImageRecycleKey, vk::Image> recycled_images{256ULL << 20, 8};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -722,6 +765,9 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
+    /// Backed images made by the constructor: what they were made with, so the destructor can
+    /// give their VkImage to TextureCacheRuntime::RecycleImage. Declared before the images.
+    std::optional<ImageRecycleKey> recycle_key;
     vk::Image original_image;
     vk::Image scaled_image;
 

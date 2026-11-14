@@ -585,6 +585,14 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+        if constexpr (requires { runtime.TakeRecycleStats(); }) {
+            const auto recycled = runtime.TakeRecycleStats();
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: {} of {} images made from deleted ones ({} "
+                     "MiB), {} MiB kept for that",
+                     recycled.hits, recycled.requests, recycled.hit_bytes >> 20,
+                     recycled.kept_bytes >> 20);
+        }
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
