@@ -288,6 +288,15 @@ public:
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
 
+    /// Whether allocations of `size` go to a separate pool: when its blocks hold a whole number
+    /// of them with at most a sixteenth of a block left over. Others get their own memory: a
+    /// 5.375 MiB sparse layer (Mario Kart World's 1024x1024 RGBA8 array layers) packed two to a
+    /// block left 5.25 MiB of each empty, ~280 MiB in all.
+    static constexpr bool PacksIntoSeparatePool(VkDeviceSize size) {
+        return size != 0 && size <= SeparatePoolBlockSize &&
+               SeparatePoolBlockSize % size <= SeparatePoolBlockSize / 16;
+    }
+
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
 
