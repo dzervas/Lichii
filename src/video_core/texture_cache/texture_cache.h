@@ -2473,6 +2473,24 @@ void TextureCache<P>::RefreshSparseLayers(Image& image) {
         } else {
             bound = layers.empty() ? std::vector<u32>{} : BindSparseLayers(image, layers);
         }
+        if (Census::Enabled() && !bound.empty()) {
+            // What of the bound layers' guest memory can hold data (sparse blocks or tiles the
+            // game wrote or mapped): roughly what binding by sparse block instead would need.
+            u64 data = 0;
+            for (const u32 layer : bound) {
+                for (const auto& range :
+                     Tegra::Nx2SparseDataRanges(image.gpu_addr + layer * stride, stride)) {
+                    data += range.second;
+                }
+            }
+            LOG_INFO(HW_GPU,
+                     "Census sparse layers {:#x} ({}x{} format {} {} levels {} layers): bound {} "
+                     "layers ({} MiB host), guest data in them {} MiB of {} MiB",
+                     image.gpu_addr, image.info.size.width, image.info.size.height,
+                     static_cast<u32>(image.info.format), image.info.resources.levels, num_layers,
+                     bound.size(), ImageMemoryBytes(image) >> 20, data >> 20,
+                     (u64{stride} * bound.size()) >> 20);
+        }
         if (bound.empty()) {
             runtime.TransitionImageLayout(image);
             return;
