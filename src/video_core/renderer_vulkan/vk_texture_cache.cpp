@@ -3633,6 +3633,7 @@ bool Image::InitSparseLayers() {
         return false;
     }
     const u32 tail_lod = (std::min)(it->imageMipTailFirstLod, s.levels);
+    s.tail_level = tail_lod;
     VkDeviceSize bytes = 0;
     for (u32 level = 0; level < tail_lod; ++level) {
         const u32 width = (std::max)(s.width >> level, 1U);
@@ -3883,7 +3884,6 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
     if (s.allocator == nullptr) {
         return false;
     }
-    const Device& device = runtime->device;
     const u64 tile = s.requirements.alignment;
     const VkMemoryRequirements tile_requirements{
         .size = tile,
@@ -3980,51 +3980,10 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
             .flags = 0,
         });
     }
-    if (image_binds.empty() && opaque_binds.empty()) {
-        return true;
-    }
-    const VkSparseImageMemoryBindInfo image_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(image_binds.size()),
-        .pBinds = image_binds.data(),
-    };
-    const VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(opaque_binds.size()),
-        .pBinds = opaque_binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 0,
-        .pBufferBinds = nullptr,
-        .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
-        .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info,
-        .imageBindCount = image_binds.empty() ? 0U : 1U,
-        .pImageBinds = image_binds.empty() ? nullptr : &image_bind_info,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    // Bound before the command buffer that uploads the blocks is submitted (as BindLayers).
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
-    {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding failed ({})", gpu_addr,
-                  static_cast<int>(result));
+    if (!SubmitSparseBinds(image_binds, opaque_binds)) {
         roll_back();
         return false;
     }
-    fence.Wait();
     return true;
 }
 
@@ -4045,12 +4004,14 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
     std::vector<VkSparseMemoryBind> opaque_binds;
     const bool tail_was_bound = s.tail_memory != VK_NULL_HANDLE;
     std::vector<u32> fresh; // Layers given memory by this call
+    std::vector<u32> by_block; // Layers bound by block so far: their other blocks get memory
     // A failed bind leaves the layers as they were, so the next call tries them again.
     const auto roll_back = [&] {
         for (const u32 layer : fresh) {
             s.allocator->FreeSparseMemory(s.layer_memory[layer]);
             s.layer_memory[layer] = VK_NULL_HANDLE;
             s.bound_bytes -= s.layer_bytes;
+            --s.counted_layers;
         }
         if (s.tail_memory != VK_NULL_HANDLE && !tail_was_bound) {
             s.allocator->FreeSparseMemory(s.tail_memory);
@@ -4062,7 +4023,11 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
             bound.push_back(layer);
             continue;
         }
-        if (s.bound_bytes + s.layer_bytes > cap) {
+        if (!s.layer_tiles.empty() && !s.layer_tiles[layer].empty()) {
+            by_block.push_back(layer);
+            continue;
+        }
+        if ((u64{s.counted_layers} + 1) * s.layer_bytes > cap) {
             if (!std::exchange(s.warned, true)) {
                 LOG_WARNING(Render_Vulkan, "Sparse layered image {:#x}: {} MiB bound, more layers "
                                            "stay without memory",
@@ -4084,6 +4049,7 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
         }
         s.layer_memory[layer] = allocation;
         s.bound_bytes += s.layer_bytes;
+        ++s.counted_layers;
         fresh.push_back(layer);
         for (u32 level = 0; level < tail_lod; ++level) {
             const u32 width = (std::max)(s.width >> level, 1U);
@@ -4139,9 +4105,187 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
             return {};
         }
     }
-    if (image_binds.empty() && opaque_binds.empty()) {
-        return bound;
+    if (!SubmitSparseBinds(image_binds, opaque_binds)) {
+        roll_back();
+        return {};
     }
+    if (!by_block.empty()) {
+        // Every block of every level, the mip tail included.
+        std::vector<VideoCommon::LevelRect> rects;
+        for (u32 level = 0; level < s.levels; ++level) {
+            rects.push_back({static_cast<s32>(level), 0, 0, (std::max)(s.width >> level, 1U),
+                             (std::max)(s.height >> level, 1U)});
+        }
+        for (const u32 layer : by_block) {
+            if (BindLayerTiles(layer, rects)) {
+                bound.push_back(layer);
+            }
+        }
+        std::ranges::sort(bound);
+    }
+    return bound;
+}
+
+bool Image::BindLayerTiles(u32 layer, std::span<const VideoCommon::LevelRect> rects) {
+    SparseLayerMemory& s = sparse_layers;
+    if (s.layer_memory.empty()) {
+        return false;
+    }
+    if (s.layer_memory[layer] != VK_NULL_HANDLE) {
+        return true; // bound whole
+    }
+    const u32 num_layers = static_cast<u32>(s.layer_memory.size());
+    if (s.layer_tiles.empty()) {
+        s.layer_tiles.resize(num_layers);
+        s.layer_tails.assign(num_layers, VK_NULL_HANDLE);
+    }
+    auto& tiles = s.layer_tiles[layer];
+    const bool fresh_layer = tiles.empty();
+    if (fresh_layer) {
+        // A layer with memory counts as a whole, so the cap leaves out the layers it did when
+        // layers were bound whole.
+        if ((u64{s.counted_layers} + 1) * s.layer_bytes > SparseLayersCap(runtime->device)) {
+            if (!std::exchange(s.warned, true)) {
+                LOG_WARNING(Render_Vulkan, "Sparse layered image {:#x}: {} MiB bound, more layers "
+                                           "stay without memory",
+                            gpu_addr, s.bound_bytes >> 20);
+            }
+            return false;
+        }
+        tiles.resize(s.tail_level);
+        for (u32 level = 0; level < s.tail_level; ++level) {
+            const u32 width = (std::max)(s.width >> level, 1U);
+            const u32 height = (std::max)(s.height >> level, 1U);
+            tiles[level].assign(size_t{Common::DivCeil(width, s.tile_width)} *
+                                    Common::DivCeil(height, s.tile_height),
+                                VK_NULL_HANDLE);
+        }
+    }
+    const u64 tile = s.requirements.alignment;
+    const bool has_tail = s.tail_level < s.levels;
+    const bool single_tail =
+        (s.sparse.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT) != 0;
+    const VkMemoryRequirements tile_requirements{
+        .size = tile,
+        .alignment = tile,
+        .memoryTypeBits = s.requirements.memoryTypeBits,
+    };
+    std::vector<VkSparseImageMemoryBind> image_binds;
+    std::vector<VkSparseMemoryBind> opaque_binds;
+    std::vector<VmaAllocation*> fresh;
+    VmaAllocation* fresh_tail{};
+    // A failed bind leaves the layer as it was, so the next call tries it again.
+    const auto roll_back = [&] {
+        for (VmaAllocation* const allocation : fresh) {
+            s.allocator->FreeSparseMemory(*allocation);
+            *allocation = VK_NULL_HANDLE;
+            s.bound_bytes -= tile;
+        }
+        if (fresh_tail != nullptr) {
+            s.allocator->FreeSparseMemory(*fresh_tail);
+            *fresh_tail = VK_NULL_HANDLE;
+            if (fresh_tail != &s.tail_memory) {
+                s.bound_bytes -= Common::AlignUp(s.sparse.imageMipTailSize, tile);
+            }
+        }
+        if (fresh_layer) {
+            tiles.clear();
+        }
+    };
+    bool needs_tail = false;
+    for (const VideoCommon::LevelRect& rect : rects) {
+        const u32 level = static_cast<u32>(rect.level);
+        if (level >= s.tail_level) {
+            needs_tail = true;
+            continue;
+        }
+        const u32 width = (std::max)(s.width >> level, 1U);
+        const u32 height = (std::max)(s.height >> level, 1U);
+        const u32 tiles_x = Common::DivCeil(width, s.tile_width);
+        for (u32 ty = rect.y / s.tile_height; ty <= (rect.y + rect.height - 1) / s.tile_height;
+             ++ty) {
+            for (u32 tx = rect.x / s.tile_width; tx <= (rect.x + rect.width - 1) / s.tile_width;
+                 ++tx) {
+                VmaAllocation& allocation = tiles[level][size_t{ty} * tiles_x + tx];
+                if (allocation != VK_NULL_HANDLE) {
+                    continue;
+                }
+                VkDeviceMemory memory{};
+                VkDeviceSize offset{};
+                allocation = s.allocator->AllocateSparseMemory(tile_requirements, memory, offset);
+                if (allocation == VK_NULL_HANDLE) {
+                    LOG_WARNING(Render_Vulkan, "Sparse layered image {:#x}: out of device memory",
+                                gpu_addr);
+                    roll_back();
+                    return false;
+                }
+                fresh.push_back(&allocation);
+                s.bound_bytes += tile;
+                const u32 x = tx * s.tile_width;
+                const u32 y = ty * s.tile_height;
+                image_binds.push_back(VkSparseImageMemoryBind{
+                    .subresource{
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = level,
+                        .arrayLayer = layer,
+                    },
+                    .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
+                    .extent{(std::min)(s.tile_width, width - x),
+                            (std::min)(s.tile_height, height - y), 1},
+                    .memory = memory,
+                    .memoryOffset = offset,
+                    .flags = 0,
+                });
+            }
+        }
+    }
+    // The mip tail: the layer's own, or the one all layers share (as BindLayers binds them).
+    VmaAllocation& tail = single_tail ? s.tail_memory : s.layer_tails[layer];
+    if (needs_tail && has_tail && tail == VK_NULL_HANDLE) {
+        const VkMemoryRequirements requirements{
+            .size = Common::AlignUp(s.sparse.imageMipTailSize, tile),
+            .alignment = tile,
+            .memoryTypeBits = s.requirements.memoryTypeBits,
+        };
+        VkDeviceMemory memory{};
+        VkDeviceSize offset{};
+        tail = s.allocator->AllocateSparseMemory(requirements, memory, offset);
+        if (tail == VK_NULL_HANDLE) {
+            LOG_WARNING(Render_Vulkan, "Sparse layered image {:#x}: out of device memory for the "
+                                       "mip tail",
+                        gpu_addr);
+            roll_back();
+            return false;
+        }
+        fresh_tail = &tail;
+        if (!single_tail) {
+            s.bound_bytes += requirements.size;
+        }
+        opaque_binds.push_back(VkSparseMemoryBind{
+            .resourceOffset = s.sparse.imageMipTailOffset +
+                              (single_tail ? 0 : layer * s.sparse.imageMipTailStride),
+            .size = s.sparse.imageMipTailSize,
+            .memory = memory,
+            .memoryOffset = offset,
+            .flags = 0,
+        });
+    }
+    if (!SubmitSparseBinds(image_binds, opaque_binds)) {
+        roll_back();
+        return false;
+    }
+    if (fresh_layer) {
+        ++s.counted_layers;
+    }
+    return true;
+}
+
+bool Image::SubmitSparseBinds(std::span<const VkSparseImageMemoryBind> image_binds,
+                              std::span<const VkSparseMemoryBind> opaque_binds) {
+    if (image_binds.empty() && opaque_binds.empty()) {
+        return true;
+    }
+    const Device& device = runtime->device;
     const VkSparseImageMemoryBindInfo image_bind_info{
         .image = *original_image,
         .bindCount = static_cast<u32>(image_binds.size()),
@@ -4166,7 +4310,7 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
         .signalSemaphoreCount = 0,
         .pSignalSemaphores = nullptr,
     };
-    // Bound before the command buffer that uploads the layers is submitted (as the multi-range
+    // Bound before the command buffer that uploads to the image is submitted (as the multi-range
     // buffer cache does).
     vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -4179,13 +4323,12 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
         result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
     }
     if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse layered image {:#x}: binding failed ({})", gpu_addr,
+        LOG_ERROR(Render_Vulkan, "Sparse image {:#x}: binding failed ({})", gpu_addr,
                   static_cast<int>(result));
-        roll_back();
-        return {};
+        return false;
     }
     fence.Wait();
-    return bound;
+    return true;
 }
 
 VkImageView Image::StorageImageLayerView(s32 level, u32 layer) {

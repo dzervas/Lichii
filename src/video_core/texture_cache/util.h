@@ -107,13 +107,19 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
     std::span<const u8> input, std::span<u8> output,
     Tegra::Texture::UnswizzleWorker* worker = nullptr);
 
-/// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
-/// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into
-/// runs along x. Levels from tail_level on (the host's mip tail) come whole.
+/// For a single-layer 2D block-linear image: the host sparse blocks (tile_width x tile_height
+/// texels, whole format blocks) that the guest byte ranges (offset, size) touch, merged into runs
+/// along x. Levels from tail_level on (the host's mip tail) come whole.
 [[nodiscard]] std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
                                                      std::span<const std::pair<u64, u64>> ranges,
                                                      u32 tile_width, u32 tile_height,
                                                      s32 tail_level);
+
+/// SparseTileRects for one layer of a 2D array, with ranges from the layer's start: in host levels,
+/// where the host leaves out the first host_level_offset guest levels (TrimmedLevels).
+[[nodiscard]] std::vector<LevelRect> SparseLayerTileRects(
+    const ImageInfo& info, std::span<const std::pair<u64, u64>> ranges, u32 tile_width,
+    u32 tile_height, s32 host_tail_level, u32 host_level_offset);
 
 /// Bytes UnswizzleImageRects writes for `rects`.
 [[nodiscard]] size_t UnswizzledRectsBytes(const ImageInfo& info, std::span<const LevelRect> rects);

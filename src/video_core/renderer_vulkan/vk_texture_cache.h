@@ -551,11 +551,26 @@ public:
     /// layers that have memory afterwards (a cap per image can leave some out).
     std::vector<u32> BindLayers(std::span<const u32> layers);
 
+    /// SparseLayers images: gives the host sparse blocks of `layer` under `rects` (host levels; and
+    /// the layer's mip tail, for levels in it) device memory where they have none yet. A layer
+    /// counts against the image's cap as a whole once it has any. False if that failed or the cap
+    /// leaves the layer out.
+    bool BindLayerTiles(u32 layer, std::span<const VideoCommon::LevelRect> rects);
+
+    /// SparseLayers images: bytes one layer takes bound whole, and one sparse block.
+    u64 SparseLayerBytes() const noexcept {
+        return sparse_layers.layer_bytes;
+    }
+    u64 SparseTileBytes() const noexcept {
+        return sparse_layers.requirements.alignment;
+    }
+
     /// SparseTiles images: gives the host sparse blocks under `rects` (and the mip tail, for
     /// levels in it) device memory where they have none yet. False if that failed.
     bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
 
-    /// SparseTiles images: the host sparse block, in texels, and the first level of the mip tail.
+    /// SparseTiles and SparseLayers images: the host sparse block, in texels, and the first host
+    /// level of the mip tail.
     u32 SparseTileWidth() const noexcept {
         return sparse_layers.tile_width;
     }
@@ -620,6 +635,11 @@ private:
             layer_bytes = other.layer_bytes;
             layer_memory = std::move(other.layer_memory);
             other.layer_memory.clear();
+            layer_tiles = std::move(other.layer_tiles);
+            other.layer_tiles.clear();
+            layer_tails = std::move(other.layer_tails);
+            other.layer_tails.clear();
+            counted_layers = other.counted_layers;
             level_tiles = std::move(other.level_tiles);
             other.level_tiles.clear();
             tail_level = other.tail_level;
@@ -639,6 +659,18 @@ private:
             for (const VmaAllocation allocation : layer_memory) {
                 allocator->FreeSparseMemory(allocation);
             }
+            for (const auto& levels_tiles : layer_tiles) {
+                for (const auto& tiles : levels_tiles) {
+                    for (const VmaAllocation allocation : tiles) {
+                        allocator->FreeSparseMemory(allocation);
+                    }
+                }
+            }
+            for (const VmaAllocation allocation : layer_tails) {
+                allocator->FreeSparseMemory(allocation);
+            }
+            layer_tiles.clear();
+            layer_tails.clear();
             for (const auto& tiles : level_tiles) {
                 for (const VmaAllocation allocation : tiles) {
                     allocator->FreeSparseMemory(allocation);
@@ -662,9 +694,14 @@ private:
         u32 tile_height{};
         VkDeviceSize layer_bytes{}; ///< One layer's levels before the mip tail, and its own tail
         std::vector<VmaAllocation> layer_memory; ///< Per layer, null until bound
+        /// SparseLayers bound by block (BindLayerTiles): per layer, per level before the mip
+        /// tail, per sparse block (rows); empty for a layer not bound that way
+        std::vector<std::vector<std::vector<VmaAllocation>>> layer_tiles;
+        std::vector<VmaAllocation> layer_tails; ///< Per layer bound by block: its own mip tail
+        u32 counted_layers{}; ///< SparseLayers: layers with any memory, against the cap
         /// SparseTiles: per level before the mip tail, per sparse block (rows), null until bound
         std::vector<std::vector<VmaAllocation>> level_tiles;
-        u32 tail_level{}; ///< SparseTiles: first level of the mip tail
+        u32 tail_level{}; ///< SparseTiles and SparseLayers: first host level of the mip tail
         /// SparseTiles: the zeroed block every block without memory of its own is bound to, where
         /// the driver can't sample unbound memory
         VmaAllocation zero_block{};
@@ -679,6 +716,10 @@ private:
 
     /// Reads the image's sparse requirements; false when it can't be bound by sparse block.
     bool InitSparseTiles();
+
+    /// Binds and waits for the binds; false if binding failed.
+    bool SubmitSparseBinds(std::span<const VkSparseImageMemoryBind> image_binds,
+                           std::span<const VkSparseMemoryBind> opaque_binds);
 
     /// Binds one zeroed block to every block of a SparseTiles image (and memory to its mip tail).
     bool BindZeroBlock();
