@@ -121,6 +121,7 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     };
 
     if (!use_accelerated) {
+        CreateRawImage(device, framebuffer, image_index);
         UpdateRawImage(framebuffer, image_index);
     }
 
@@ -215,16 +216,24 @@ void Layer::CreateStagingBuffer(const Device& device, const Tegra::FramebufferCo
 }
 
 void Layer::CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer) {
-    const auto format = GetFormat(framebuffer);
+    // Made on first use (CreateRawImage): only a framebuffer the texture cache doesn't hold is
+    // copied into one, and games' framebuffers are nearly always there (3 unused 2560x1440 images
+    // for Mario Kart World).
     resource_ticks.resize(image_count);
+    raw_image_views.clear();
     raw_images.resize(image_count);
     raw_image_views.resize(image_count);
+}
 
-    for (size_t i = 0; i < image_count; ++i) {
-        raw_images[i] =
-            CreateWrappedImage(memory_allocator, {framebuffer.width, framebuffer.height}, format);
-        raw_image_views[i] = CreateWrappedImageView(device, raw_images[i], format);
+void Layer::CreateRawImage(const Device& device, const Tegra::FramebufferConfig& framebuffer,
+                           size_t image_index) {
+    if (raw_images[image_index]) {
+        return;
     }
+    const auto format = GetFormat(framebuffer);
+    raw_images[image_index] =
+        CreateWrappedImage(memory_allocator, {framebuffer.width, framebuffer.height}, format);
+    raw_image_views[image_index] = CreateWrappedImageView(device, raw_images[image_index], format);
 }
 
 void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer) {

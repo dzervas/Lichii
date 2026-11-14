@@ -72,13 +72,17 @@ private:
     std::array<vk::Image, MaxStaticImage> m_static_images{};
     std::array<vk::ImageView, MaxStaticImage> m_static_image_views{};
 
-    struct Images {
+    // One set of intermediate images for every frame in flight: each pass's layout transitions
+    // (TransitionImageLayout) order it after every earlier use of them on the queue, and each
+    // frame rewrites them whole. Descriptor sets and framebuffers stay per frame, as the frame's
+    // input changes and Layer waits only for its own frame's work before updating them.
+    std::array<vk::Image, MaxDynamicImage> m_dynamic_images{};
+    std::array<vk::ImageView, MaxDynamicImage> m_dynamic_image_views{};
+    struct Frame {
         vk::DescriptorSets descriptor_sets{};
-        std::array<vk::Image, MaxDynamicImage> images{};
-        std::array<vk::ImageView, MaxDynamicImage> image_views{};
         std::array<vk::Framebuffer, MaxSMAAStage> framebuffers{};
     };
-    std::vector<Images> m_dynamic_images{};
+    std::vector<Frame> m_frames{};
     bool m_images_ready{};
 
     vk::Sampler m_sampler{};
