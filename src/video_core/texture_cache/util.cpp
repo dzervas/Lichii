@@ -1008,6 +1008,10 @@ std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
                                        u32 tile_height, s32 tail_level) {
     std::vector<LevelRect> rects;
     const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
+    // BlockLinearLevels counts across and down in format blocks (4x4 texels for BCn), the rects
+    // are in texels.
+    const u32 block_width = DefaultBlockWidth(info.format);
+    const u32 block_height = DefaultBlockHeight(info.format);
     const u64 image_end = CalculateLevelBytes(
         CalculateLevelSizes(MakeLevelInfo(info), info.resources.levels), info.resources.levels);
     for (s32 index = 0; index < static_cast<s32>(levels.size()); ++index) {
@@ -1038,13 +1042,14 @@ std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
                 const u64 row_start = row * level.blocks_per_row;
                 const u64 low = (std::max)(first, row_start) - row_start;
                 const u64 high = (std::min)(last, row_start + level.blocks_per_row - 1) - row_start;
-                const u64 x0 = low * level.block_texels;
-                const u64 y0 = row * level.block_rows;
+                const u64 x0 = low * level.block_texels * block_width;
+                const u64 y0 = u64{row} * level.block_rows * block_height;
                 if (x0 >= level.width || y0 >= level.height) {
                     continue;
                 }
-                const u64 x1 = (std::min<u64>)((high + 1) * level.block_texels, level.width);
-                const u64 y1 = (std::min<u64>)(y0 + level.block_rows, level.height);
+                const u64 x1 =
+                    (std::min<u64>)((high + 1) * level.block_texels * block_width, level.width);
+                const u64 y1 = (std::min<u64>)(y0 + u64{level.block_rows} * block_height, level.height);
                 for (u64 ty = y0 / tile_height; ty <= (y1 - 1) / tile_height; ++ty) {
                     for (u64 tx = x0 / tile_width; tx <= (x1 - 1) / tile_width; ++tx) {
                         touched[ty * tiles_x + tx] = true;
@@ -1073,6 +1078,22 @@ std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
                 });
             }
         }
+    }
+    return rects;
+}
+
+std::vector<LevelRect> SparseLayerTileRects(const ImageInfo& info,
+                                            std::span<const std::pair<u64, u64>> ranges,
+                                            u32 tile_width, u32 tile_height, s32 host_tail_level,
+                                            u32 host_level_offset) {
+    ImageInfo layer_info = info;
+    layer_info.resources.layers = 1;
+    const s32 offset = static_cast<s32>(host_level_offset);
+    std::vector<LevelRect> rects =
+        SparseTileRects(layer_info, ranges, tile_width, tile_height, host_tail_level + offset);
+    std::erase_if(rects, [offset](const LevelRect& rect) { return rect.level < offset; });
+    for (LevelRect& rect : rects) {
+        rect.level -= offset;
     }
     return rects;
 }

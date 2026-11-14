@@ -2440,14 +2440,80 @@ void TextureCache<P>::RefreshSparseLayers(Image& image) {
             }
         }
         image.dirty_layers.clear();
-        const std::vector<u32> bound =
-            layers.empty() ? std::vector<u32>{} : BindSparseLayers(image, layers);
+        std::vector<u32> bound;
+        if constexpr (requires { &Image::BindLayerTiles; }) {
+            // Only the host blocks under the guest blocks that can hold data get memory: the rest
+            // of the layer reads zero, as those guest blocks do (13-26% of title 1's terrain
+            // array layers are written, and ~2% of its 85 MB a layer BC6H array). A layer mostly
+            // written is bound whole, as are layers the GPU writes (PrepareImage).
+            std::vector<u32> whole;
+            for (const u32 layer : layers) {
+                const std::vector<LevelRect> rects = SparseLayerRects(image, layer);
+                if (rects.empty()) {
+                    whole.push_back(layer);
+                } else if (BindSparseLayerTiles(image, layer, rects)) {
+                    bound.push_back(layer);
+                }
+            }
+            if (!whole.empty()) {
+                const std::vector<u32> bound_whole = BindSparseLayers(image, whole);
+                bound.insert(bound.end(), bound_whole.begin(), bound_whole.end());
+                std::ranges::sort(bound);
+            }
+        } else {
+            bound = layers.empty() ? std::vector<u32>{} : BindSparseLayers(image, layers);
+        }
         if (bound.empty()) {
             runtime.TransitionImageLayout(image);
             return;
         }
         UploadLayers(image, bound);
         runtime.InsertUploadMemoryBarrier();
+    }
+}
+
+template <class P>
+std::vector<LevelRect> TextureCache<P>::SparseLayerRects(const Image& image, u32 layer) const {
+    if constexpr (requires { &Image::BindLayerTiles; }) {
+        const u64 stride = image.info.layer_stride;
+        const std::vector<std::pair<u64, u64>> ranges =
+            Tegra::Nx2SparseDataRanges(image.gpu_addr + layer * stride, stride);
+        if (ranges.empty()) {
+            return {};
+        }
+        std::vector<LevelRect> rects = SparseLayerTileRects(
+            image.info, ranges, image.SparseTileWidth(), image.SparseTileHeight(),
+            image.SparseTailLevel(), image.host_level_offset);
+        u64 bytes = 0;
+        for (const LevelRect& rect : rects) {
+            if (rect.level < image.SparseTailLevel()) {
+                bytes += u64{Common::DivCeil(rect.width, image.SparseTileWidth())} *
+                         Common::DivCeil(rect.height, image.SparseTileHeight()) *
+                         image.SparseTileBytes();
+            }
+        }
+        if (bytes * 2 >= image.SparseLayerBytes()) {
+            rects.clear(); // mostly written: bound whole
+        }
+        return rects;
+    } else {
+        return {};
+    }
+}
+
+template <class P>
+bool TextureCache<P>::BindSparseLayerTiles(Image& image, u32 layer,
+                                           std::span<const LevelRect> rects) {
+    if constexpr (requires { &Image::BindLayerTiles; }) {
+        const u64 bound_bytes = ImageMemoryBytes(image);
+        const bool bound = image.BindLayerTiles(layer, rects);
+        // RegisterImage counts what an image has bound by then; later binds are added here.
+        if (True(image.flags & ImageFlagBits::Registered)) {
+            total_used_memory += ImageMemoryBytes(image) - bound_bytes;
+        }
+        return bound;
+    } else {
+        return false;
     }
 }
 

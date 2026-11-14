@@ -245,6 +245,13 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Image::BindLayers, with the memory it binds counted in total_used_memory.
     std::vector<u32> BindSparseLayers(Image& image, std::span<const u32> layers);
 
+    /// SparseLayers images: the host blocks of `layer` under its guest blocks that can hold data
+    /// (Nx2SparseDataRanges), or none when the layer is to be bound whole.
+    [[nodiscard]] std::vector<LevelRect> SparseLayerRects(const Image& image, u32 layer) const;
+
+    /// Image::BindLayerTiles, counting what it binds.
+    bool BindSparseLayerTiles(Image& image, u32 layer, std::span<const LevelRect> rects);
+
     /// Uploads `layers` of the image from guest memory.
     void UploadLayers(Image& image, std::span<const u32> layers);
 
