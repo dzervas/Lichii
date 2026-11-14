@@ -100,6 +100,7 @@ add_executable(tests
     video_core/descriptor_limits.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
+    video_core/separate_pool_packing.cpp
     video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp

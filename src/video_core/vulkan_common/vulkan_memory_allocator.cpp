@@ -412,12 +412,21 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     };
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
-    // In a pool of their own (see Device::SeparatePool); anything over half a block, or a pool
-    // allocation that fails, takes the default blocks.
+    // In a pool of their own (see Device::SeparatePool) when its blocks fit them well
+    // (PacksIntoSeparatePool), otherwise in memory of their own; an allocation that fails there
+    // takes the default blocks.
     u32 memory_type{};
-    if (requirements.size <= Device::SeparatePoolBlockSize / 2 &&
-        vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
+    if (!Device::PacksIntoSeparatePool(requirements.size)) {
+        VmaAllocationCreateInfo dedicated_ci = alloc_ci;
+        dedicated_ci.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        if (vmaAllocateMemory(allocator, &requirements, &dedicated_ci, &allocation, &info) ==
             VK_SUCCESS) {
+            memory = info.deviceMemory;
+            offset = info.offset;
+            return allocation;
+        }
+    } else if (vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci,
+                                      &memory_type) == VK_SUCCESS) {
         if (const VmaPool pool =
                 device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type)) {
             VmaAllocationCreateInfo pool_ci = alloc_ci;
