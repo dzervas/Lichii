@@ -627,7 +627,9 @@ private:
                ((device_addr + size) & ~Core::DEVICE_PAGEMASK);
     }
 
-    void RunGarbageCollector(bool aggressive_gc);
+    /// Deletes buffers unused for 120 frames (60 if aggressive_gc), or for idle_frames when given;
+    /// below aggressive_gc, not the ones holding GPU-written data.
+    void RunGarbageCollector(bool aggressive_gc, u64 idle_frames = 0);
 
     void BindHostIndexBuffer();
 
