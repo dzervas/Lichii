@@ -336,6 +336,9 @@ private:
                     operation();
                 }
                 released.operations.clear();
+                if constexpr (requires { released.fence->NoteReleased(); }) {
+                    released.fence->NoteReleased();
+                }
             }
             if (!batch.empty()) {
                 VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);

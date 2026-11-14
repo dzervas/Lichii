@@ -33,6 +33,9 @@ public:
 
     void Wait();
 
+    /// EDEN_NX2_FENCE_TRACE: its operations ran (the fencing thread).
+    void NoteReleased() const;
+
 private:
     Scheduler& scheduler;
     u64 wait_tick = 0;

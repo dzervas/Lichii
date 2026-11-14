@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_fence_trace.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -152,6 +153,18 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                  trace_timestamp_bits, trace_timestamp_period);
     }
 
+    if (FenceTrace::g_enabled && trace_timestamp_bits != 0 && trace_timestamp_bits <= 64 &&
+        trace_timestamp_period > 0) {
+        fence_trace_pool = device.GetLogical().CreateQueryPool({
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = FenceTraceSlots * 2,
+            .pipelineStatistics = 0,
+        });
+    }
+
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
@@ -164,6 +177,9 @@ Scheduler::~Scheduler() {
         worker_thread.join();
         if (trace_gpu_tick != 0) {
             master_semaphore->Wait(trace_gpu_tick);
+        }
+        if (!fence_trace_pending.empty()) {
+            master_semaphore->Wait(fence_trace_pending.back().first);
         }
     }
 }
@@ -678,6 +694,44 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     if (trace_query_pool && !trace_gpu_failed && (trace_gpu_pending || trace_gpu_sampling)) {
         TraceGpuSubmission();
     }
+    if (fence_trace_pool) {
+        HarvestFenceTrace();
+    }
+}
+
+void Scheduler::HarvestFenceTrace() {
+    master_semaphore->Refresh();
+    const u64 mask =
+        trace_timestamp_bits == 64 ? ~u64{0} : (u64{1} << trace_timestamp_bits) - 1;
+    while (!fence_trace_pending.empty() && IsFree(fence_trace_pending.front().first)) {
+        const auto [tick, slot] = fence_trace_pending.front();
+        fence_trace_pending.pop();
+        struct Result {
+            u64 timestamp;
+            u64 available;
+        };
+        std::array<Result, 2> results{};
+        if (device.GetLogical().GetQueryResults(
+                *fence_trace_pool, slot * 2, 2, sizeof(results), results.data(), sizeof(Result),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS &&
+            results[0].available != 0 && results[1].available != 0) {
+            const auto ns = [&](u64 timestamp) {
+                return static_cast<s64>(static_cast<double>(timestamp & mask) *
+                                        trace_timestamp_period);
+            };
+            FenceTrace::GpuTimes(tick, ns(results[0].timestamp), ns(results[1].timestamp));
+        }
+    }
+    if (fence_trace_pending.size() >= FenceTraceSlots) {
+        fence_trace_current.reset();
+        return;
+    }
+    const u32 slot = fence_trace_next;
+    fence_trace_next = (fence_trace_next + 1) % FenceTraceSlots;
+    fence_trace_current = slot;
+    current_upload_cmdbuf.ResetQueryPool(*fence_trace_pool, slot * 2, 2);
+    current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *fence_trace_pool,
+                                         slot * 2);
 }
 
 void Scheduler::TraceShader(u64 hash, u32 stage) {
@@ -749,6 +803,8 @@ void Scheduler::ReportWorkTimes() {
     };
     std::map<std::pair<u64, u64>, Totals> by_shaders;
     double total_ms{};
+    double compute_ms{}, graphics_ms{};
+    u32 compute_count{}, graphics_count{};
     for (u32 i = 0; i < count; ++i) {
         if (results[i * 2].available == 0 || results[i * 2 + 1].available == 0) {
             continue;
@@ -766,6 +822,8 @@ void Scheduler::ReportWorkTimes() {
             totals.max_size = item.size;
         }
         total_ms += ms;
+        (item.fragment_hash == 0 ? compute_ms : graphics_ms) += ms;
+        ++(item.fragment_hash == 0 ? compute_count : graphics_count);
     }
     std::vector<std::pair<std::pair<u64, u64>, Totals>> sorted(by_shaders.begin(),
                                                                by_shaders.end());
@@ -785,8 +843,10 @@ void Scheduler::ReportWorkTimes() {
                                totals.max_size[1], totals.max_size[2]);
     }
     LOG_INFO(Render_Vulkan,
-             "DKB gpu_work renderer_frame={} timed={} timed_sum_ms={:.3f} slowest:{}",
-             trace_sample_frame, count, total_ms, slowest);
+             "DKB gpu_work renderer_frame={} timed={} timed_sum_ms={:.3f} dispatches={} "
+             "dispatch_ms={:.3f} draws={} draw_ms={:.3f} slowest:{}",
+             trace_sample_frame, count, total_ms, compute_count, compute_ms, graphics_count,
+             graphics_ms, slowest);
 }
 
 void Scheduler::TraceGpuSubmission() {
@@ -942,6 +1002,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (trace_work_pool) {
             trace_work = {};
         }
+        if (fence_trace_current) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *fence_trace_pool,
+                                  *fence_trace_current * 2 + 1);
+            fence_trace_pending.emplace(signal_value, *fence_trace_current);
+            fence_trace_current.reset();
+        }
         cmdbuf.End();
 
         if (on_submit) {
@@ -952,6 +1018,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
+            if (fence_trace_pool) {
+                FenceTrace::Submitted(signal_value);
+            }
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

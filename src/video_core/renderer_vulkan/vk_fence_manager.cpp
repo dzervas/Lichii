@@ -6,6 +6,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
+#include "video_core/renderer_vulkan/vk_fence_trace.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -24,8 +25,17 @@ void InnerFence::Queue() {
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
+    if (FenceTrace::g_enabled) {
+        FenceTrace::FenceMade(wait_tick);
+    }
     if (!scheduler.DeferFlush()) {
         scheduler.Flush();
+    }
+}
+
+void InnerFence::NoteReleased() const {
+    if (FenceTrace::g_enabled && !is_stubbed) {
+        FenceTrace::FenceReleased(wait_tick);
     }
 }
 

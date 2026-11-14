@@ -483,6 +483,7 @@ private:
     void AllocateWorkerCommandBuffer();
 
     void TraceGpuSubmission();
+    void HarvestFenceTrace();
     void ReportWorkTimes();
     void TraceShader(u64 hash, u32 stage);
 
@@ -536,6 +537,13 @@ private:
         std::array<u32, 3> size{};
     };
     vk::QueryPool trace_work_pool;
+    /// EDEN_NX2_FENCE_TRACE (vk_fence_trace.h): every submission's GPU start and end, a ring of
+    /// FenceTraceSlots (worker thread).
+    static constexpr u32 FenceTraceSlots = 1024;
+    vk::QueryPool fence_trace_pool;
+    std::queue<std::pair<u64, u32>> fence_trace_pending; ///< tick, slot
+    std::optional<u32> fence_trace_current;
+    u32 fence_trace_next{};
     std::vector<WorkTrace> trace_work_items;
     u32 trace_work_count{};
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
