@@ -173,7 +173,9 @@ TEST_CASE("null sink plays render output at the device rate", "[sysmix_sink]") {
     stream->Start();
     AudioCore::Sink::SinkBuffer block{240, 0, 0, false};
     std::array<s16, 480> samples{};
-    constexpr u32 blocks = 20;
+    // A consumer that woke late makes up for at most 20 blocks at once.
+    constexpr u32 catch_up = 20;
+    constexpr u32 blocks = 2 * catch_up;
     const auto start = std::chrono::steady_clock::now();
     for (u32 i = 0; i < blocks; ++i) {
         stream->AppendBuffer(block, samples);
@@ -183,7 +185,8 @@ TEST_CASE("null sink plays render output at the device rate", "[sysmix_sink]") {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     REQUIRE(stream->GetQueueSize() == 0);
-    // One 240-frame block per 5 ms at 48 kHz.
-    REQUIRE(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds{5 * (blocks - 1)});
+    // One 240-frame block per 5 ms at 48 kHz, for the blocks that were not caught up on.
+    REQUIRE(std::chrono::steady_clock::now() - start >=
+            std::chrono::milliseconds{5 * (blocks - catch_up - 1)});
     null.CloseStream(stream);
 }
