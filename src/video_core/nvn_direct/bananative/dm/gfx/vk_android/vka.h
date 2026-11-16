@@ -411,9 +411,10 @@ int vka_rc_mode(void);
 void vka_rc_keep(const prog_t *p);
 typedef struct vka_dstate vka_dstate;
 void vka_rc_draw(const vka_dstate *d);
-vka_shader *vka_rc_shader(const prog_t *p, unsigned i, uint64_t key, uint32_t prim_inputs, int *st);
+vka_shader *vka_rc_shader(const prog_t *p, unsigned i, uint64_t key, uint32_t inputs, int *st);
 int vka_rc_stage(uint64_t key);         // NVN stage of a kept control section, -1 none
 uint32_t vka_rc_prim(uint64_t key);     // a recompiled mesh shader's generic outputs per primitive
+uint32_t vka_rc_outs(uint64_t key);     // a recompiled vertex or tess evaluation shader's generic outputs
 vka_shader *vka_rc_by_key(uint64_t key);
 unsigned vka_rc_stage_keys(int st, uint64_t **out);   // the kept translations' shader keys of NVN stage st (malloc'd)
 void vka_rc_counts(unsigned *made, unsigned *kept);    // shaders made this run, of them kept from earlier runs

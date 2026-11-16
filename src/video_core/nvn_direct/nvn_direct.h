@@ -57,6 +57,9 @@ typedef struct nvn_direct_shader_source {
     uint8_t vertex_input_types[32]; ///< vertex: generic input types, 0 float, 1 signed, 2 unsigned
     int convert_depth;         ///< pre-rasterization stages: z from -w..w to 0..w (the GL depth mode)
     uint32_t per_primitive_inputs; ///< fragment after a mesh program: the generic inputs it writes per primitive
+    /// geometry: the generics the stage before writes (an emulated passthrough copies only those);
+    /// 0 = not known, all of them
+    uint32_t previous_generic_outputs;
     void* context;
     uint32_t (*read_cbuf)(void* context, uint32_t bank, uint32_t offset);
     /// 1 = the size bytes at guest address were read into out
@@ -105,6 +108,7 @@ typedef struct nvn_direct_shader {
     uint32_t input_mask;       ///< vertex: generic inputs read
     uint32_t output_mask;      ///< fragment: colour outputs written
     uint32_t per_primitive_outputs; ///< mesh: generic outputs written per primitive
+    uint32_t generic_outputs;  ///< vertex and tess evaluation: generic outputs written
     uint32_t ssbo_align;       ///< storage buffers are bound at their address rounded down to this
     char error[256];           ///< why it was not translated
 } nvn_direct_shader;

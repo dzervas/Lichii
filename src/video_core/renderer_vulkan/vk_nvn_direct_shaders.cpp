@@ -461,6 +461,18 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
         Shader::Maxwell::TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
     std::array<Shader::IR::Program*, 1> programs{&program};
     Shader::Optimization::LimitPipelineSampledTextureArrays(programs, host_info);
+    // An emulated passthrough geometry shader copies only what the stage before writes, as the
+    // pipeline cache does: all 32 generics are over the host's component limits (Donkey Kong
+    // Bananza's world pipeline crashed RADV's pipeline creation with them).
+    if (source.previous_generic_outputs != 0 && !host_info.support_geometry_shader_passthrough) {
+        Shader::VaryingState previous;
+        for (u32 index = 0; index < 32; ++index) {
+            if (source.previous_generic_outputs >> index & 1) {
+                previous.Set(Shader::IR::Attribute::Generic0X + index * 4);
+            }
+        }
+        Shader::Maxwell::TrimGeometryPassthrough(program, previous);
+    }
     const Shader::Info& info = program.info;
     // The replay's pipeline layouts have no push constants for the render area, and those of the
     // resolution scale only while it scales (nvn_direct.h NVN_DIRECT_SCALE_PUSH_SIZE), each stage
@@ -629,6 +641,10 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     for (u32 index = 0; index < 32; ++index) {
         if (stage == Shader::Stage::VertexB && info.loads.Generic(index)) {
             shader.input_mask |= 1U << index;
+        }
+        if ((stage == Shader::Stage::VertexB || stage == Shader::Stage::TessellationEval) &&
+            info.stores.Generic(index)) {
+            shader.generic_outputs |= 1U << index;
         }
         if (stage == Shader::Stage::Fragment && index < info.stores_frag_color.size() &&
             info.stores_frag_color[index]) {
