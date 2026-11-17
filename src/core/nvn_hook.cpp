@@ -548,9 +548,82 @@ void CheckBindTexture(State& state, Counters& counters, Core::Memory::Memory& me
     }
 }
 
+#ifdef LICHII_NVN_DIRECT
+/// The answers of NVN2's own nvnDeviceGetInteger that are constants in its code, given to the front
+/// end as device integers (dm_sdk_nvn2_item), read from the module at `base` that holds the driver
+/// as upstream's loader.c nvn2_find_switch reads them. Its API and GPU code versions move with the
+/// SDK and games check them: Ocarina of Time (SDK 22.2.8) requires API 231.40 (main+0x346c118)
+/// and otherwise makes no graphics system. The driver's switch over the items loads w0 with the
+/// major first, then jumps through a byte table: mov w0, #231 / adr (the cases) / adrp + add (the
+/// table) / ldrb / br, with cmp wN, #<last item> before it; a constant case is mov w0, #v; b.
+/// Returns how many items it found.
+u32 ReadNvn2Constants(Kernel::KProcess& process, u64 base) {
+    Kernel::KMemoryInfo info{};
+    Kernel::Svc::PageInfo page{};
+    if (process.GetPageTable()
+            .QueryInfo(std::addressof(info), std::addressof(page), base)
+            .IsError()) {
+        return 0;
+    }
+    const u64 text_end = info.GetSvcMemoryInfo().base_address + info.GetSvcMemoryInfo().size;
+    const u64 end = GetInteger(Core::GetModuleEnd(&process, base)) + 1;
+    std::vector<u32> words((end - base) / 4);
+    if (text_end <= base || !ReadGuest(process.GetMemory(), base, words.data(), words.size() * 4)) {
+        return 0;
+    }
+    const auto* const bytes = reinterpret_cast<const u8*>(words.data());
+    const s64 text_size = static_cast<s64>(text_end - base);
+    const s64 size = static_cast<s64>(words.size() * 4);
+    // adr and adrp's signed 21-bit immediate
+    const auto immediate = [](u32 word) {
+        const s64 value = ((word >> 3) & 0x1ffffc) | ((word >> 29) & 3);
+        return (value & 0x100000) != 0 ? value - 0x200000 : value;
+    };
+    for (s64 p = 8; p + 9 < text_size / 4; ++p) {
+        if (words[p] != 0x52801ce0) { // mov w0, #231
+            continue;
+        }
+        s64 table = -1, cases = -1, last = -1;
+        bool ldrb = false, br = false;
+        for (s64 q = p - 8; q <= p + 8; ++q) {
+            const u32 word = words[q];
+            if ((word & 0xffc0001f) == 0x7100001f) { // cmp wN, #imm
+                last = (word >> 10) & 0xfff;
+            } else if ((word & 0x9f000000) == 0x90000000 &&
+                       (words[q + 1] & 0xffc00000) == 0x91000000) { // adrp + add
+                table = ((q * 4) & ~s64{0xfff}) + immediate(word) * 4096 +
+                        ((words[q + 1] >> 10) & 0xfff);
+            } else if ((word & 0x9f000000) == 0x10000000) { // adr
+                cases = q * 4 + immediate(word);
+            } else if ((word & 0xffe0fc00) == 0x38606800) { // ldrb wK, [xT, xI]
+                ldrb = true;
+            } else if ((word & 0xfffffc1f) == 0xd61f0000) { // br
+                br = true;
+            }
+        }
+        if (last <= 1 || !ldrb || !br || table < text_size || table + last >= size || cases < 0 ||
+            cases % 4 != 0 || cases + 255 * 4 + 8 > text_size) {
+            continue;
+        }
+        u32 found = 0;
+        for (s64 item = 0; item <= last; ++item) {
+            const s64 at = cases / 4 + bytes[table + item];
+            if ((words[at] & 0xffe0001f) == 0x52800000 &&     // mov w0, #imm16
+                (words[at + 1] & 0xfc000000) == 0x14000000) { // b
+                nvn_direct_set_device_integer(static_cast<unsigned>(item),
+                                              static_cast<int>((words[at] >> 5) & 0xffff));
+                ++found;
+            }
+        }
+        return found;
+    }
+    return 0;
+}
+#endif
+
 /// Direct mode, at Install: a slot per name the front end knows (upstream's names.txt), the
 /// driver's entry points from a pass-through run's capture, hooked only to count, and its
-/// device integers.
+/// device integers (the driver code's constants, then the capture's answers).
 void InstallDirect(State& state) {
 #ifdef LICHII_NVN_DIRECT
     for (int front = 0; front < nvn_direct_name_count(); ++front) {
@@ -567,6 +640,21 @@ void InstallDirect(State& state) {
     // The game's inline NVN encoding stays off: its commands come through the table (nvnPrivate0
     // is 1 only once the driver's lookup ran, which it never does now; written at each lookup).
     state.private0_value = state.private0_value.value_or(0);
+    // NVN2 is compiled into the module that exports nvnBootstrapLoader.
+    u32 constants = 0;
+    if (state.process->IsSwitch2()) {
+        for (const u64 entry : state.bootstrap_entries) {
+            constants = ReadNvn2Constants(*state.process,
+                                          std::prev(state.modules.upper_bound(entry))->first);
+            if (constants != 0) {
+                break;
+            }
+        }
+        if (constants == 0) {
+            LOG_WARNING(Core, "NVN direct: NVN2's nvnDeviceGetInteger switch is not in the game's "
+                              "driver: the device answers the newest versions known");
+        }
+    }
     std::FILE* file = state.driver_file_path.empty()
                           ? nullptr
                           : std::fopen(state.driver_file_path.c_str(), "r");
@@ -596,9 +684,9 @@ void InstallDirect(State& state) {
     }
     LOG_INFO(Core,
              "NVN direct: the game's NVN driver is replaced: {} names in the front end, {} driver "
-             "entries watched, {} device integers from the driver",
+             "entries watched, {} device integers from the driver, {} from its code",
              state.slot_count.load() - FirstNameSlot, state.driver_entries.size(),
-             state.device_integers.size());
+             state.device_integers.size(), constants);
 #endif
 }
 

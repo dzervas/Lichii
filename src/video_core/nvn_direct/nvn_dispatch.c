@@ -260,8 +260,8 @@ uint64_t nvn_direct_call(int slot, const uint64_t x[8], const uint64_t v[8], uin
     return g_slot[slot].d->d(g_slot[slot].fn, x, v, v0);
 }
 
-// nvnDeviceGetInteger: the game's own NVN2 driver's answers, as Lichii captured them
-// (hle_nvn.c asks dm_sdk_nvn2_item before its table).
+// nvnDeviceGetInteger: the game's own NVN2 driver's answers, as Lichii captured them or read the
+// constants among them from its code (hle_nvn.c asks dm_sdk_nvn2_item before its table).
 enum { DEVICE_ITEMS = 0x100 };
 static int g_item_known[DEVICE_ITEMS], g_item_value[DEVICE_ITEMS];
 void nvn_direct_set_device_integer(unsigned item, int value) {
