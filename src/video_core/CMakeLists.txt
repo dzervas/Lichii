@@ -5,7 +5,7 @@
 
 add_subdirectory(host_shaders)
 add_subdirectory(gpu_logging)
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ARCHITECTURE_x86_64)
+if (ENABLE_NVN_DIRECT)
     add_subdirectory(nvn_direct)
 endif()
 
