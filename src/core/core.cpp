@@ -631,7 +631,6 @@ struct System::Impl {
 
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
-        Service::g_nx2_told_hdr = false;
 
         // The cheat VM runs on the timer thread, which keeps running through the teardown, and
         // reads keys through the service manager and memory through the process. Freed below,
@@ -689,6 +688,8 @@ struct System::Impl {
             general_channel_context.reset();
         }
         kernel.Shutdown();
+        // After the services stop: a display HDR query still in flight stores its answer.
+        Service::g_nx2_told_hdr = false;
         Core::NvnHook::Uninstall();
         stop_event = {};
         Network::RestartSocketOperations();
