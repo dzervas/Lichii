@@ -20,8 +20,9 @@ static inline uint64_t nvn_caller(void) { return nvn_direct_guest_lr; }
 uint64_t nvn_direct_guest_of(uint64_t host);
 /// The host pointer of a game address (anything at or past the guest address space: unchanged).
 uint64_t nvn_direct_host_of(uint64_t guest);
-/// nvn_direct_memory's map_view and track_pages (nvn_direct.h).
+/// nvn_direct_memory's map_view, unmap_view and track_pages (nvn_direct.h).
 void* nvn_direct_map_view(uint64_t address, uint64_t size, uint64_t* unmapped);
+void nvn_direct_unmap_view(void* view, uint64_t size);
 void nvn_direct_track_pages(uint64_t address, uint64_t size, int armed);
 /// The file holding the backing memory of the guest page at address (nvn_direct_memory's
 /// backing_fd) and the page's offset in it (*offset); -1 when there is no file or the guest has

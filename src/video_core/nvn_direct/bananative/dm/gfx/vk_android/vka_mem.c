@@ -517,7 +517,7 @@ static int import_seg(uintptr_t lo, uintptr_t hi) {
 fail:
     if (s.mem) vk.vkFreeMemory(V.dev, s.mem, NULL);
     if (s.buf) vk.vkDestroyBuffer(V.dev, s.buf, NULL);
-    if (view) munmap(view, n);
+    if (view) nvn_direct_unmap_view(view, n);
     if (dfd >= 0) close(dfd);
     return 0;
 }   // this thread's bytes placed and time in pend_wait (mtl_pool_add's attribution: other threads place while it waits)
@@ -639,7 +639,7 @@ static void alias_drop_buf(VkBuffer buf, VkDeviceSize lo, VkDeviceSize hi);   //
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *view; size_t n; } import_free;
 static void import_free_run(void *arg) {
     import_free *f = arg;
-    if (!vka_hung()) { vk.vkDestroyBuffer(V.dev, f->buf, NULL); vk.vkFreeMemory(V.dev, f->mem, NULL); if (f->view) munmap(f->view, f->n); }
+    if (!vka_hung()) { vk.vkDestroyBuffer(V.dev, f->buf, NULL); vk.vkFreeMemory(V.dev, f->mem, NULL); if (f->view) nvn_direct_unmap_view(f->view, f->n); }
     free(f);
 }
 static void import_free_after(uint64_t fence, VkBuffer buf, VkDeviceMemory mem, void *view, size_t n) {
@@ -787,7 +787,7 @@ static void unplace(const seg_t *sp) {
     alias_drop_buf(s.buf, 0, n);
     if (s.import) {   // Lichii: an import (import_seg): nothing to copy back, the pages are the guest's; its view goes with the memory (kept, as the memory, while the GPU may use it)
         seg_free(&s, waited, fence);
-        if (waited && s.view) munmap(s.view, n);
+        if (waited && s.view) nvn_direct_unmap_view(s.view, n);
         static int nlog; if (nlog++ < 4) VLOG("pool memory %#lx+%#zx: import given back (%.2f GiB imported)", (unsigned long)s.lo, n, vka_mem_placed_bytes(NULL) / 1073741824.0);
         return;
     }

@@ -44,7 +44,6 @@
 #include "video_core/nvn_header_count.h"
 #include "video_core/nvn_hle_marker.h"
 #ifdef LICHII_NVN_DIRECT
-#include <sys/mman.h>
 #include "video_core/nvn_direct/nvn_direct.h"
 #endif
 
@@ -179,8 +178,8 @@ struct State {
     u64 presents{};                                         ///< direct mode's presents so far
 
     Kernel::KProcess* process{};
-    /// Lichii's guest memory (its memfd and backing view, for the replay's pool imports)
-    const Common::HostMemory* host_memory{};
+    /// Lichii's guest memory (its memfd and backing views, for the replay's pool imports)
+    Common::HostMemory* host_memory{};
     u64 synthetic_base{};
     /// nvnBootstrapLoader, every module's export: LM3 (Switch 1) exports it from a subsdk
     /// (nnSdkEn) and from nnSdk (dotfiles-1gi).
@@ -711,55 +710,46 @@ u32 DirectSlotOf(State& state, const std::string& name) {
 }
 
 /// nvn_direct_memory.map_view (dotfiles-25x.5): the pages behind guest [address, address + size)
-/// mapped once more at a range of their own, for the replay to import. Each run of pages that lie
-/// one after the other in the backing memory is a mremap of the backing view with old size 0,
-/// which on a shared mapping makes a second mapping of the same pages; pages the guest has not
-/// mapped stay the reservation's zero pages.
+/// mapped once more at a range of their own, for the replay to import: each run of pages that lie
+/// one after the other in the backing memory is one mapping of it (HostMemory::MapBackingView);
+/// pages the guest has not mapped are zero pages of the view.
 void* MapPoolView(void* context, u64 address, u64 size, u64* unmapped) {
-    auto& memory = static_cast<State*>(context)->process->GetMemory();
-    u8* const view = static_cast<u8*>(mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
-    if (view == MAP_FAILED) {
-        return nullptr;
-    }
+    State& state = *static_cast<State*>(context);
+    auto& memory = state.process->GetMemory();
+    const u8* const backing_base = state.host_memory->BackingBasePointer();
     constexpr u64 PageSize = Core::Memory::LICHII_PAGESIZE;
-    u64 run_start = 0;
-    u8* run_backing = nullptr;
-    const auto map_run = [&](u64 end) {
-        if (run_backing == nullptr) {
-            return true;
-        }
-        void* const moved = mremap(run_backing, 0, end - run_start, MREMAP_MAYMOVE | MREMAP_FIXED,
-                                   view + run_start);
-        if (moved != view + run_start) {
-            LOG_ERROR(Core, "NVN direct: view of guest {:#x}+{:#x}: mremap {}", address + run_start,
-                      end - run_start, std::strerror(errno));
-            return false;
-        }
-        run_backing = nullptr;
-        return true;
-    };
+    std::vector<Common::HostMemory::BackingRun> runs;
     for (u64 offset = 0; offset < size; offset += PageSize) {
-        u8* const backing = memory.GetPointerSilent(address + offset);
-        if (run_backing != nullptr && backing == run_backing + (offset - run_start)) {
-            continue;
-        }
-        if (!map_run(offset)) {
-            munmap(view, size);
-            return nullptr;
-        }
+        const u8* const backing = memory.GetPointerSilent(address + offset);
         if (backing == nullptr) {
             *unmapped += PageSize;
             continue;
         }
-        run_start = offset;
-        run_backing = backing;
+        if (backing < backing_base ||
+            static_cast<size_t>(backing - backing_base) >= state.host_memory->BackingSize()) {
+            LOG_ERROR(Core, "NVN direct: view of guest {:#x}+{:#x}: page {:#x} is outside the "
+                      "backing memory", address, size, address + offset);
+            return nullptr;
+        }
+        const size_t host_offset = static_cast<size_t>(backing - backing_base);
+        if (!runs.empty() && runs.back().view_offset + runs.back().length == offset &&
+            runs.back().host_offset + runs.back().length == host_offset) {
+            runs.back().length += PageSize;
+            continue;
+        }
+        runs.push_back({.view_offset = offset, .host_offset = host_offset, .length = PageSize});
     }
-    if (!map_run(size)) {
-        munmap(view, size);
-        return nullptr;
+    u8* const view = state.host_memory->MapBackingView(size, runs);
+    if (view == nullptr) {
+        LOG_ERROR(Core, "NVN direct: no view of guest {:#x}+{:#x} ({} runs)", address, size,
+                  runs.size());
     }
     return view;
+}
+
+/// nvn_direct_memory.unmap_view: takes down a view MapPoolView made.
+void UnmapPoolView(void* context, void* view, u64 size) {
+    static_cast<State*>(context)->host_memory->UnmapBackingView(static_cast<u8*>(view), size);
 }
 
 /// nvn_direct_memory.track_pages: arms or disarms the write tracking of pool pages by guest
@@ -813,6 +803,7 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
         if (!state.direct_ready) {
             auto& page_table = state.process->GetPageTable();
             const nvn_direct_memory views{.map_view = MapPoolView,
+                                          .unmap_view = UnmapPoolView,
                                           .track_pages = TrackPages,
                                           .backing = Backing,
                                           .context = &state,

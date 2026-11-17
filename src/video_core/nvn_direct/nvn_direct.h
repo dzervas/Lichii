@@ -200,8 +200,10 @@ typedef struct nvn_direct_memory {
     /// range of their own: read-write and never protected, so Vulkan imports them while the
     /// guest's own view (the fastmem arena) may be write-tracked or partly unmapped. Pages the
     /// guest has not mapped are zero pages of the view (their bytes in *unmapped). NULL on
-    /// failure. The view is given back with munmap.
+    /// failure. The view is given back with unmap_view.
     void* (*map_view)(void* context, uint64_t address, uint64_t size, uint64_t* unmapped);
+    /// Takes down a view map_view made, of size bytes.
+    void (*unmap_view)(void* context, void* view, uint64_t size);
     /// Arms (1) or disarms (0) Lichii's tracking of CPU writes to the pool pages [address,
     /// address + size): a write to an armed page is reported (nvn_direct_cpu_written).
     void (*track_pages)(void* context, uint64_t address, uint64_t size, int armed);
