@@ -102,14 +102,22 @@ static void *worker_main(void *arg) {
     for (;;) {
         uint64_t t0 = wns();
         pthread_mutex_lock(&g_mu);
-        while (g_qout == g_qin) pthread_cond_wait(&g_cv, &g_mu);
+        // Lichii: while work is held (vka_rp_hold_sub), a look at it every 100 ms without jobs, and at once when the replay stops
+        int look = 0;
+        while (g_qout == g_qin && !look) {
+            if (!vka_rp_holding()) { pthread_cond_wait(&g_cv, &g_mu); continue; }
+            struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 100000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            look = vka_stopping() || pthread_cond_timedwait(&g_cv, &g_mu, &dl);
+        }
+        if (g_qout == g_qin) { pthread_mutex_unlock(&g_mu); vka_rp_resume(); pthread_mutex_lock(&g_mu); pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); continue; }
         job_t j = g_q[g_qout % NJOB];
         pthread_mutex_unlock(&g_mu);
         uint64_t t1 = wns(), c1 = j.kind == J_SUB ? thread_cpu_ns() : 0; g_idle_ns += t1 - t0;
         aff_check();
         static int slow_ms = -1; if (slow_ms < 0) { const char *e = getenv("DM_VK_SLOWSUB_MS"); slow_ms = e ? atoi(e) : 0; }
         slow_snap sa; if (slow_ms > 0 && j.kind == J_SUB) slow_take(&sa);
-        if (j.kind == J_SUB) {
+        if (j.kind == J_SUB && vka_rp_hold_sub(j.serial, j.origin_ll, j.frame, j.wait, j.nwait, j.h, j.nh, j.fence)) {}   // (Lichii: held, j.h with it)
+        else if (j.kind == J_SUB) {
             vka_rp_queue_activate(j.serial); vka_rp_set_queue_origin(j.origin_ll);
             vka_gp_sub_frame(j.frame); vka_exec_sub_frame(j.frame); vka_rp_sub_begin();
             for (int i = 0; i < j.nwait; i++) vka_rp_sub_wait(j.wait[i]);
@@ -119,6 +127,7 @@ static void *worker_main(void *arg) {
         } else if (j.kind == J_PRESENT) vka_present_fill(j.ticket, &j.t, j.period, j.has_crop ? j.crop : NULL);
         else if (j.kind == J_FORGET) vka_rp_queue_forget(j.serial);
         else if (j.kind == J_EVENT) vka_rp_event(j.ev, j.ev_mode, j.ev_v);
+        vka_rp_resume();   // (Lichii: what this job let go on)
         uint64_t t2 = wns(); g_busy_ns += t2 - t1;
         if (slow_ms > 0 && j.kind == J_SUB && t2 - t1 > (uint64_t)slow_ms * 1000000ull) { slow_snap sb; slow_take(&sb); slow_log(t2 - t1, thread_cpu_ns() - c1, &sa, &sb); } if (j.kind == J_SUB) { g_sub_ns += t2 - t1; atomic_fetch_add_explicit(&g_sub_all, t2 - t1, memory_order_relaxed); atomic_fetch_add_explicit(&g_sub_cpu_all, thread_cpu_ns() - c1, memory_order_relaxed); }
         if (j.kind == J_PRESENT && j.ticket % 300 == 0) {
@@ -161,8 +170,8 @@ int vka_worker_idle(uint64_t timeout_ns) {
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + timeout_ns; dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
     pthread_mutex_lock(&g_mu);
-    while (g_qout != g_qin) if (pthread_cond_timedwait(&g_cv, &g_mu, &dl)) break;
-    int idle = g_qout == g_qin; pthread_mutex_unlock(&g_mu);
+    while (g_qout != g_qin || vka_rp_holding()) if (pthread_cond_timedwait(&g_cv, &g_mu, &dl)) break;   // (Lichii: and nothing held)
+    int idle = g_qout == g_qin && !vka_rp_holding(); pthread_mutex_unlock(&g_mu);
     return idle;
 }
 
@@ -203,7 +212,7 @@ void mtl_exec(const uint8_t *handle) {
     g_cur.h[g_cur.nh++] = handle;
 }
 uint64_t mtl_sub_commit(void) {
-    if (!g_in_sub) return vka_rp_sub_commit(0);
+    if (!g_in_sub) { uint64_t f = vka_rp_sub_commit(0); vka_rp_resume(); return f; }
     g_in_sub = 0;
     job_t j = {J_SUB}; j.serial = g_pend_serial; j.origin_ll = g_pend_origin; j.nh = g_cur.nh;
     j.nwait = g_cur.nwait; memcpy(j.wait, g_cur.wait, sizeof j.wait);
