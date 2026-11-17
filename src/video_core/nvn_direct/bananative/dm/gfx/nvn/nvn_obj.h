@@ -111,7 +111,7 @@ enum {
 };
 // Payload (immediately follows op_hdr)
 typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
-typedef struct { int32_t index, mask; float rgba[4]; } p_clear_color;
+typedef struct { int32_t index, mask; float rgba[4]; int32_t ints; } p_clear_color;   // ints (Lichii): 1 / 2, rgba holds the bits of ClearColori / ClearColorui's int32 / uint32 values
 typedef struct { uint64_t h; NVNdrawTextureRegion d, s; } p_draw_tex;   // nvnCommandBufferDrawTexture: texture handle, destination (pixels) and source (texels) regions
 typedef struct { int32_t mode, pad; uint64_t addr; } p_render_cond;   // mode 0 / 1: SetRenderEnableConditional (render if the 64-bit counters at addr and addr + 16 are equal / not equal), 2 / 3: SetRenderEnable(true / false)
 typedef struct { float depth; int32_t depth_mask, stencil, stencil_mask; } p_clear_ds;

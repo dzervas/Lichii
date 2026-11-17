@@ -511,6 +511,14 @@ static VkClearColorValue color_value(const vka_fmt *f, const float rgba[4]) {
     }
     return v;
 }
+// Lichii: a colour clear's value. From ClearColori/ui (ints) the integer bits go to an integer target as they are, and a float target gets them converted
+static VkClearColorValue clear_value(const vka_fmt *f, const p_clear_color *c) {
+    VkClearColorValue v; uint32_t u[4]; memcpy(u, c->rgba, 16);
+    if (!c->ints) return color_value(f, c->rgba);
+    if (f->kind == 1 || f->kind == 2) { memcpy(v.uint32, u, 16); return v; }
+    float fl[4]; for (int i = 0; i < 4; i++) fl[i] = c->ints == 1 ? (float)(int32_t)u[i] : (float)u[i];
+    return color_value(f, fl);
+}
 static void level_size(const vka_img *im, uint32_t lv, uint32_t *w, uint32_t *h) { *w = im->w >> lv ? im->w >> lv : 1; *h = im->h >> lv ? im->h >> lv : 1; }
 static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv, uint32_t *l0, uint32_t *nl) {
     *lv = has_v && v->set_levels ? v->base_level : 0;
@@ -585,7 +593,7 @@ static void clear_color(const p_clear_color *c) {
     VkRect2D rc; int part = scissored(im, lv, &rc);
     if (!rc.extent.width) return;
     vka_fmt fl = f; fl.srgb = 0;   // in a pass the attachment is the sRGB view: the clear colour stays linear there
-    vka_pclear pc = {c->index, im, f.vk, VK_IMAGE_ASPECT_COLOR_BIT, lv, l0, nl, rc, !part, {.color = color_value(&f, c->rgba)}, {.color = color_value(&fl, c->rgba)}};
+    vka_pclear pc = {c->index, im, f.vk, VK_IMAGE_ASPECT_COLOR_BIT, lv, l0, nl, rc, !part, {.color = clear_value(&f, c)}, {.color = clear_value(&fl, c)}};
     vka_img_written(im); g_stat_ops++;
     if (!clear_in_pass(&pc)) vka_clear_outside(&pc);
 }
