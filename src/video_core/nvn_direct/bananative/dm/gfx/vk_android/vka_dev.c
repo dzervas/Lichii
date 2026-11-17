@@ -69,6 +69,7 @@ int nvn_direct_adopt_device(const nvn_direct_device *d) {
     char h[256]; uint64_t u = 0, b = 0;
     if (g_adopt.memory_usage) { V.pd = d->physical; vka_heap_line(h, sizeof h); u = g_adopt.memory_usage(g_adopt.memory_context); VLOG("VRAM before the replay starts: host use %.0f MiB; driver %s", u / 1048576.0, h); }
     int ok = vka_init();
+    if (ok) vka_shlib_check_pending();   // (the library may have loaded inside the init: vka_pso_start)
     if (ok && g_adopt.memory_usage && VKA_ENV("DM_VK_VRAM_TRACE", 0)) g_vram_up = !pthread_create(&g_vram_th, NULL, vram_trace_main, NULL);
     if (ok && g_adopt.memory_usage) { vka_heap_line(h, sizeof h); u = g_adopt.memory_usage(g_adopt.memory_context); (void)b; VLOG("VRAM after the replay started: host use %.0f MiB; driver %s", u / 1048576.0, h); }
     return ok;

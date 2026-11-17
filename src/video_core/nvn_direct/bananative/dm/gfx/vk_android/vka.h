@@ -412,6 +412,7 @@ int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask);   //
 #define VKA_FS_RETYPE 4                  // vka_gkey.fs_variant beyond the library's DMSH_VK_MOD_*: the base pixel module with its float outputs at integer attachments retyped (vka_pso.c fout_masks)
 VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t smask);   // the base module with those float inputs as uvec4 / ivec4 (vka_spv_vin_retype), made once per masks   // the module of that variant (DMSH_VK_MOD_*), made on first use; VK_NULL_HANDLE = the entry has none   // the shader of key in library L (the game's, or the selftest's own); NULL = not there or refused
 int vka_shlib_check_all(const vka_shlib *L);   // every module and compute pipeline of L made (DM_VK_SHLIB_CHECK=1): the failures
+void vka_shlib_check_pending(void);             // Lichii: DM_VK_SHLIB_CHECK's check of the game's library, once it has loaded; never under g_mu or inside the replay's init
 // Lichii's recompiler (nvn_recompile.c, dotfiles-25x.11): EDEN_NX2_NVN_RECOMPILE's mode (1 recompiler, the default; 0 library; 2 library compared with it); control sections kept at
 // nvnProgramSetShaders; the draw whose state translation reads; a program stage's shader (*st its NVN stage, -1 without a kept control section); a shader by key;
 // mode 2's comparison; a recompiled compute shader's c[0]

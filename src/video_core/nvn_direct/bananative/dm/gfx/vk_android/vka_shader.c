@@ -25,6 +25,7 @@
 #include <time.h>
 
 static vka_shlib g_lib; static int g_lib_state;   // 0 not tried, 1 loaded, -1 none
+static _Atomic int g_check_pending;   // Lichii: DM_VK_SHLIB_CHECK's check, run by vka_shlib_check_pending outside g_mu and the replay's init (it makes shaders and pipelines)
 static char g_lib_path[1024];                       // the library loaded (vka_shader_lib_path)
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -120,9 +121,10 @@ static int lib_load(void) {
          g_lib.size / 1e6, DMSH_CHAIN, DMSH_VK_CHAIN, inputs, sg, sa ? sa : 1);
     g_lib_state = 1;
     const char *ck = getenv("DM_VK_SHLIB_CHECK");
-    if (ck && atoi(ck)) vka_shlib_check_all(&g_lib);
+    if (ck && atoi(ck)) atomic_store(&g_check_pending, 1);
     return 1;
 }
+void vka_shlib_check_pending(void) { if (atomic_exchange(&g_check_pending, 0)) vka_shlib_check_all(&g_lib); }
 
 // ---------- Static memory: buffers that live as long as the process ----------
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; VkDeviceSize size, used; } stblk;
@@ -370,6 +372,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
 vka_shader *vka_shader_by_key(uint64_t key) {
     if (vka_rc_mode() == 1) return vka_rc_by_key(key);   // Lichii: recompiled shaders only (nvn_recompile.c): those translated so far
     pthread_mutex_lock(&g_mu); int ok = lib_load(); pthread_mutex_unlock(&g_mu);
+    vka_shlib_check_pending();
     return ok ? vka_shader_make(&g_lib, key) : NULL;
 }
 
@@ -479,6 +482,7 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
         return 1;
     }
     pthread_mutex_lock(&g_mu); int ok = lib_load(); pthread_mutex_unlock(&g_mu);
+    vka_shlib_check_pending();
     if (!ok) return 0;
     for (unsigned i = 0; i < p->nstage && i < 6; i++) {   // (a program has at most 6 shaders: hle_nvn.c nvnProgramSetShaders)
         uint8_t md[8];
