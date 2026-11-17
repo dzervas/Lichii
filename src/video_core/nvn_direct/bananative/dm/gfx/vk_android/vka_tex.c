@@ -2086,7 +2086,7 @@ static int img_storage_upgrade(vka_img *im, VkCommandBuffer cb) {
     vk.vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, n->img, VK_IMAGE_LAYOUT_GENERAL, nc, c);
     vka_barrier(cb);
     VkImage oi = im->img; vka_imem od = im->m; void *ov = im->views; uint64_t ob = im->bytes;
-    im->img = n->img; im->m = n->m; im->views = NULL; im->usage = n->usage; im->bytes = n->bytes; im->alt = n->alt; im->any_fmt = n->any_fmt;
+    im->img = n->img; im->m = n->m; im->views = NULL; im->usage = n->usage; im->bytes = n->bytes; im->alt = n->alt; im->any_fmt = n->any_fmt; im->nx = n->nx; memcpy(im->xfmt, n->xfmt, sizeof im->xfmt);
     n->img = oi; n->m = od; n->views = ov; n->bytes = ob; g_img_bytes -= ob;
     vka_after(vka_fence_last() + !vka_worker_on(), img_destroy, n);   // (inline replay: after the submission being recorded, which copies from it)
     // Views made of the old image are gone with it: the recording memo (g_tgen) and the registered pool slots that name the image are made again
