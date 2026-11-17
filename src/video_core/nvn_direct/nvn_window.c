@@ -13,6 +13,7 @@
 #include "hle.h"
 #include "nvn_protos.h"
 #include "nvn_obj.h"
+#include "nvn_capture.h"
 #include "nvn_mtl.h"
 #include "nvn_direct_front.h"
 
@@ -115,5 +116,6 @@ NVN(nvnQueuePresentTexture, void, NVNqueue* q, NVNwindow* w, int idx) {
     o->pfence[idx] = o->last_pfence = nvn_direct_present_queue_fence = ((const queue_t*)q)->last_fence;
     const int interval = o->interval > 0 ? o->interval : 1;
     const int has_crop = o->crop[2] > 0 && o->crop[3] > 0;
+    nvn_cap_present(CTX(o->tex[idx]), has_crop ? o->crop : NULL); // DM_NVN_CAPTURE
     nvn_direct_present_note(mtl_present(CTX(o->tex[idx]), interval / 60.0, has_crop ? o->crop : NULL), (uint32_t)interval);
 }
