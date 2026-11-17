@@ -1019,26 +1019,23 @@ static int interleave_on(void) { return !V.multi && VKA_ENV("DM_VK_QUEUE_INTERLE
 enum { EVW = 16 };
 enum { EVG = 8 };
 // A gate: waits walked for a value no signal walked so far wrote (the value a later signal will write, of this mode: 1 = equal), as a semaphore of its own: each such wait
-// is its next value (val; pending: the highest not signalled yet), and the first signal walked that writes a value meeting it signals the gate there. Lichii: a gate holds
-// the waits of one Vulkan queue (q). NVN queues past the Vulkan queues share them, so a wait can sit ahead of its signal on one Vulkan queue, which the GPU never gets past
-// (Ocarina of Time: six NVN queues on three, worker queues waiting for the frame their producer signals next). Stopgap until the replay holds such work back: the host
-// signals that queue's gate when the signal is walked, so its waits run before the signalling part instead of after it (that ordering is given up), and the gates of the
-// other queues wait for the part's GPU signal as before
-typedef struct { uint32_t w; int eq, q; uint32_t wn; VkSemaphore sem; uint64_t val, pending; } evgate;   // wn: the NVN queues (g_qt entries) whose waits are pending
+// is its next value (val; pending: the highest not signalled yet), and the first signal walked that writes a value meeting it signals the gate there. Lichii: only waits on
+// a Vulkan queue no other NVN queue shares get a gate; on a shared one such a wait is held until its signal is on a queue (wait_holds, vka_rp_resume)
+typedef struct { uint32_t w; int eq; VkSemaphore sem; uint64_t val, pending; } evgate;
 typedef struct { volatile uint32_t *val; VkSemaphore sem; uint64_t last, wmax; uint32_t cur; int last_q, nw, ng; struct { uint32_t v; int q, n; uint64_t t, p; } w[EVW]; evgate g[EVG]; } evsem;   // last: the last signal's value; wmax: the highest a wait walked waits for (host let-through); w: values written since the last CPU write (q -1: the CPU's); g: gates
 static evsem g_evs[NEVV]; static int g_nevs;
 static int gate_met(const evgate *g, uint32_t v) { return g->eq ? v == g->w : v >= g->w; }
 static evgate *gate_of(evsem *e, uint32_t w, int eq) {
-    for (int i = 0; i < e->ng; i++) if (e->g[i].w == w && e->g[i].eq == eq && e->g[i].q == g_qi) return &e->g[i];
+    for (int i = 0; i < e->ng; i++) if (e->g[i].w == w && e->g[i].eq == eq) return &e->g[i];
     // Lichii: a gate whose waits were all signalled takes the new value (its semaphore goes on counting): a frame counter waited for every frame (Ocarina of Time) used
     // up the gates in eight frames. Only once the semaphore has reached its last value: a signal still on a queue must stay above any host signal of the new value
     for (int i = 0; i < e->ng; i++) { evgate *g = &e->g[i]; uint64_t c = 0;
         if (g->pending || (vk.vkGetSemaphoreCounterValue(V.dev, g->sem, &c), c < g->val)) continue;
-        g->w = w; g->eq = eq; g->q = g_qi; return g; }
+        g->w = w; g->eq = eq; return g; }
     if (e->ng == EVG) { VRED_ONCE("more than %d values waited for before they were signalled on one queue event: the wait is met by the next signal", EVG); return NULL; }
     VkSemaphoreTypeCreateInfo st = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
-    evgate *g = &e->g[e->ng]; memset(g, 0, sizeof *g); g->w = w; g->eq = eq; g->q = g_qi;
+    evgate *g = &e->g[e->ng]; memset(g, 0, sizeof *g); g->w = w; g->eq = eq;
     if (vk.vkCreateSemaphore(V.dev, &sci, NULL, &g->sem)) return NULL;
     e->ng++; return g;
 }
@@ -1117,7 +1114,7 @@ static void evsem_cpu(volatile uint32_t *val, int mode, uint32_t v) {
     }
     for (int i = 0; i < e->ng; i++) { evgate *g = &e->g[i];   // gates the CPU's value meets: by the host (a gate is signalled only where its waits are met)
         if (!g->pending || !gate_met(g, v)) continue;
-        VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g->sem, .value = g->pending}; vk.vkSignalSemaphore(V.dev, &ss); g->pending = 0; g->wn = 0; }
+        VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g->sem, .value = g->pending}; vk.vkSignalSemaphore(V.dev, &ss); g->pending = 0; }
     evsem_wrote(e, v, -1, t, 0, -1);
     evtr('C', e, v, t);
 }
@@ -1138,12 +1135,8 @@ static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   
     for (int i = 0; i < e->ng; i++) { evgate *g = &e->g[i];
         if (!g->pending || !gate_met(g, v)) continue;
         for (int j = 0; j < g_nblk; j++) if (g_blk[j].g == g && g_blk[j].val <= g->pending) { g_blk[j].g = NULL; g_blk[j].sq = g_qi; g_blk[j].sp = g_qpos[g_qi]; }   // (Lichii: their signal is this part's)
-        if (g->q == g_qi) { uint64_t c = 0; vk.vkGetSemaphoreCounterValue(V.dev, g->sem, &c);   // (the stopgap above; vka_exec_stall may have signalled it already)
-            if (c < g->pending) { VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g->sem, .value = g->pending}; vk.vkSignalSemaphore(V.dev, &ss); }
-            VRED_ONCE("queue event %p: a wait on Vulkan queue %d is ahead of its signal there: let through by the host before the signalling part runs", (void *)val, g_qi);
-            for (int j = 0; j < NQT; j++) if (g->wn >> j & 1 && j != g_qn && g_qn >= 0) { g_qt[j].dep |= 1u << g_qn; g_qt[g_qn].dep |= 1u << j; } }   // (queue_move)
-        else if (g_psy.ns < PWS) { g_psy.ss[g_psy.ns] = g->sem; g_psy.sv[g_psy.ns++] = g->pending; } else VRED_ONCE("more than %d event signals in one part", PWS);
-        g->pending = 0; g->wn = 0; }
+        if (g_psy.ns < PWS) { g_psy.ss[g_psy.ns] = g->sem; g_psy.sv[g_psy.ns++] = g->pending; } else VRED_ONCE("more than %d event signals in one part", PWS);
+        g->pending = 0; }
     if (g_nblk) blk_settle();
     if (!chunk()) VRED_ONCE("an event signal in a submission of more than %d parts: made at its end", NCHUNK);
 }
@@ -1154,7 +1147,7 @@ static void evsem_wait(const p_wait_event *w) {   // a wait walked here: met on 
     int k = ev_find(e, w);
     uint64_t t = k < e->nw ? e->w[k].t : e->last + 1;   // (none yet: a gate, else the next signal)
     evgate *g = k < e->nw ? NULL : gate_of(e, w->value, eq);
-    if (g) { g->pending = ++g->val; t = g->val; if (g_qn >= 0) g->wn |= 1u << g_qn; }
+    if (g) { g->pending = ++g->val; t = g->val; }
     if (VKA_ENV("DM_VK_EVENTLOG", 0)) { static int n; if (n++ < 60) VLOG("event wait: queue %d event %p %s %u -> timeline %llu (last %llu on queue %d; frame %llu, part %d)", g_qi, (void *)w->val, eq ? "==" : ">=", w->value, (unsigned long long)t, (unsigned long long)e->last, e->last_q, (unsigned long long)g_frame, g_nx); }
     if (!t || (k < e->nw && e->w[k].q == g_qi)) { evtr('w', e, w->value, t); return; }   // reached already, or signalled earlier on this queue: queue order
     evtr(g ? 'G' : 'W', e, w->value, t);
