@@ -121,6 +121,7 @@ int nxhost_vk_selftest(ANativeWindow *w, int frames) {
     uint64_t q = nvn_new_serial(), last = 0, fences[4] = {0};
     if (frames <= 0) frames = 1;
     for (int f = 0; f < frames; f++) {
+        if (f && !mtl_wait(fences[(f - 1) & 3], 2000000000ull)) { VRED("selftest: frame %d's submission not done in 2 s: stopped", f - 1); bad++; break; }   // (Lichii: the worker reads cmd, rewritten below, in place)
         float c[4]; hue(f / 360.0, c);   // round the hues every 6 s at 60 Hz
         float wsq[4] = {1, 1, 1, 1};
         if (fences[f & 3]) mtl_wait(fences[f & 3], 2000000000ull);   // the uniform slot this frame writes is free again
