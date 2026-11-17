@@ -950,6 +950,9 @@ static evsem g_evs[NEVV]; static int g_nevs;
 static int gate_met(const evgate *g, uint32_t v) { return g->eq ? v == g->w : v >= g->w; }
 static evgate *gate_of(evsem *e, uint32_t w, int eq) {
     for (int i = 0; i < e->ng; i++) if (e->g[i].w == w && e->g[i].eq == eq) return &e->g[i];
+    // Lichii: a gate whose waits were all signalled takes the new value (its semaphore goes on counting): a frame counter waited for every frame (Ocarina of Time) used
+    // up the gates in eight frames
+    for (int i = 0; i < e->ng; i++) if (!e->g[i].pending) { e->g[i].w = w; e->g[i].eq = eq; return &e->g[i]; }
     if (e->ng == EVG) { VRED_ONCE("more than %d values waited for before they were signalled on one queue event: the wait is met by the next signal", EVG); return NULL; }
     VkSemaphoreTypeCreateInfo st = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
