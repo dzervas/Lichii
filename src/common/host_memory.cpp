@@ -949,7 +949,7 @@ public:
     /// HostMemory::MapBackingView: anonymous zero pages with each run mapped from the file over
     /// them, as Map maps the fastmem views.
     u8* MapBackingView(size_t length, std::span<const HostMemory::BackingRun> runs) {
-        if (fd < 0) {
+        if (fd < 0 && !runs.empty()) {
             LOG_ERROR(HW_Memory, "Backing view: private backing memory is not mapped twice");
             return nullptr;
         }

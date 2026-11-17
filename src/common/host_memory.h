@@ -103,8 +103,8 @@ public:
     /// Maps backing memory once more, at a host range of its own of `length` bytes: each run
     /// read-write at its view offset, the rest zero pages of the view's own (read-write, shared
     /// with nothing). Map, Unmap and Protect never touch it. Runs are page aligned, in view order
-    /// and do not overlap. nullptr (logged) when the backing memory cannot be mapped twice (no
-    /// fastmem, or private memory behind it) or a mapping fails. Given back with
+    /// and do not overlap. nullptr (logged) without fastmem, when there are runs and private
+    /// memory is behind them (it cannot be mapped twice), or when a mapping fails. Given back with
     /// UnmapBackingView.
     [[nodiscard]] u8* MapBackingView(size_t length, std::span<const BackingRun> runs);
 
