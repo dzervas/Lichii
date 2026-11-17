@@ -330,6 +330,14 @@ void vka_rp_sub_begin(void) {
     vka_o72_ns[4] += now_ns() - t_o72b;
 }
 
+// Lichii: nvnQueueWaitSync on a fence of another NVN queue. That submission was replayed before this one (the worker's FIFO); on another Vulkan queue, this submission's
+// first part waits for its timeline value. Not found (one queue, it ran on the CPU, or more than FQ_RING fences ago): nothing to wait for on the GPU
+void vka_rp_sub_wait(uint64_t fence) {
+    int q; VkSemaphore s; uint64_t v;
+    if (!g_cb || !vka_fence_queue(fence, &q, &s, &v) || q == g_qi) return;
+    if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = s; g_psy.wv[g_psy.nw++] = v; } else VRED_ONCE("more than %d waits in one part", PWS);
+}
+
 // A long submission goes to the queue in parts, so the GPU starts on its first passes while the rest is recorded: before the first pass after DM_VK_CHUNK draws (default
 // 600; 0 = one part) of the part in progress, the part is ended and submitted without a signal, and the submission goes on in the slot's next command buffer. The parts run
 // in order on the one queue, and the barriers recorded in a part cover what later parts do (submission order); only the last part signals the submission's fence.

@@ -134,8 +134,10 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
 uint64_t vka_fence_next(void);                      // reserve the next fence value (submit thread)
 uint64_t vka_fence_last(void);                      // the last fence reserved (its submission may still be recording on another thread)
 uint64_t vka_fence_queued(void);                    // the last fence handed to the queue: the most a submission (the present's) may wait for without a wait-before-signal on its own queue
+int vka_fence_queue(uint64_t fence, int *q, VkSemaphore *sem, uint64_t *val);   // Lichii (V.multi): the Vulkan queue a fence's submission went to and its timeline value there; 0: none known
 // The replay (vka_exec.c), entered by the replay worker (vka_worker.c) or inline by the mtl_* calls of the submitting thread
 void vka_rp_sub_begin(void);
+void vka_rp_sub_wait(uint64_t fence);                // Lichii, after vka_rp_sub_begin: the submission's first part waits for the submission of that fence when it went to another Vulkan queue
 void vka_rp_exec(const uint8_t *handle, uint64_t fence);   // fence: the submission's, reserved before it (0 = taken at its commit)
 uint64_t vka_rp_sub_commit(uint64_t reserved);
 void vka_rp_queue_activate(uint64_t serial);

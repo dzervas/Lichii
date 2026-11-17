@@ -345,6 +345,14 @@ int vka_queue_idle(void) {
     return 1;
 }
 uint64_t vka_fence_queued(void) { return __atomic_load_n(&V.tl_queued, __ATOMIC_ACQUIRE); }
+int vka_fence_queue(uint64_t fence, int *q, VkSemaphore *sem, uint64_t *val) {   // (the slot holds the fence until FQ_RING later ones: an older one is not known)
+    if (!V.multi || !fence) return 0;
+    vka_qlock();
+    const int ok = g_fq[fence % FQ_RING].fence == fence && g_fq[fence % FQ_RING].q >= 0;
+    if (ok) { *q = g_fq[fence % FQ_RING].q; *sem = V.qtl[*q]; *val = g_fq[fence % FQ_RING].qv; }
+    vka_qunlock();
+    return ok;
+}
 
 // ---------- Fences ----------
 // Fence n is reserved by the submission that signals timeline value n. The completion thread waits for the timeline, then runs that submission's CPU-side effects in order

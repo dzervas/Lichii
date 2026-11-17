@@ -884,7 +884,17 @@ NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = ((const queue_t *)q)->last_fence; }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
+// Lichii: the replay may run NVN queues on several Vulkan queues (V.multi), so a fence of QueueFenceSync goes with the queue's next submission, which waits for it on the GPU (mtl_sub_wait)
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
+    const sync_t *y = (const sync_t *)s; static int once;
+    if (!y->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait");
+    if (y->fenced == 1 && y->fence) {
+        queue_t *o = (queue_t *)q; dm_host_mutex_lock(&g_sub_mu);
+        if (o->nwait < 8) o->wait_fence[o->nwait++] = y->fence; else { static int full; if (!full++) LOG("[RED] QueueWaitSync: more than 8 waits before a submission: the rest are not waited for"); }
+        pthread_mutex_unlock(&g_sub_mu);
+    }
+    return 1;
+}
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
@@ -1477,6 +1487,8 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
     nvn_cap_submit(n, (const uint64_t *)h);   // DM_NVN_CAPTURE (nvn_capture.inc)
     mtl_sub_begin();
+    for (int i = 0; i < ((queue_t *)q)->nwait; i++) mtl_sub_wait(((queue_t *)q)->wait_fence[i]);
+    ((queue_t *)q)->nwait = 0;
     nvn_ft_poll();
     mtl_sub_index((const uint64_t *)h, n);
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }

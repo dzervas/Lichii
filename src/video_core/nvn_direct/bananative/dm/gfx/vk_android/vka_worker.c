@@ -36,6 +36,7 @@ typedef struct {
     int kind;
     uint64_t serial, fence, frame; int origin_ll;   // J_SUB: the queue, its window origin, the fence reserved for it, the game's frame when it submitted
     const uint8_t **h; int nh;                   // J_SUB: the command handles, in order
+    uint64_t wait[8]; int nwait;                 // J_SUB: the fences it waits for (mtl_sub_wait)
     uint64_t ticket; tex_t t; double period; int has_crop, crop[4];   // J_PRESENT
     volatile uint32_t *ev; int ev_mode; uint32_t ev_v;                // J_EVENT: a CPU signal (mtl_event_cpu)
 } job_t;
@@ -111,6 +112,7 @@ static void *worker_main(void *arg) {
         if (j.kind == J_SUB) {
             vka_rp_queue_activate(j.serial); vka_rp_set_queue_origin(j.origin_ll);
             vka_gp_sub_frame(j.frame); vka_exec_sub_frame(j.frame); vka_rp_sub_begin();
+            for (int i = 0; i < j.nwait; i++) vka_rp_sub_wait(j.wait[i]);
             for (int i = 0; i < j.nh; i++) vka_rp_exec(j.h[i], j.fence);
             vka_rp_sub_commit(j.fence);
             free(j.h);
@@ -188,7 +190,11 @@ void mtl_event_cpu(volatile uint32_t *val, int mode, uint32_t v) {
 }
 void mtl_sub_begin(void) {
     if (!up()) { vka_rp_sub_begin(); return; }
-    g_in_sub = 1; g_cur.nh = 0;
+    g_in_sub = 1; g_cur.nh = 0; g_cur.nwait = 0;
+}
+void mtl_sub_wait(uint64_t fence) {
+    if (!g_in_sub) { vka_rp_sub_wait(fence); return; }
+    if (g_cur.nwait < 8) g_cur.wait[g_cur.nwait++] = fence;
 }
 void mtl_exec(const uint8_t *handle) {
     if (!g_in_sub) { vka_rp_exec(handle, 0); return; }
@@ -200,6 +206,7 @@ uint64_t mtl_sub_commit(void) {
     if (!g_in_sub) return vka_rp_sub_commit(0);
     g_in_sub = 0;
     job_t j = {J_SUB}; j.serial = g_pend_serial; j.origin_ll = g_pend_origin; j.nh = g_cur.nh;
+    j.nwait = g_cur.nwait; memcpy(j.wait, g_cur.wait, sizeof j.wait);
     j.h = malloc((size_t)(j.nh ? j.nh : 1) * sizeof *j.h); if (j.nh) memcpy(j.h, g_cur.h, (size_t)j.nh * sizeof *j.h);
     j.fence = vka_fence_next(); j.frame = vka_frame();
     for (int i = 0; i < j.nh; i++) fence_syncs(j.h[i], j.fence, 0);
