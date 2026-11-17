@@ -6,7 +6,9 @@
 // Off unless EDEN_NX2_NVN_HOOK=1 and EDEN_NX2_NVN_TRACE=<file>. Records every call from the
 // start (objects are made at load); EDEN_NX2_NVN_TRACE_FROM=<present> starts the window: the
 // memory pools' contents then, and from then the pool pages each frame changed;
-// EDEN_NX2_NVN_TRACE_FRAMES=<n> presents later the file is closed and tracing stops.
+// EDEN_NX2_NVN_TRACE_FRAMES=<n> (default 120) presents later the file is closed and tracing stops.
+// Without FROM (or with 0) no window opens: the file holds the calls and presents only (no pool
+// snapshot, no changed pages), and FRAMES does not apply: tracing goes on until the emulator stops.
 //
 // The file: "NVNTRC01", then blocks {u32 compressed, u32 raw, zstd frame}; the raw stream is
 // records {u8 type, ...} (little-endian):
