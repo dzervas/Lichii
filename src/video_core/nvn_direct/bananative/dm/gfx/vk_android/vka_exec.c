@@ -273,34 +273,37 @@ typedef struct { uint32_t nw, ns; VkSemaphore ws[PWS], ss[PWS]; uint64_t wv[PWS]
 typedef struct { VkCommandBuffer cb; uint32_t q; int queue; part_sync sy; } part_arg;   // q: the part's bottom (part_submit) or top (part_begin) timestamp query, UINT32_MAX = none; queue: its Vulkan queue
 static part_sync g_psy;   // the part being recorded
 static int g_qi;          // the submission's Vulkan queue (vka_rp_sub_begin: its NVN queue's)
-// The Vulkan queue of an NVN queue (V.multi), given at its first submission. Lichii: the one the fewest live NVN queues use (one of its own while the family has enough), given
-// back when the NVN queue is finalized (vka_rp_queue_forget); NVN queues past the Vulkan queues share them. g_qshared: a bit per Vulkan queue more than one live NVN queue uses
-enum { NQT = 32 };
-static struct { uint64_t serial, last; int q; uint32_t dep; } g_qt[NQT];   // the live NVN queues (serial 0: a free entry); last: its last submission's fence; dep: entries it conflicts with (queue_move)
-static unsigned g_qshared; static int g_qt_full;       // full: an NVN queue found no entry, so any Vulkan queue may be shared
+// The Vulkan queue of an NVN queue (V.multi), given at its first submission. Lichii: the one the fewest live NVN queues use (one of its own while the family has enough), and
+// of those one whose last submission is done (g_qtail: work of a finalized NVN queue may still be on it, a gate wait among it); given back when the NVN queue is finalized
+// (vka_rp_queue_forget); NVN queues past the Vulkan queues share them. The table grows, so an NVN queue keeps its entry, and its Vulkan queue, until it is finalized; conflicts
+// (dep, queue_move) are kept for the first 32 entries. g_qshared: a bit per Vulkan queue more than one live NVN queue uses
+static struct { uint64_t serial, last; int q; uint32_t dep; } *g_qt; static int g_nqt;   // the live NVN queues (serial 0: a free entry); last: its last submission's fence; dep: entries it conflicts with
+static uint64_t g_qtail[NVN_DIRECT_MAX_QUEUES];   // the last submission on each Vulkan queue
+static unsigned g_qshared;
 static int g_qn = -1;                                  // the submission's NVN queue's entry (-1: none)
 static void qt_shared(void) {
-    int n[NVN_DIRECT_MAX_QUEUES] = {0}; g_qshared = g_qt_full ? ~0u : 0;
-    for (int i = 0; i < NQT; i++) if (g_qt[i].serial && ++n[g_qt[i].q] > 1) g_qshared |= 1u << g_qt[i].q;
+    int n[NVN_DIRECT_MAX_QUEUES] = {0}; g_qshared = 0;
+    for (int i = 0; i < g_nqt; i++) if (g_qt[i].serial && ++n[g_qt[i].q] > 1) g_qshared |= 1u << g_qt[i].q;
 }
 static int queue_of(uint64_t serial) {
     g_qn = -1; if (!V.multi) return 0;
-    int n[NVN_DIRECT_MAX_QUEUES] = {0}, f = -1, q = 0;
-    for (int i = 0; i < NQT; i++) { if (g_qt[i].serial == serial) { g_qn = i; return g_qt[i].q; } if (g_qt[i].serial) n[g_qt[i].q]++; else if (f < 0) f = i; }
-    for (int i = 1; i < V.nq - 1; i++) if (n[i] < n[q]) q = i;
-    if (f < 0) { g_qt_full = 1; VRED_ONCE("more than %d live NVN queues: Vulkan queues are taken as shared from now on", NQT); }
-    else { for (int i = 0; i < NQT; i++) g_qt[i].dep &= ~(1u << f); g_qt[f].serial = serial; g_qt[f].last = 0; g_qt[f].q = q; g_qt[f].dep = 0; g_qn = f; }
+    int n[NVN_DIRECT_MAX_QUEUES] = {0}, k[NVN_DIRECT_MAX_QUEUES], f = -1, q = 0;
+    for (int i = 0; i < g_nqt; i++) { if (g_qt[i].serial == serial) { g_qn = i; return g_qt[i].q; } if (g_qt[i].serial) n[g_qt[i].q]++; else if (f < 0) f = i; }
+    for (int i = 0; i < V.nq - 1; i++) { k[i] = 2 * n[i] + (g_qtail[i] && !vka_wait_fence(g_qtail[i], 0)); if (k[i] < k[q]) q = i; }
+    if (f < 0) { int c = g_nqt ? 2 * g_nqt : 16; g_qt = realloc(g_qt, (size_t)c * sizeof *g_qt); memset(g_qt + g_nqt, 0, (size_t)(c - g_nqt) * sizeof *g_qt); f = g_nqt; g_nqt = c; }
+    if (f < 32) for (int i = 0; i < g_nqt; i++) g_qt[i].dep &= ~(1u << f);
+    g_qt[f].serial = serial; g_qt[f].last = 0; g_qt[f].q = q; g_qt[f].dep = 0; g_qn = f;
     qt_shared();
     VLOG("NVN queue %llu on Vulkan queue %d%s", (unsigned long long)serial, q, n[q] ? " (shared)" : "");
     return q;
 }
-static void queue_drop(uint64_t serial) { for (int i = 0; i < NQT; i++) if (g_qt[i].serial == serial) { g_qt[i].serial = 0; qt_shared(); } }
+static void queue_drop(uint64_t serial) { for (int i = 0; i < g_nqt; i++) if (g_qt[i].serial == serial) { g_qt[i].serial = 0; qt_shared(); } }
 // Lichii: an NVN queue that waited ahead of a signal of another NVN queue on its Vulkan queue, or that the other waited ahead of (dep, both ways), moves before its next
 // submission to the Vulkan queue the fewest live NVN queues use among those where none conflicts with it. Only once its last submission is done: nothing of it is left on
 // the old queue for its next one to wait for there (its earlier fences keep the old queue's timeline values)
 static int queue_move(int n) {
     int q = g_qt[n].q, cnt[NVN_DIRECT_MAX_QUEUES] = {0}, bad[NVN_DIRECT_MAX_QUEUES] = {0}, c = -1;
-    for (int i = 0; i < NQT; i++) if (g_qt[i].serial && i != n) { cnt[g_qt[i].q]++; bad[g_qt[i].q] |= g_qt[n].dep >> i & 1; }
+    for (int i = 0; i < g_nqt; i++) if (g_qt[i].serial && i != n) { cnt[g_qt[i].q]++; bad[g_qt[i].q] |= i < 32 && g_qt[n].dep >> i & 1; }
     if (!bad[q] || (g_qt[n].last && !vka_wait_fence(g_qt[n].last, 0))) return q;
     for (int i = 0; i < V.nq - 1; i++) if (i != q && !bad[i] && (c < 0 || cnt[i] < cnt[c])) c = i;
     if (c < 0) return q;
@@ -430,6 +433,7 @@ static uint64_t g_cur_fence;   // the fence of the submission being replayed, re
 uint64_t vka_rp_sub_commit(uint64_t reserved) {
     uint64_t fence = reserved ? reserved : vka_fence_next(); g_cur_fence = 0;
     if (g_qn >= 0) g_qt[g_qn].last = fence;   // (queue_move)
+    if (V.multi) g_qtail[g_qi] = fence;
     int tail = 0;   // counted for the tail floor (DM_VK_GPU_FLOOR_AUTO=2): given back by the span op when it completes
     if (g_cb && g_stat_draws > g_sub_draws0) { int vka_floor_tail_add(void); tail = vka_floor_tail_add(); post((pop){3, 0, (uint32_t)tail, 0, g_job_frame_set ? g_job_frame : g_frame}); }   // the frame's span at the end of this submission with draws (post_run)
     pop *ops = g_npost ? malloc((size_t)g_npost * sizeof *ops) : NULL; if (ops) memcpy(ops, g_post, (size_t)g_npost * sizeof *ops);
@@ -1099,7 +1103,7 @@ static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   
         if (g->q == g_qi) { uint64_t c = 0; vk.vkGetSemaphoreCounterValue(V.dev, g->sem, &c);   // (the stopgap above; vka_exec_stall may have signalled it already)
             if (c < g->pending) { VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g->sem, .value = g->pending}; vk.vkSignalSemaphore(V.dev, &ss); }
             VRED_ONCE("queue event %p: a wait on Vulkan queue %d is ahead of its signal there: let through by the host before the signalling part runs", (void *)val, g_qi);
-            for (int j = 0; j < NQT; j++) if (g->wn >> j & 1 && j != g_qn && g_qn >= 0) { g_qt[j].dep |= 1u << g_qn; g_qt[g_qn].dep |= 1u << j; } }   // (queue_move)
+            for (int j = 0; j < 32; j++) if (g->wn >> j & 1 && j != g_qn && g_qn >= 0 && g_qn < 32) { g_qt[j].dep |= 1u << g_qn; g_qt[g_qn].dep |= 1u << j; } }   // (queue_move)
         else if (g_psy.ns < PWS) { g_psy.ss[g_psy.ns] = g->sem; g_psy.sv[g_psy.ns++] = g->pending; } else VRED_ONCE("more than %d event signals in one part", PWS);
         g->pending = 0; g->wn = 0; }
     if (!chunk()) VRED_ONCE("an event signal in a submission of more than %d parts: made at its end", NCHUNK);
@@ -1111,7 +1115,7 @@ static void evsem_wait(const p_wait_event *w) {   // a wait walked here: met on 
     int k = 0; while (k < e->nw && !(eq ? e->w[k].v == w->value : e->w[k].v >= w->value)) k++;
     uint64_t t = k < e->nw ? e->w[k].t : e->last + 1;   // (none yet: a gate, else the next signal)
     evgate *g = k < e->nw ? NULL : gate_of(e, w->value, eq);
-    if (g) { g->pending = ++g->val; t = g->val; if (g_qn >= 0) g->wn |= 1u << g_qn; }
+    if (g) { g->pending = ++g->val; t = g->val; if (g_qn >= 0 && g_qn < 32) g->wn |= 1u << g_qn; }
     if (VKA_ENV("DM_VK_EVENTLOG", 0)) { static int n; if (n++ < 60) VLOG("event wait: queue %d event %p %s %u -> timeline %llu (last %llu on queue %d; frame %llu, part %d)", g_qi, (void *)w->val, eq ? "==" : ">=", w->value, (unsigned long long)t, (unsigned long long)e->last, e->last_q, (unsigned long long)g_frame, g_nx); }
     if (!t || (k < e->nw && e->w[k].q == g_qi)) { evtr('w', e, w->value, t); return; }   // reached already, or signalled earlier on this queue: queue order
     evtr(g ? 'G' : 'W', e, w->value, t);
