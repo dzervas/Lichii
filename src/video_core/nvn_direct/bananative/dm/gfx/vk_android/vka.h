@@ -126,8 +126,7 @@ int vka_ok(void);
 uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
 void vka_mem_import_choose(int dmabuf);   // Lichii: with host_import, whether pools are host-pointer imports or udmabufs (vka_mem.c); dmabuf: VK_EXT_external_memory_dma_buf is there
 VkResult vka_submit_q(int q, VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages,
-                      uint32_t nsig, const VkSemaphore *sig_sems, const uint64_t *sig_vals, uint64_t *qv);   // on queue q, with extra timeline signals; vka_submit = queue 0. Lichii: qv
-                                                                                                  // (V.multi): the queue timeline's value it signals (with signal 0, a step with no fence)
+                      uint32_t nsig, const VkSemaphore *sig_sems, const uint64_t *sig_vals);   // on queue q, with extra timeline signals; vka_submit = queue 0
 uint64_t vka_up_last(void);   // the upload timeline's last batch value (a submission on another queue waits for it)
 VkSemaphore vka_up_timeline(void);
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal);
@@ -144,11 +143,6 @@ void vka_rp_exec(const uint8_t *handle, uint64_t fence);   // fence: the submiss
 uint64_t vka_rp_sub_commit(uint64_t reserved);
 void vka_rp_queue_activate(uint64_t serial);
 void vka_rp_queue_forget(uint64_t serial);
-// Lichii (V.multi): a submission whose NVN queue is held, or that must wait before it begins, is kept (1: taken, h with it) instead of replayed; vka_rp_resume, between jobs,
-// replays held work whose waits may go to the GPU now (or that waited the hang time); vka_rp_holding: some is held
-int vka_rp_hold_sub(uint64_t serial, int origin, uint64_t frame, const uint64_t *wait, int nwait, const uint8_t **h, int nh, uint64_t fence);
-void vka_rp_resume(void);
-int vka_rp_holding(void);
 void vka_rp_event(volatile uint32_t *val, int mode, uint32_t v);   // a CPU signal, in replay order (the worker's FIFO)
 void vka_rp_set_queue_origin(int on);
 int vka_worker_on(void);                              // DM_VK_WORKER (default 1): submissions are replayed on the replay worker thread

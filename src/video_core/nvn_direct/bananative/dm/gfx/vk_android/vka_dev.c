@@ -294,23 +294,23 @@ int vka_ok(void) { return __atomic_load_n(&g_state, __ATOMIC_ACQUIRE) > 0; }
 // Fence n's queue and value on its timeline (multi): the completion thread waits for that, then signals V.tl = n. q < 0: no GPU work signals it (the host takes it as reached)
 enum { FQ_RING = 4096 };
 static struct { uint64_t fence, qv; int q; } g_fq[FQ_RING];
-static uint64_t sub_ex(int q, VkCommandBuffer cb, uint64_t signal, int step, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages,
+static uint64_t sub_ex(int q, VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages,
                        uint32_t nsig, const VkSemaphore *sig_sems, const uint64_t *sig_vals, VkSemaphore bin_signal, VkResult *res);
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal) {
-    VkResult r; sub_ex(-1, cb, signal, 0, nwait, wait, wait_vals, stages, 0, NULL, NULL, bin_signal, &r); return r;
+    VkResult r; sub_ex(-1, cb, signal, nwait, wait, wait_vals, stages, 0, NULL, NULL, bin_signal, &r); return r;
 }
 VkResult vka_submit_q(int q, VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages,
-                      uint32_t nsig, const VkSemaphore *sig_sems, const uint64_t *sig_vals, uint64_t *qv) {
-    VkResult r; uint64_t v = sub_ex(q, cb, signal, qv != NULL, nwait, wait, wait_vals, stages, nsig, sig_sems, sig_vals, VK_NULL_HANDLE, &r); if (qv) *qv = v; return r;
+                      uint32_t nsig, const VkSemaphore *sig_sems, const uint64_t *sig_vals) {
+    VkResult r; sub_ex(q, cb, signal, nwait, wait, wait_vals, stages, nsig, sig_sems, sig_vals, VK_NULL_HANDLE, &r); return r;
 }
-static uint64_t sub_ex(int q, VkCommandBuffer cb, uint64_t signal, int step, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages,
+static uint64_t sub_ex(int q, VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages,
                        uint32_t nsig, const VkSemaphore *sig_sems, const uint64_t *sig_vals, VkSemaphore bin_signal, VkResult *res) {
     int host = q < 0 || !V.multi; if (q < 0 || q >= V.nq - 1 || !V.multi) q = 0;   // (host: the host queue V.q; with signal, its fences are recorded under queue 0's slot... none signal: the replay's go through queues 0..nq-2)
     VkSemaphore sig[24]; uint64_t sv[24]; uint32_t ns = 0;
     vka_qlock();
     uint64_t qv = 0;
     if (signal && !V.multi) { sig[ns] = V.tl; sv[ns++] = signal; }
-    else if (signal || (step && V.multi && !host)) { qv = ++V.qseq[q]; sig[ns] = V.qtl[q]; sv[ns++] = qv; }   // (Lichii, step: with no fence, vka_exec.c's held parts)
+    else if (signal) { qv = ++V.qseq[q]; sig[ns] = V.qtl[q]; sv[ns++] = qv; }
     if (bin_signal) { sig[ns] = bin_signal; sv[ns++] = 0; }
     for (uint32_t i = 0; i < nsig && ns < 24; i++) { sig[ns] = sig_sems[i]; sv[ns++] = sig_vals[i]; }
     // The waits, one for the upload batches on queue 0 (a submission on another queue), and one more for the sparse binds queued before it (vks_queue_locked)
@@ -323,8 +323,7 @@ static uint64_t sub_ex(int q, VkCommandBuffer cb, uint64_t signal, int step, uin
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = nwait, .pWaitSemaphores = ws, .pWaitDstStageMask = wst,
                        .commandBufferCount = cb ? 1 : 0, .pCommandBuffers = &cb, .signalSemaphoreCount = ns, .pSignalSemaphores = sig};
     VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(host ? V.q : V.qs[q], 1, &si, VK_NULL_HANDLE);
-    if (qv && r) { V.qseq[q]--; qv = 0; }
-    if (signal && V.multi) { g_fq[signal % FQ_RING].fence = signal; g_fq[signal % FQ_RING].q = r ? -1 : q; g_fq[signal % FQ_RING].qv = qv; }
+    if (signal && V.multi) { if (r) V.qseq[q]--; g_fq[signal % FQ_RING].fence = signal; g_fq[signal % FQ_RING].q = r ? -1 : q; g_fq[signal % FQ_RING].qv = qv; }
     if (!r && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
     vka_qunlock();
     *res = r;
@@ -464,8 +463,8 @@ static int multi_pass(uint64_t done, uint64_t sub, uint64_t *pending) {
     for (uint64_t f = done + 1; f <= sub; f++) { unsigned k = (unsigned)(f - done - 1); fq[k].q = g_fq[f % FQ_RING].fence == f ? g_fq[f % FQ_RING].q : -2; fq[k].qv = g_fq[f % FQ_RING].qv; }
     vka_qunlock();
     for (uint64_t f = done + 1; f <= sub; f++) {
-        pthread_mutex_lock(&g_fmu); int d = g_fdone[f % FQ_RING] == f, held = g_post[f % POST_RING].fence != f; pthread_mutex_unlock(&g_fmu);
-        if (d || held) continue;   // (Lichii, held: not handed over yet, a held submission's (vka_exec.c vka_rp_resume): neither done nor a stall)
+        pthread_mutex_lock(&g_fmu); int d = g_fdone[f % FQ_RING] == f; pthread_mutex_unlock(&g_fmu);
+        if (d) continue;
         int q = fq[f - done - 1].q; uint64_t qv = fq[f - done - 1].qv;
         if (q == -2 || (q >= 0 && qc[q] < qv)) { if (!*pending) *pending = f; continue; }   // (-2: handed to the queue but not recorded yet; -1: not on the GPU)
         post_run_one(f);
@@ -520,7 +519,7 @@ static void *completion_main(void *arg) {
             pthread_mutex_unlock(&g_fmu);
             if (v > done) { VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = V.tl, .value = v}; uint64_t cur = 0; vk.vkGetSemaphoreCounterValue(V.dev, V.tl, &cur); if (cur < v) vk.vkSignalSemaphore(V.dev, &ss); }
             uint64_t t = now_ns();
-            if (n || !pending) { stall_t0 = 0; if (!n && v < sub) multi_wait(); }   // (Lichii: only held fences left, vka_exec.c: neither done nor stalled)
+            if (n || !pending) stall_t0 = 0;
             else {   // no fence completed in this pass
                 if (!stall_t0 || stall_at != pending) { stall_t0 = t; stall_at = pending; stall_logged = 0; }
                 double st = (t - stall_t0) / 1e9;

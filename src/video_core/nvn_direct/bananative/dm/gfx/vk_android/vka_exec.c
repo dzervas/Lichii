@@ -19,7 +19,7 @@ enum { NQS = 8 };
 static qstate g_qs[NQS]; static int g_nqs;
 enum { NSLOT = 8 };
 enum { NCHUNK = 96 };   // (parts: every queue event signal and wait ends one when the NVN queues are Vulkan queues)
-static struct { VkCommandBuffer cb; uint64_t fence, qv; int q; VkCommandBuffer x[NCHUNK]; } g_slot[NSLOT];   // x: the command buffers a submission goes on in once it hands its first part to the queue (chunk); qv: its last part's value on queue q's timeline (V.multi)
+static struct { VkCommandBuffer cb; uint64_t fence; VkCommandBuffer x[NCHUNK]; } g_slot[NSLOT];   // x: the command buffers a submission goes on in once it hands its first part to the queue (chunk)
 static unsigned g_slot_i;
 static int g_chunk_draws = -1, g_nx; static uint64_t g_chunk_d0;   // chunk(): draws a part, parts this submission, draws at its part's start
 static VkCommandPool g_pool;
@@ -82,9 +82,7 @@ void vka_rp_queue_activate(uint64_t serial) {
     memset(&S, 0, sizeof S); S.serial = serial;
 }
 static void queue_drop(uint64_t serial);
-static int hold_forget(uint64_t serial);
 void vka_rp_queue_forget(uint64_t serial) {
-    if (hold_forget(serial)) return;   // (Lichii: once its held work has run, vka_rp_resume)
     for (int i = 0; i < g_nqs; i++) if (g_qs[i].serial == serial) { g_qs[i] = g_qs[--g_nqs]; break; }
     if (S.serial == serial) memset(&S, 0, sizeof S);
     queue_drop(serial);   // (its Vulkan queue goes to the next NVN queue made: work of it still there runs first, in queue order)
@@ -241,12 +239,6 @@ static void gpu_slot_done(unsigned slot) {   // the slot's fence is done: its tw
     }
     atomic_fetch_sub(&g_gpu[k].pending, 1);
 }
-// Lichii (V.multi): a slot is free once its own last part has run on its queue, not once every fence before its own is done: a held submission's fence completes after later ones
-static void slot_wait(unsigned k) {
-    VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &V.qtl[g_slot[k].q], .pValues = &g_slot[k].qv};
-    while (!vka_hung() && vk.vkWaitSemaphores(V.dev, &wi, 100000000ull) == VK_TIMEOUT) {}
-    g_slot[k].qv = 0; gpu_slot_done(k);
-}
 double mtl_gpu_ms(uint64_t f) {
     unsigned k = f % GRING;
     if (atomic_load(&g_gpu[k].frame) != f || atomic_load(&g_gpu[k].pending)) return -1;
@@ -306,37 +298,16 @@ static void queue_drop(uint64_t serial) { for (int i = 0; i < NQT; i++) if (g_qt
 // Lichii: an NVN queue that waited ahead of a signal of another NVN queue on its Vulkan queue, or that the other waited ahead of (dep, both ways), moves before its next
 // submission to the Vulkan queue the fewest live NVN queues use among those where none conflicts with it. Only once its last submission is done: nothing of it is left on
 // the old queue for its next one to wait for there (its earlier fences keep the old queue's timeline values)
-static int unres(int q, uint64_t p);
 static int queue_move(int n) {
     int q = g_qt[n].q, cnt[NVN_DIRECT_MAX_QUEUES] = {0}, bad[NVN_DIRECT_MAX_QUEUES] = {0}, c = -1;
     for (int i = 0; i < NQT; i++) if (g_qt[i].serial && i != n) { cnt[g_qt[i].q]++; bad[g_qt[i].q] |= g_qt[n].dep >> i & 1; }
     if (!bad[q] || (g_qt[n].last && !vka_wait_fence(g_qt[n].last, 0))) return q;
-    for (int i = 0; i < V.nq - 1; i++) if (i != q && !bad[i] && !unres(i, UINT64_MAX) && (c < 0 || cnt[i] < cnt[c])) c = i;   // (a queue with a blocker: see blockers)
+    for (int i = 0; i < V.nq - 1; i++) if (i != q && !bad[i] && (c < 0 || cnt[i] < cnt[c])) c = i;
     if (c < 0) return q;
     VLOG("NVN queue %llu moves from Vulkan queue %d to %d (it waited ahead of another NVN queue's signal there, or that one ahead of its)", (unsigned long long)g_qt[n].serial, q, c);
     g_qt[n].q = c; qt_shared();
     return c;
 }
-// Lichii: blockers. The parts on Vulkan queue q from position p on (g_qpos: the parts handed to each queue so far) wait, directly or through queue order, for sem to reach val,
-// which a signal gives that no queue has yet (g: the gate whose next signal it is), or that one has, at sq's position sp, behind a blocker itself. A signal is resolved while no
-// blocker is before it on its queue; a blocker goes once its signal is, or once sem has reached val (the CPU signalled it, the GPU got there, a stall let it through). A Vulkan
-// queue other NVN queues share takes no part a blocker holds up (vka_rp_hold_sub, walk): there it could keep another NVN queue from the work that leads to that signal
-typedef struct { int q, sq; uint64_t p, sp, val; VkSemaphore sem; const void *g; } blocker;
-static blocker *g_blk; static int g_nblk, g_cblk;
-static uint64_t g_qpos[NVN_DIRECT_MAX_QUEUES];
-static int unres(int q, uint64_t p) { for (int i = 0; i < g_nblk; i++) if (g_blk[i].q == q && g_blk[i].p <= p) return 1; return 0; }
-static void blk_add(int q, VkSemaphore sem, uint64_t val, const void *g, int sq, uint64_t sp) {   // (the part being recorded on q is the first one held up)
-    if (g_nblk == g_cblk) { g_cblk = g_cblk ? 2 * g_cblk : 32; g_blk = realloc(g_blk, (size_t)g_cblk * sizeof *g_blk); }
-    g_blk[g_nblk++] = (blocker){q, sq, g_qpos[q], sp, val, sem, g};
-}
-static void blk_settle(void) {
-    for (int i = 0; i < g_nblk; i++) { const blocker *b = &g_blk[i]; uint64_t c = 0;
-        if ((b->g || b->sq < 0 || unres(b->sq, b->sp)) && (vk.vkGetSemaphoreCounterValue(V.dev, b->sem, &c), c < b->val)) continue;
-        g_blk[i] = g_blk[--g_nblk]; i = -1; }
-}
-enum { NFPOS = 256 };
-static struct { uint64_t fence, p; } g_fpos[NFPOS];   // a submission's last part's position on its queue, by fence
-static uint64_t fence_pos(uint64_t f) { return g_fpos[f % NFPOS].fence == f ? g_fpos[f % NFPOS].p : UINT64_MAX; }   // (not known: after every part)
 void vka_rp_sub_begin(void) {
     uint64_t t_o72b = now_ns();
     vka_perf_thread(0); vka_ctl_sub();
@@ -358,7 +329,7 @@ void vka_rp_sub_begin(void) {
         for (int i = 0; i < NSLOT; i++) g_slot[i].cb = cbs[i];
     }
     unsigned k = g_slot_i++ % NSLOT;
-    if (g_slot[k].qv) slot_wait(k); else if (g_slot[k].fence) vka_wait_done(g_slot[k].fence, UINT64_MAX);
+    if (g_slot[k].fence) vka_wait_done(g_slot[k].fence, UINT64_MAX);
     uint64_t done = vka_done();
     for (unsigned i = 0; i < NSLOT; i++) if (g_slot_ts[i] && g_slot[i].fence <= done) gpu_slot_done(i);
     g_cb = g_slot[k].cb;
@@ -388,15 +359,13 @@ void vka_rp_sub_begin(void) {
     vka_o72_ns[4] += now_ns() - t_o72b;
 }
 
-// Lichii: nvnQueueWaitSync on a fence of another NVN queue. That submission was handed to its queue before this one (the worker's FIFO, or held work first: vka_rp_hold_sub);
-// on another Vulkan queue, this submission's first part waits for its timeline value (waits on one queue merged). Not found (one queue, it ran on the CPU, or more than FQ_RING
-// fences ago): nothing to wait for on the GPU. A fence a blocker holds up adds one here (an exclusive queue); a shared queue's submission was held until it was not, and is
-// only let through (or replayed inline) without the wait
+// Lichii: nvnQueueWaitSync on a fence of another NVN queue. That submission was replayed before this one (the worker's FIFO); on another Vulkan queue, this submission's
+// first part waits for its timeline value (waits on one queue merged). Not found (one queue, it ran on the CPU, or more than FQ_RING fences ago): nothing to wait for on the
+// GPU. Nor when other NVN queues share this submission's Vulkan queue: the fence's submission may wait for an event one of them signals behind this wait there, which
+// would never run
 void vka_rp_sub_wait(uint64_t fence) {
     int q; VkSemaphore s; uint64_t v;
-    if (!g_cb || !vka_fence_queue(fence, &q, &s, &v) || q == g_qi) return;
-    uint64_t p = fence_pos(fence);
-    if (unres(q, p)) { if (g_qshared >> g_qi & 1) return; blk_add(g_qi, s, v, NULL, q, p); }
+    if (!g_cb || g_qshared >> g_qi & 1 || !vka_fence_queue(fence, &q, &s, &v) || q == g_qi) return;
     for (uint32_t i = 0; i < g_psy.nw; i++) if (g_psy.ws[i] == s) { if (g_psy.wv[i] < v) g_psy.wv[i] = v; return; }
     if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = s; g_psy.wv[g_psy.nw++] = v; } else VRED_ONCE("more than %d waits in one part", PWS);
 }
@@ -405,15 +374,15 @@ void vka_rp_sub_wait(uint64_t fence) {
 // 600; 0 = one part) of the part in progress, the part is ended and submitted without a signal, and the submission goes on in the slot's next command buffer. The parts run
 // in order on the one queue, and the barriers recorded in a part cover what later parts do (submission order); only the last part signals the submission's fence.
 // On the Adreno 840 phone, Donkey Kong Bananza's level recorded ~45 ms a frame before its GPU work (~30 ms) began, and the game waited for that frame's fence (@sync_ms ~64)
-static VkResult submit_part(int queue, VkCommandBuffer cb, uint64_t fence, const part_sync *sy, uint64_t *qv) {
+static VkResult submit_part(int queue, VkCommandBuffer cb, uint64_t fence, const part_sync *sy) {
     VkPipelineStageFlags st[PWS]; for (uint32_t i = 0; i < PWS; i++) st[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    return vka_submit_q(queue, cb, fence, sy->nw, sy->ws, sy->wv, st, sy->ns, sy->ss, sy->sv, qv);
+    return vka_submit_q(queue, cb, fence, sy->nw, sy->ws, sy->wv, st, sy->ns, sy->ss, sy->sv);
 }
 static void part_submit(const void *a) {   // the part ends and goes to the queue (on the encoder thread when it is on)
     part_arg pa; memcpy(&pa, a, sizeof pa); VkCommandBuffer cb = pa.cb;
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, pa.q);
     VkResult r = vk.vkEndCommandBuffer(cb);
-    if (!r) r = submit_part(pa.queue, cb, 0, &pa.sy, NULL);
+    if (!r) r = submit_part(pa.queue, cb, 0, &pa.sy);
     if (r && !vka_stopping()) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); }   // (Lichii: refused after vka_stop)
 }
 static void part_begin(const void *a) {
@@ -435,7 +404,7 @@ static int chunk(void) {   // 1 = the part was ended and submitted
     // The part's bottom and the next part's top timestamps (the slot's queries were reset at the submission's start, in its first part)
     uint32_t part = g_slot_parts[k]; int ts = g_slot_ts[k] && part < NCHUNK + 1;
     part_arg pe = {g_cb, ts ? k * QPS + 2 * (part - 1) + 1 : UINT32_MAX, g_qi, g_psy}, pb = {next, ts ? k * QPS + 2 * part : UINT32_MAX, g_qi, {0}};
-    memset(&g_psy, 0, sizeof g_psy); g_qpos[g_qi]++;
+    memset(&g_psy, 0, sizeof g_psy);
     if (ts) g_slot_parts[k] = part + 1;
     { uint64_t t_o72 = now_ns(); vka_up_flush(); vka_up_throttle(); vka_o72_ns[2] += now_ns() - t_o72; }   // the upload batch goes first: the part may use what it made (vka_dev.c "Upload batches")
     // With the encoder the part's end, its submit and the next part's reset and begin are made on its thread, in order with the calls before: the replay thread goes on
@@ -458,17 +427,14 @@ static inline void chunk_check(void) {
     if (cp > 0 && in >= (uint64_t)cp && vka_rp_open_for(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); }
 }
 static uint64_t g_cur_fence;   // the fence of the submission being replayed, reserved before it (vka_worker.c); 0 = reserved at its commit
-struct hsub; static struct hsub *g_hcur; static void hold_keep(struct hsub *s, uint64_t fence, pop *ops, int n);   // (Lichii: holds, below)
 uint64_t vka_rp_sub_commit(uint64_t reserved) {
     uint64_t fence = reserved ? reserved : vka_fence_next(); g_cur_fence = 0;
-    struct hsub *held = g_hcur; g_hcur = NULL;   // Lichii: held at a wait, the part before it goes to the queue without the fence (vka_rp_resume)
     if (g_qn >= 0) g_qt[g_qn].last = fence;   // (queue_move)
     int tail = 0;   // counted for the tail floor (DM_VK_GPU_FLOOR_AUTO=2): given back by the span op when it completes
     if (g_cb && g_stat_draws > g_sub_draws0) { int vka_floor_tail_add(void); tail = vka_floor_tail_add(); post((pop){3, 0, (uint32_t)tail, 0, g_job_frame_set ? g_job_frame : g_frame}); }   // the frame's span at the end of this submission with draws (post_run)
     pop *ops = g_npost ? malloc((size_t)g_npost * sizeof *ops) : NULL; if (ops) memcpy(ops, g_post, (size_t)g_npost * sizeof *ops);
     int n = g_npost; g_npost = 0;
-    if (held) { hold_keep(held, fence, ops, n); ops = NULL; n = 0; }
-    if (!g_cb) { if (!held) vka_fence_cpu(fence, ops, n, post_run); return fence; }
+    if (!g_cb) { vka_fence_cpu(fence, ops, n, post_run); return fence; }
     vka_rp_end();
     { uint64_t t_o72 = now_ns(); vka_tex_writeback(g_cb); vka_o72_ns[1] += now_ns() - t_o72; }   // linear textures the GPU wrote, back into their storage for the CPU
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT};
@@ -483,16 +449,12 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) {
     vka_tex_gw_commit(fence);
     vka_floor_commit(tail);
     { uint64_t t_o72 = now_ns(); vka_up_flush(); vka_up_throttle(); vka_o72_ns[2] += now_ns() - t_o72; }   // before the submission that may use what it made
-    uint64_t qv = 0;
-    { uint64_t t_o72 = now_ns(); if (!r) r = submit_part(g_qi, g_cb, held ? 0 : fence, &g_psy, &qv); memset(&g_psy, 0, sizeof g_psy); vka_o72_ns[3] += now_ns() - t_o72; }
-    g_slot[k].fence = fence; g_slot[k].q = g_qi; g_slot[k].qv = qv;
-    if (!held) g_fpos[fence % NFPOS].fence = fence, g_fpos[fence % NFPOS].p = g_qpos[g_qi];
-    g_qpos[g_qi]++;
+    { uint64_t t_o72 = now_ns(); if (!r) r = submit_part(g_qi, g_cb, fence, &g_psy); memset(&g_psy, 0, sizeof g_psy); vka_o72_ns[3] += now_ns() - t_o72; }
+    g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
     if (vka_nan_on()) vka_nan_commit(fence);
     vka_scratch_retire(fence);
     if (r) {
         static _Atomic int nred; if (!vka_stopping() && atomic_fetch_add(&nred, 1) < 8) VRED("submission %llu: %d (its effects run without the GPU)", (unsigned long long)fence, r);
-        if (held) { g_cb = VK_NULL_HANDLE; return fence; }   // (its rest commits it)
         VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = V.tl, .value = fence};
         vka_qlock();   // signalled by the host: later submissions may wait for it (with several queues the completion thread does, in fence order: vka_dev.c sub_ex)
         VkResult sr = vka_hung() ? VK_ERROR_DEVICE_LOST : V.multi ? VK_SUCCESS : vk.vkSignalSemaphore(V.dev, &si);
@@ -500,7 +462,7 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) {
         vka_qunlock();
         if (sr) { vka_fence_cpu(fence, ops, n, post_run); g_cb = VK_NULL_HANDLE; return fence; }
     }
-    if (!held) vka_fence_post(fence, ops, n, post_run);
+    vka_fence_post(fence, ops, n, post_run);
     if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0)
         VLOG("sync sub: frame %llu fence %llu: %llu draws, %d parts, recorded %.2f-%.2f ms, queued", (unsigned long long)g_frame, (unsigned long long)fence,
              (unsigned long long)(g_stat_draws - g_sub_draws0), g_nx + 1, (g_sub_t0 % 1000000000000ull) / 1e6, ms_now());
@@ -1025,7 +987,7 @@ enum { EVG = 8 };
 // signals that queue's gate when the signal is walked, so its waits run before the signalling part instead of after it (that ordering is given up), and the gates of the
 // other queues wait for the part's GPU signal as before
 typedef struct { uint32_t w; int eq, q; uint32_t wn; VkSemaphore sem; uint64_t val, pending; } evgate;   // wn: the NVN queues (g_qt entries) whose waits are pending
-typedef struct { volatile uint32_t *val; VkSemaphore sem; uint64_t last, wmax; uint32_t cur; int last_q, nw, ng; struct { uint32_t v; int q, n; uint64_t t, p; } w[EVW]; evgate g[EVG]; } evsem;   // last: the last signal's value; wmax: the highest a wait walked waits for (host let-through); w: values written since the last CPU write (q -1: the CPU's); g: gates
+typedef struct { volatile uint32_t *val; VkSemaphore sem; uint64_t last, wmax; uint32_t cur; int last_q, nw, ng; struct { uint32_t v; int q; uint64_t t; } w[EVW]; evgate g[EVG]; } evsem;   // last: the last signal's value; wmax: the highest a wait walked waits for (host let-through); w: values written since the last CPU write (q -1: the CPU's); g: gates
 static evsem g_evs[NEVV]; static int g_nevs;
 static int gate_met(const evgate *g, uint32_t v) { return g->eq ? v == g->w : v >= g->w; }
 static evgate *gate_of(evsem *e, uint32_t w, int eq) {
@@ -1042,12 +1004,9 @@ static evgate *gate_of(evsem *e, uint32_t w, int eq) {
     if (vk.vkCreateSemaphore(V.dev, &sci, NULL, &g->sem)) return NULL;
     e->ng++; return g;
 }
-static void evsem_wrote(evsem *e, uint32_t v, int q, uint64_t t, uint64_t p, int n) {   // (Lichii: p, n: the signal's position on queue q and its NVN queue's entry, -1 for the CPU's)
+static void evsem_wrote(evsem *e, uint32_t v, int q, uint64_t t) {
     if (e->nw == EVW) { memmove(e->w, e->w + 1, (EVW - 1) * sizeof *e->w); e->nw--; }
-    e->w[e->nw].v = v; e->w[e->nw].q = q; e->w[e->nw].n = n; e->w[e->nw].p = p; e->w[e->nw++].t = t; e->cur = v;
-}
-static int ev_find(const evsem *e, const p_wait_event *w) {   // the first value written since the last CPU write that meets the wait (e->nw: none)
-    int eq = w->mode == NVN_EVENT_WAIT_MODE_EQUAL, k = 0; while (k < e->nw && !(eq ? e->w[k].v == w->value : e->w[k].v >= w->value)) k++; return k;
+    e->w[e->nw].v = v; e->w[e->nw].q = q; e->w[e->nw++].t = t; e->cur = v;
 }
 // The last NEVTR queue-event steps in replay order (C: a CPU write, S: a GPU signal walked, W: a wait that ends the part, G: one on a gate, w: a wait met on its own queue), for a GPU hang's
 // report (dotfiles-25x.4): the stuck part's wait, the semaphores' values and the queue timelines then
@@ -1099,7 +1058,7 @@ static evsem *evsem_of(volatile uint32_t *val) {
     if (vk.vkCreateSemaphore(V.dev, &sci, NULL, &e->sem)) { VRED_ONCE("queue event semaphore not made: its waits are not kept"); return NULL; }
     // The value the event holds when the replay first meets it (a CPU signal before the replay was up, the last signal of a queue walked before it was waited for) is
     // reached already: a wait for it is met, as on the console
-    evsem_wrote(e, ev_get(val), -1, 0, 0, -1);
+    evsem_wrote(e, ev_get(val), -1, 0);
     g_nevs++; return e;
 }
 static void evsem_cpu(volatile uint32_t *val, int mode, uint32_t v) {
@@ -1118,7 +1077,7 @@ static void evsem_cpu(volatile uint32_t *val, int mode, uint32_t v) {
     for (int i = 0; i < e->ng; i++) { evgate *g = &e->g[i];   // gates the CPU's value meets: by the host (a gate is signalled only where its waits are met)
         if (!g->pending || !gate_met(g, v)) continue;
         VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g->sem, .value = g->pending}; vk.vkSignalSemaphore(V.dev, &ss); g->pending = 0; g->wn = 0; }
-    evsem_wrote(e, v, -1, t, 0, -1);
+    evsem_wrote(e, v, -1, t);
     evtr('C', e, v, t);
 }
 static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   // a GPU signal walked here: the part ends with it
@@ -1129,7 +1088,7 @@ static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   
         if (c < e->last) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("queue event %p: queue %d signals %llu while queue %d's signal to %llu is pending (semaphore at %llu)",
                                                                                         (void *)val, g_qi, (unsigned long long)t, e->last_q, (unsigned long long)e->last, (unsigned long long)c); } }
     e->last = t; e->last_q = g_qi;
-    evsem_wrote(e, v, g_qi, t, g_qpos[g_qi], g_qn);
+    evsem_wrote(e, v, g_qi, t);
     evtr('S', e, v, t);
     if (VKA_ENV("DM_VK_EVENTLOG", 0)) { static int n; if (n++ < 60) VLOG("event signal: queue %d event %p value %u -> timeline %llu (frame %llu, part %d)", g_qi, (void *)val, v, (unsigned long long)t, (unsigned long long)g_frame, g_nx); }
     vka_rp_end();
@@ -1137,21 +1096,19 @@ static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   
     if (g_psy.ns < PWS) { g_psy.ss[g_psy.ns] = e->sem; g_psy.sv[g_psy.ns++] = t; } else VRED_ONCE("more than %d event signals in one part", PWS);
     for (int i = 0; i < e->ng; i++) { evgate *g = &e->g[i];
         if (!g->pending || !gate_met(g, v)) continue;
-        for (int j = 0; j < g_nblk; j++) if (g_blk[j].g == g && g_blk[j].val <= g->pending) { g_blk[j].g = NULL; g_blk[j].sq = g_qi; g_blk[j].sp = g_qpos[g_qi]; }   // (Lichii: their signal is this part's)
         if (g->q == g_qi) { uint64_t c = 0; vk.vkGetSemaphoreCounterValue(V.dev, g->sem, &c);   // (the stopgap above; vka_exec_stall may have signalled it already)
             if (c < g->pending) { VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g->sem, .value = g->pending}; vk.vkSignalSemaphore(V.dev, &ss); }
             VRED_ONCE("queue event %p: a wait on Vulkan queue %d is ahead of its signal there: let through by the host before the signalling part runs", (void *)val, g_qi);
             for (int j = 0; j < NQT; j++) if (g->wn >> j & 1 && j != g_qn && g_qn >= 0) { g_qt[j].dep |= 1u << g_qn; g_qt[g_qn].dep |= 1u << j; } }   // (queue_move)
         else if (g_psy.ns < PWS) { g_psy.ss[g_psy.ns] = g->sem; g_psy.sv[g_psy.ns++] = g->pending; } else VRED_ONCE("more than %d event signals in one part", PWS);
         g->pending = 0; g->wn = 0; }
-    if (g_nblk) blk_settle();
     if (!chunk()) VRED_ONCE("an event signal in a submission of more than %d parts: made at its end", NCHUNK);
 }
 static void evsem_wait(const p_wait_event *w) {   // a wait walked here: met on this queue already, or the part ends and the next waits
     evsem *e = evsem_of(w->val); if (!e || !g_cb) return;
     int eq = w->mode == NVN_EVENT_WAIT_MODE_EQUAL;
     if (!w->value && !eq) return;   // (at least 0: met)
-    int k = ev_find(e, w);
+    int k = 0; while (k < e->nw && !(eq ? e->w[k].v == w->value : e->w[k].v >= w->value)) k++;
     uint64_t t = k < e->nw ? e->w[k].t : e->last + 1;   // (none yet: a gate, else the next signal)
     evgate *g = k < e->nw ? NULL : gate_of(e, w->value, eq);
     if (g) { g->pending = ++g->val; t = g->val; if (g_qn >= 0) g->wn |= 1u << g_qn; }
@@ -1163,16 +1120,6 @@ static void evsem_wait(const p_wait_event *w) {   // a wait walked here: met on 
     vka_checkpoint_op(-4000 - (int)(w->value > 999 ? 999 : w->value));   // (lab: the part ends before this event wait)
     if (!chunk()) VRED_ONCE("an event wait in a submission of more than %d parts: the whole part waits", NCHUNK);
     if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = g ? g->sem : e->sem; g_psy.wv[g_psy.nw++] = t; } else VRED_ONCE("more than %d event waits in one part", PWS);
-    if (g) blk_add(g_qi, g->sem, t, g, -1, 0);   // (Lichii: a wait for a signal no queue has, or one held up on another queue)
-    else if (k == e->nw) blk_add(g_qi, e->sem, t, NULL, -1, 0);
-    else if (e->w[k].q >= 0 && unres(e->w[k].q, e->w[k].p)) blk_add(g_qi, e->sem, t, NULL, e->w[k].q, e->w[k].p);
-}
-// Lichii: 1 = the wait must not go to Vulkan queue q now: q is shared and the wait is for a value no signal walked so far wrote, or for another queue's signal a blocker holds up
-static int wait_holds(const p_wait_event *w, int q) {
-    if (!(g_qshared >> q & 1)) return 0;
-    evsem *e = evsem_of(w->val); if (!e || (!w->value && w->mode != NVN_EVENT_WAIT_MODE_EQUAL)) return 0;
-    int k = ev_find(e, w);
-    return k == e->nw || (e->w[k].q >= 0 && e->w[k].q != q && unres(e->w[k].q, e->w[k].p));
 }
 static void try_resume(void);
 // Walks w until its lists end (0) or a wait is not met (1: w stops at the wait)
@@ -1198,7 +1145,7 @@ static int walk(walk_t *w) {
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); w->p[w->n - 1] = p + h.size;
             if (w->n < WDEPTH) w->p[w->n++] = (const uint8_t *)(uintptr_t)t; else VRED_ONCE("command lists nested deeper than 16");
             continue; }
-        case OP_WAIT_EVENT: if (V.multi) { if (w->skip) w->skip = 0; else if (g_cb && wait_holds(a, g_qi)) return 1; else evsem_wait(a); break; }   // (Lichii: held, vka_rp_exec)
+        case OP_WAIT_EVENT: if (V.multi) { evsem_wait(a); break; }
             if (w->skip) w->skip = 0; else if (interleave_on() && !wait_met(p)) return 1;
             break;
         case OP_SIGNAL_EVENT: { uint64_t val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); post((pop){1, m, v, 0, val}); rpt_note(val & ~7ull, 0x100 | (v & 0xff));
@@ -1296,98 +1243,10 @@ static void try_resume(void) {
         if (parked) k->since = g_n_sub; else { park_drop(k); i = -1; }   // (one queue's progress may meet another's wait: scan again)
     }
 }
-// Lichii: holds (V.multi). A walk on a shared Vulkan queue stops at a wait wait_holds keeps off it; the rest of that submission and that NVN queue's later submissions wait here
-// in order (whole submissions also before they begin: vka_rp_hold_sub), and vka_rp_resume replays each as a submission of its own, committed with its fence, once its wait may
-// go to the GPU: then its signal is on a queue ahead of it. The part before the wait goes to its queue without the fence, which is handed over only with the rest (the completion
-// thread skips it until then: it neither reads as done nor counts as a stall); what that part posted waits with it. A hold older than the hang time, or one the replay stops or
-// hangs with, is let through ([RED]: the wait skipped)
-typedef struct hsub { uint64_t fence, frame; int origin, nwait, nh, ih, nops; uint64_t wait[NVN_QUEUE_WAITS]; const uint8_t **h; walk_t w; pop *ops; } hsub;   // w.n: held at the wait w is at; h[ih..nh): its lists after; ops: what its part before posted
-typedef struct { uint64_t serial, since; int ns, forget; hsub *s; } hold_t;
-static hold_t g_hold[NQT]; static _Atomic int g_nhold;
-int vka_rp_holding(void) { return atomic_load(&g_nhold) > 0; }
-static int hold_forget(uint64_t serial) { for (int i = 0; i < g_nhold; i++) if (g_hold[i].serial == serial) return g_hold[i].forget = 1; return 0; }
-static hold_t *hold_of(uint64_t serial) { for (int i = 0; i < g_nhold; i++) if (g_hold[i].serial == serial) return &g_hold[i]; return NULL; }
-static hold_t *hold_new(uint64_t serial) {
-    if (g_nhold == NQT) return NULL;
-    { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("NVN queue %llu held: a wait of it may not go to its shared Vulkan queue yet", (unsigned long long)serial); }
-    hold_t *k = &g_hold[g_nhold++]; memset(k, 0, sizeof *k); k->serial = serial; k->since = now_ns(); return k;
-}
-static hsub *hold_push(hold_t *k) { k->s = realloc(k->s, (size_t)(k->ns + 1) * sizeof *k->s); hsub *s = &k->s[k->ns++]; memset(s, 0, sizeof *s); return s; }
-static void hold_keep(hsub *s, uint64_t fence, pop *ops, int n) {
-    s->fence = fence;
-    if (n) { s->ops = realloc(s->ops, (size_t)(s->nops + n) * sizeof *ops); memcpy(s->ops + s->nops, ops, (size_t)n * sizeof *ops); s->nops += n; }
-    free(ops);
-}
-static int fence_holds(uint64_t f, int q) {   // a QueueWaitSync fence that keeps a submission on Vulkan queue q back: held, or (q shared) handed over behind a blocker
-    int fq; VkSemaphore s; uint64_t v;
-    if (vka_wait_fence(f, 0)) return 0;
-    for (int i = 0; i < g_nhold; i++) for (int j = 0; j < g_hold[i].ns; j++) if (g_hold[i].s[j].fence == f) return 1;
-    return vka_fence_queue(f, &fq, &s, &v) && fq != q && g_qshared >> q & 1 && unres(fq, fence_pos(f));
-}
-static int hsub_holds(const hsub *s, int q) {
-    if (s->w.n) return wait_holds((const p_wait_event *)(s->w.p[s->w.n - 1] + 8), q);
-    if (g_qshared >> q & 1 && unres(q, UINT64_MAX)) return 1;   // (its queue became shared behind a blocker)
-    for (int i = 0; i < s->nwait; i++) if (fence_holds(s->wait[i], q)) return 1;
-    return 0;
-}
-int vka_rp_hold_sub(uint64_t serial, int origin, uint64_t frame, const uint64_t *wait, int nwait, const uint8_t **h, int nh, uint64_t fence) {
-    if (!V.multi || !vka_ok() || vka_hung()) return 0;
-    hold_t *k = hold_of(serial);
-    hsub s = {.fence = fence, .frame = frame, .origin = origin, .nwait = nwait, .nh = nh, .h = h}; memcpy(s.wait, wait, (size_t)nwait * sizeof *wait);
-    if (!k) {
-        if (g_nblk) blk_settle();
-        int q = queue_of(serial); if (g_qn >= 0 && g_qshared >> q & 1) q = queue_move(g_qn);
-        if (!hsub_holds(&s, q) || !(k = hold_new(serial))) return 0;
-    }
-    *hold_push(k) = s;
-    return 1;
-}
-void vka_rp_resume(void) {
-    if (!g_nhold) return;
-    if (g_nblk) blk_settle();
-    for (int i = 0; i < g_nhold; i++) {
-        hold_t *k = &g_hold[i]; uint64_t now = now_ns(); int late = vka_stopping() || vka_hung() || now - k->since > vka_hang_ns();
-        while (k->ns) {
-            hsub *s = &k->s[0]; int q = queue_of(k->serial);
-            if (!late && hsub_holds(s, q)) break;
-            if (late && !vka_stopping() && !vka_hung()) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("GPU stall: NVN queue %llu held %.1f s on shared Vulkan queue %d %s: let through", (unsigned long long)k->serial,
-                (now - k->since) / 1e9, q, s->w.n ? "at an event wait no signal handed to a queue meets" : "before a submission whose waits are not handed to a queue"); }
-            if (!late && s->w.n) {   // who signalled what it waited for: that NVN queue on the same Vulkan queue conflicts with it (queue_move)
-                const p_wait_event *w = (const p_wait_event *)(s->w.p[s->w.n - 1] + 8); evsem *e = evsem_of(w->val); int j = e ? ev_find(e, w) : 0, b = e && j < e->nw ? e->w[j].n : -1;
-                if (b >= 0 && g_qn >= 0 && b != g_qn && e->w[j].q == q) { g_qt[b].dep |= 1u << g_qn; g_qt[g_qn].dep |= 1u << b; }
-            }
-            vka_rp_queue_activate(k->serial); vka_rp_set_queue_origin(s->origin); vka_gp_sub_frame(s->frame); vka_exec_sub_frame(s->frame);
-            vka_rp_sub_begin(); g_cur_fence = s->fence;
-            for (int j = 0; j < s->nops; j++) post(s->ops[j]);
-            free(s->ops); s->ops = NULL; s->nops = 0;
-            for (int j = 0; j < s->nwait && !late; j++) vka_rp_sub_wait(s->wait[j]);
-            s->nwait = 0;
-            int held = 0;
-            if (s->w.n) { s->w.skip = late; held = walk(&s->w); }
-            while (!held && s->ih < s->nh) { s->w = (walk_t){{s->h[s->ih++]}, 1, 0}; held = walk(&s->w); }
-            if (held) g_hcur = s;
-            vka_rp_sub_commit(s->fence);
-            if (held) { k->since = now_ns(); break; }
-            free(s->h); memmove(k->s, k->s + 1, (size_t)--k->ns * sizeof *k->s);
-        }
-        if (!k->ns) { uint64_t ser = k->serial; int fg = k->forget; free(k->s); g_hold[i] = g_hold[--g_nhold]; if (fg) vka_rp_queue_forget(ser); i = -1; }   // (its progress may let another go on)
-    }
-}
 void vka_rp_event(volatile uint32_t *val, int mode, uint32_t v) { ev_set(val, mode, v); if (V.multi && vka_ok()) evsem_cpu(val, mode, v); }
 void vka_rp_exec(const uint8_t *handle, uint64_t fence) {
     if (fence) g_cur_fence = fence;
     if (!handle) return;
-    if (V.multi) {   // Lichii: holds
-        hold_t *h;
-        if (!g_hcur && g_cb && (h = hold_of(S.serial))) { g_hcur = hold_push(h); g_hcur->frame = g_job_frame_set ? g_job_frame : g_frame; g_hcur->origin = g_queue_origin_ll; }   // (inline: a held queue's submission)
-        if (g_hcur) { g_hcur->h = realloc(g_hcur->h, (size_t)(g_hcur->nh + 1) * sizeof *g_hcur->h); g_hcur->h[g_hcur->nh++] = handle; return; }
-        walk_t w = {{handle}, 1, 0};
-        while (walk(&w)) {
-            if ((h = hold_of(S.serial) ? hold_of(S.serial) : hold_new(S.serial))) { g_hcur = hold_push(h); g_hcur->frame = g_job_frame_set ? g_job_frame : g_frame; g_hcur->origin = g_queue_origin_ll; g_hcur->w = w; return; }
-            VRED_ONCE("more than %d NVN queues held: a wait is let through", NQT); w.skip = 1;
-        }
-        return;
-    }
     if (g_npark) try_resume();   // (CPU signals since, or a wait held too long)
     park_t *k = park_of(S.serial);
     if (k) { if (k->nh == k->cap) { k->cap = k->cap ? 2 * k->cap : 8; k->h = realloc(k->h, (size_t)k->cap * sizeof *k->h); } k->h[k->nh++] = handle; return; }   // behind its held list
