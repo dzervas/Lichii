@@ -22,7 +22,8 @@ namespace Common {
 static std::vector<std::pair<u64, u64>> vector_regions {};
 static std::mutex vector_regions_mutex {};
 
-// Workaround for handling non-commited memory accessed by Dynarmic; usually result of an error
+// The first read of a page nothing has written yet (GetOrDefault, Dynarmic's page table lookups)
+// faults: commit the page, which reads as zero, and retry. Writes must commit through the vector.
 static LONG WINAPI FakePageFaultHandler(PEXCEPTION_POINTERS info) {
     DWORD code = info->ExceptionRecord->ExceptionCode;
     u64 exception_addr = static_cast<u64>(info->ExceptionRecord->ExceptionInformation[1]);
@@ -58,17 +59,15 @@ static LONG WINAPI FakePageFaultHandler(PEXCEPTION_POINTERS info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    LOG_ERROR(HW_Memory, "Accessing an unallocated region of a SparseLargeVector at {:#x}; this shouldn't happen and is likely a Dynarmic error!", exception_addr);
-
     // Commit this region
     if (addr != 0) {
-        if (!CommitVectorPage(addr << HostPageBits, false)) {
+        if (!CommitVectorPage(addr << HostPageBits)) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
     // Commit next region if needed
     if (addr2 != 0) {
-        if (!CommitVectorPage(addr2 << HostPageBits, false)) {
+        if (!CommitVectorPage(addr2 << HostPageBits)) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
@@ -76,31 +75,13 @@ static LONG WINAPI FakePageFaultHandler(PEXCEPTION_POINTERS info) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
-    MEMORY_BASIC_INFORMATION info {};
-    auto res = VirtualQuery(reinterpret_cast<void*>(addr), &info, sizeof(info));
-    if (res == 0) {
-        LOG_CRITICAL(HW_Memory, "Failed to query large buffer region at {:#x} with error {}, will try committing anyway", addr, GetLastError());
-    } else if (info.State == MEM_COMMIT) {
-        DWORD old_protect {};
-        auto perm = write ? PAGE_READWRITE : PAGE_READONLY;
-        if (!VirtualProtect(reinterpret_cast<void*>(addr), HostPageSize, perm, &old_protect)) {
-            LOG_ERROR(HW_Memory, "Failed to change permissions of large buffer region at {:#x}, error {}", addr, GetLastError());
-            return false;
-        }
-        return true;
-    } else if (info.State != MEM_RESERVE) {
-        LOG_ERROR(HW_Memory, "Tried to commit an unreserved large buffer region at {:#x} that is not mapped (state {:#x})", addr, info.State);
-        return false;
-    }
-
-    auto perm = write ? PAGE_READWRITE : PAGE_READONLY;
-    void* res2 = VirtualAlloc(reinterpret_cast<LPVOID>(addr), HostPageSize, MEM_COMMIT, perm);
-    if (res2 == nullptr) {
+// Pages are always committed read-write, as a read fault and a write on another thread may commit
+// the same page at once. Committing a committed page succeeds and keeps its contents.
+bool CommitVectorPage(uintptr_t addr) noexcept {
+    if (!VirtualAlloc(reinterpret_cast<LPVOID>(addr), HostPageSize, MEM_COMMIT, PAGE_READWRITE)) {
         LOG_ERROR(HW_Memory, "Failed to commit large buffer region at {:#x}, error {}", addr, GetLastError());
         return false;
     }
-
     return true;
 }
 #endif

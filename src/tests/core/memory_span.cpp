@@ -47,6 +47,10 @@ TEST_CASE("Memory spans need every page backed by one linear host range", "[core
     map(13, 5, backing + 0x31000);
     REQUIRE(memory.GetSpan(0xC000, 0x2000) == backing + 0x30000);
 
+    // Unmapped pages are no span, also when mapped ones follow.
+    REQUIRE(memory.GetSpan(0x20000, 0x40000) == nullptr);
+    REQUIRE(memory.GetSpan(0xB000, 0x2000) == nullptr);
+
     // The address-space end is exclusive, even when the requested range is empty.
     const u64 end = u64{1} << table.GetAddressSpaceBits();
     REQUIRE(memory.GetSpan(end, 0) == nullptr);

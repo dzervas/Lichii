@@ -341,6 +341,10 @@ struct Memory::Impl {
         const u64 first_page = addr >> LICHII_PAGEBITS;
         const u64 last_page = (addr + (size != 0 ? size - 1 : 0)) >> LICHII_PAGEBITS;
         const uintptr_t offset = current_page_table->entries[first_page].Pointer(true);
+        // An unmapped first page has no span; don't read the rest, which commits pages on Windows.
+        if (offset == 0) {
+            return nullptr;
+        }
         for (u64 page = first_page + 1; page <= last_page; ++page) {
             if (current_page_table->entries[page].Pointer(true) != offset) {
                 return nullptr;

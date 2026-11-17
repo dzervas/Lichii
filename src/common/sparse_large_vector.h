@@ -25,7 +25,7 @@ namespace Common {
 constexpr u64 HostPageSize = 0x1000;
 constexpr u64 HostPageBits = 12;
 constexpr u64 HostPageMask = ~(HostPageSize - 1);
-bool CommitVectorPage(uintptr_t addr, bool write) noexcept;
+bool CommitVectorPage(uintptr_t addr) noexcept;
 #else
 inline const u64 HostPageSize = sysconf(_SC_PAGESIZE);
 inline const u64 HostPageBits = std::countr_zero(HostPageSize);
@@ -87,12 +87,8 @@ public:
 
     /// Returns a reference to the value of the requested index if initialized, or will otherwise return a zero-initialized object.
     const T& GetOrDefault(std::size_t index) const {
-#ifdef _WIN32
-        if (!IsCommittedPage(index)) {
-            return *reinterpret_cast<const T*>(&default_val);
-        }
-#endif
-        // On non-Windows, OS page table should optimize this by pointing to a zero page if unallocated.
+        // An unallocated page reads as zero: the OS maps it to a zero page, or on Windows the
+        // first read faults and the exception handler commits a zeroed page.
         return base_ptr[index];
     }
 
@@ -173,7 +169,7 @@ private:
         auto page_index = (index * sizeof(T)) >> HostPageBits;
         auto page = reinterpret_cast<uintptr_t>(base_ptr + index) & HostPageMask;
 #if defined(_WIN32)
-        if (!CommitVectorPage(page, true)) {
+        if (!CommitVectorPage(page)) {
             return false;
         }
 #else
@@ -191,9 +187,6 @@ private:
     T* base_ptr{};
 
     std::vector<std::atomic<u64>> committed_pages{};
-#ifdef _WIN32
-    const std::array<u8, sizeof(T)> default_val{};
-#endif
 };
 
 } // namespace Common
