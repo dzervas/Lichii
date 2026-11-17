@@ -328,6 +328,7 @@ vka_img *vka_tex_acquire(uint64_t serial);          // a reference that keeps th
 void vka_tex_drop(vka_img *im);
 int vka_tex_live_refs(vka_img **out, int max);       // references to every live image (the replayer's --dump-gpu), each dropped with vka_tex_drop
 vka_img *vka_tex_ref(vka_img *im);                  // one more reference to im (dropped with vka_tex_drop)
+int vka_img_lists(vka_img *im, VkFormat v);         // 1 = im's format list takes views in v (a texture of another format sharing it: learned view formats)
 // The GPU writes im (render target, clear, copy destination, storage image): its content is the GPU's from now on (no re-upload from storage), and a linear texture's level 0
 // is copied back into its storage when the submission ends (vka_tex_writeback), where the CPU reads it as it would on the Switch
 void vka_img_written_at(vka_img *im, const char *file, int line);

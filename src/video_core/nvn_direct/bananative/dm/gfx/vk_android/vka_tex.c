@@ -1544,6 +1544,7 @@ void vka_tex_drop(vka_img *im) {
     pthread_mutex_unlock(&g_tmu);
 }
 vka_img *vka_tex_ref(vka_img *im) { if (im) { pthread_mutex_lock(&g_tmu); im->refs++; im->holds++; pthread_mutex_unlock(&g_tmu); } return im; }
+int vka_img_lists(vka_img *im, VkFormat v) { pthread_mutex_lock(&g_tmu); int r = img_lists(im, v); pthread_mutex_unlock(&g_tmu); return r; }
 
 VkImageView vka_view(vka_img *im, VkFormat fmt, VkImageViewType type, VkImageAspectFlags asp, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers, const VkComponentMapping *swz) {
     VkComponentMapping id = {0}; if (!swz) swz = &id;

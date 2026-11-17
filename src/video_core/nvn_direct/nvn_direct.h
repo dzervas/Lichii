@@ -250,7 +250,7 @@ uint64_t nvn_direct_call(int slot, const uint64_t x[8], const uint64_t v[8], uin
 typedef struct nvn_direct_frame {
     uint64_t id;
     VkImage image;
-    VkImageView view; ///< 2D, level 0, layer 0, in the image's own format
+    VkImageView view; ///< 2D, level 0, layer 0, sampled only, in format
     VkFormat format;
     uint32_t width, height;           ///< the texture's size (the crop's units)
     uint32_t scaled_width, scaled_height; ///< the image's (the render scale's)

@@ -24,6 +24,7 @@ enum { NPRES = 8 };
 typedef struct {
     uint64_t ticket, fence;
     uint64_t serial;
+    VkFormat format;   // the presenting texture's (UNORM for sRGB); its image may have been made in another (learned view formats)
     int32_t crop[4];
     int has_crop;
 } pres_t;
@@ -97,6 +98,8 @@ void vka_present_fill(uint64_t tk, const tex_t* t, double period_s, const int cr
     pres_t* p = &g_pres[tk % NPRES];
     p->ticket = tk;
     p->serial = t->serial;
+    vka_fmt f;
+    p->format = vka_fmt_of(t->d.format, &f) ? f.vk : VK_FORMAT_UNDEFINED;
     // The presenting queue's last submission (handed to the queue: the worker fills presents in
     // order with the submissions).
     p->fence = vka_ok() ? g_queue_fence[tk % NPRES] : 0;
@@ -146,9 +149,11 @@ void nvn_direct_present_note(uint64_t ticket, uint32_t interval) {
     t_interval = interval;
 }
 
-static VkImageView frame_view(const vka_img* im) {
-    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                                .format = im->f.vk, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+static VkImageView frame_view(const vka_img* im, VkFormat format) {
+    // Sampled only: the image's other uses (storage) need not hold for the view's format
+    VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &vu, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                .format = format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkImageView v = VK_NULL_HANDLE;
     return vk.vkCreateImageView(V.dev, &vi, NULL, &v) ? VK_NULL_HANDLE : v;
 }
@@ -168,7 +173,13 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
     vka_img* im = vka_tex_acquire(p.serial);
     if (!im) return 0;   // the replay never drew or uploaded it (a boot frame): nothing to show
     int ok = im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->samples == 1 && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT);
-    VkImageView view = ok ? frame_view(im) : VK_NULL_HANDLE;
+    // In the presenting texture's format: a texture of another format sharing the image wrote it in its own (an RGB10A2 window over an RGBA8 image)
+    VkFormat format = p.format;
+    if (ok && format != im->f.vk && !(format && vka_img_lists(im, format))) {
+        VRED_ONCE("window texture serial %llu: its image (VkFormat %d) cannot be viewed in the texture's VkFormat %d: shown in the image's", (unsigned long long)p.serial, im->f.vk, format);
+        format = im->f.vk;
+    }
+    VkImageView view = ok ? frame_view(im, format) : VK_NULL_HANDLE;
     if (!view) {
         VRED_ONCE("window texture serial %llu (format %#x) cannot be shown (initialised %d, aspect %#x, samples %u, usage %#x)", (unsigned long long)im->serial, im->d.format,
                   im->inited, im->aspect, im->samples, im->usage);
@@ -184,7 +195,7 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
     }
     h->id = id;
     h->im = im;
-    h->frame = (nvn_direct_frame){.id = id, .image = im->img, .view = view, .format = im->f.vk, .width = im->scaled ? im->d.width : im->w, .height = im->scaled ? im->d.height : im->h,
+    h->frame = (nvn_direct_frame){.id = id, .image = im->img, .view = view, .format = format, .width = im->scaled ? im->d.width : im->w, .height = im->scaled ? im->d.height : im->h,
                                   .scaled_width = im->w, .scaled_height = im->h, .interval = out->interval, .fence = p.fence};
     if (p.has_crop) memcpy(h->frame.crop, p.crop, sizeof p.crop);
     *out = h->frame;
