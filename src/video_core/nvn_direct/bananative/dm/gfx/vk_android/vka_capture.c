@@ -278,6 +278,8 @@ static int cap_enc_addr(void *ctx, uint64_t *field, uint64_t len, int writable) 
     (void)ctx; (void)writable;
     uint64_t v = *field; if (!v) return 1;
     int i = cap_reg_find(v);
+    if (i >= 0 && len > g_cap_reg[i].size - (v - g_cap_reg[i].lo)) { cap_fail("a record's memory runs past its region");   // (Lichii: else the capture keeps part of it)
+        CRED("%#llx (%llu bytes) runs past region %#llx (%llu bytes): %s", (unsigned long long)v, (unsigned long long)len, (unsigned long long)g_cap_reg[i].lo, (unsigned long long)g_cap_reg[i].size, cap_where(field)); return 1; }
     if (i < 0 && len && len <= (1u << 20) && nvn_host_readable(v, len)) {
         for (uint32_t k = 0; k < g_cap_nreg; k++) if (g_cap_reg[k].lo < v + len && v < g_cap_reg[k].lo + g_cap_reg[k].size) { cap_fail("a record's memory straddles a region");
             CRED("%#llx (%llu bytes) straddles region %#llx (%llu bytes): %s", (unsigned long long)v, (unsigned long long)len, (unsigned long long)g_cap_reg[k].lo, (unsigned long long)g_cap_reg[k].size, cap_where(field)); return 1; }
