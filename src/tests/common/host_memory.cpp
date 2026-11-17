@@ -349,6 +349,9 @@ TEST_CASE("HostMemory: Protect within a view, across views and over a gap", "[co
 #endif
 
 TEST_CASE("HostMemory: Backing view maps runs and zero pages of its own", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     if (mem.VirtualBasePointer() == nullptr) {
         SKIP("no fastmem");
