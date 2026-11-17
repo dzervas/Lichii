@@ -161,7 +161,7 @@ void vka_ctl_frame(uint64_t f) {   // mtl_set_frame: frame f begins
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
 static char g_shot_path[1024]; static _Atomic int g_shot_want;
 static VkBuffer g_sbuf; static VkDeviceMemory g_smem; static void *g_smap; static VkDeviceSize g_ssize;
-static struct { int on, w, h, fmt, flip; uint64_t frame; } g_rec_shot;
+static struct { int on, w, h, fmt, flip; uint64_t frame; char path[1024]; } g_rec_shot;   // path: its request's (Lichii: a later request does not rename it)
 static char g_ctl_dir[1024];
 static void ctl_dir(void) {
     if (g_ctl_dir[0]) return;
@@ -169,7 +169,7 @@ static void ctl_dir(void) {
     char *s = strrchr(g_ctl_dir, '/'); if (s) *s = 0;
 }
 void dm_gfx_shot_at(long k, const char *path) {   // the Mac's "shot <path>" too (k: frames ahead; the next frame here)
-    (void)k; pthread_mutex_lock(&g_smu); snprintf(g_shot_path, sizeof g_shot_path, "%s", path ? path : ""); pthread_mutex_unlock(&g_smu); atomic_store(&g_shot_want, 1);
+    (void)k; pthread_mutex_lock(&g_smu); snprintf(g_shot_path, sizeof g_shot_path, "%s", path ? path : ""); atomic_store(&g_shot_want, 1); pthread_mutex_unlock(&g_smu);
 }
 static int shot_buf(VkDeviceSize n) {
     if (g_ssize >= n) return 1;
@@ -196,7 +196,7 @@ static int shot_bpp(VkFormat f) {
 void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch) {   // present thread, before vkEndCommandBuffer
     g_rec_shot.on = 0;
     if (!atomic_load_explicit(&g_shot_want, memory_order_relaxed) || !im || !im->inited) return;
-    atomic_store(&g_shot_want, 0);
+    pthread_mutex_lock(&g_smu); atomic_store(&g_shot_want, 0); snprintf(g_rec_shot.path, sizeof g_rec_shot.path, "%s", g_shot_path); pthread_mutex_unlock(&g_smu);
     int bpp = shot_bpp(im->f.vk);
     if (!bpp || im->samples != 1 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { VLOG("ctl: screenshot: the window texture's format %d is not one the writer takes (RGBA8, BGRA8, RGB10A2, RGBA16F)", im->f.vk); return; }
     if (cx < 0 || cy < 0 || cw <= 0 || ch <= 0 || (uint32_t)(cx + cw) > im->w || (uint32_t)(cy + ch) > im->h) { cx = cy = 0; cw = (int)im->w; ch = (int)im->h; }
@@ -257,7 +257,7 @@ void vka_ctl_shot_done(VkFence fence) {   // present thread, after the present's
     }
     j->rgb = rgb; j->w = w; j->h = h; j->frame = g_rec_shot.frame;
     pthread_mutex_lock(&g_smu);
-    if (g_shot_path[0]) snprintf(j->path, sizeof j->path, "%s", g_shot_path);
+    if (g_rec_shot.path[0]) snprintf(j->path, sizeof j->path, "%s", g_rec_shot.path);
     else { ctl_dir(); snprintf(j->path, sizeof j->path, "%s/ctl-shot-%llu.png", g_ctl_dir, (unsigned long long)j->frame); }
     pthread_mutex_unlock(&g_smu);
     pthread_t th; if (pthread_create(&th, NULL, shot_main, j)) { free(rgb); free(j); return; }
