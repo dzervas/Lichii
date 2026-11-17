@@ -1567,9 +1567,9 @@ VkImageView vka_view(vka_img *im, VkFormat fmt, VkImageViewType type, VkImageAsp
         if (v->f == fmt && v->t == type && v->asp == asp && v->l0 == level && v->nl == nlevels && v->a0 == layer && v->na == nlayers && !memcmp(&v->swz, swz, sizeof *swz)) {
             if (pv != &VIEWS(im)) { *pv = v->next; v->next = VIEWS(im); VIEWS(im) = v; }
             pthread_mutex_unlock(&g_tmu); return v->v; }
-    // An sRGB view of an image with storage use: the view leaves storage out (sRGB formats have no storage support)
+    // A view of an image with storage use in a format without storage support (sRGB): the view leaves storage out
     VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = im->usage & ~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT};
-    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = fmt != im->f.vk && (im->usage & VK_IMAGE_USAGE_STORAGE_BIT) ? &vu : NULL, .image = im->img, .viewType = type, .format = fmt, .components = *swz, .subresourceRange = {asp, level, nlevels, layer, nlayers}};
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = (im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(feats(fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? &vu : NULL, .image = im->img, .viewType = type, .format = fmt, .components = *swz, .subresourceRange = {asp, level, nlevels, layer, nlayers}};
     VkImageView view = VK_NULL_HANDLE; VkResult r = vk.vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("image view of serial %llu format %d type %d levels %u+%u layers %u+%u: %d", (unsigned long long)im->serial, fmt, type, level, nlevels, layer, nlayers, r); }
     else { view_ent *v = malloc(sizeof *v); *v = (view_ent){VIEWS(im), view, fmt, type, asp, level, nlevels, layer, nlayers, *swz}; VIEWS(im) = v; }
@@ -2031,6 +2031,9 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     vka_fmt f; const view_t *v = e->has_v ? &e->v : NULL;
     if (!vka_fmt_of(v && v->set_format ? v->format : e->t.d.format, &f)) f = im->f;
     if (f.astc_bw && im->f.astc_bw) { f.vk = im->f.vk; f.view = f.srgb ? srgb_twin(im->f.vk) : im->f.vk; f.bpb = im->f.bpb; }   // (BC1 or BC3, as the image was made: astc_bc1)
+    if (storage && f.vk != im->f.vk && !(feats(f.vk) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {   // (its view leaves storage out: vka_view)
+        VRED_ONCE("texture serial %llu (image VkFormat %d) bound as a shader image in VkFormat %d, which has no storage support: unbound", (unsigned long long)im->serial, im->f.vk, f.vk);
+        return VK_NULL_HANDLE; }
     uint32_t tl = im->base + im->levels, l0 = v && v->set_levels ? v->base_level : 0, nl = v && v->set_levels && v->nlevels ? v->nlevels : tl > l0 ? tl - l0 : 1;
     if (im->vtrack && !storage && l0 < im->vmin) { uint32_t cut = im->vmin - l0; nl = nl > cut ? nl - cut : 1; l0 = im->vmin; }   // a sparse texture: from its wholly mapped levels
     if (l0 < im->base) { uint32_t cut = im->base - l0; nl = nl > cut ? nl - cut : 1; l0 = 0; } else l0 -= im->base;   // texture levels → the image's (a sparse texture's left-out levels)
@@ -2175,7 +2178,7 @@ static void write_tex(int id, VkCommandBuffer cb, VkWriteDescriptorSet *w, VkDes
     if (im && e->img && im->scaled) vka_tex_unscale(im, cb, "a shader image");
     if (im && e->img && im->m.z) { pthread_mutex_lock(&g_tmu); img_own(im, cb); pthread_mutex_unlock(&g_tmu); }   // (shaders write it: memory of its own first)
     if (im && e->img && !(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { pthread_mutex_lock(&g_tmu); img_storage_upgrade(im, cb); pthread_mutex_unlock(&g_tmu); }
-    VkImageView view = im ? view_of(e, im, -1, 0) : VK_NULL_HANDLE;
+    VkImageView view = im && (!e->img || (im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) ? view_of(e, im, -1, e->img) : VK_NULL_HANDLE;   // (a shader image without storage use: unbound)
     if (!view) view = g_null_view;
     pthread_mutex_lock(&g_tmu);
     if (im && e->img) { pthread_mutex_unlock(&g_tmu); vka_img_written(im); pthread_mutex_lock(&g_tmu); }   // an image registration: shaders write it (vka_tex_id_view)
