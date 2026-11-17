@@ -271,11 +271,13 @@ typedef struct { uint32_t nw, ns; VkSemaphore ws[PWS], ss[PWS]; uint64_t wv[PWS]
 typedef struct { VkCommandBuffer cb; uint32_t q; int queue; part_sync sy; } part_arg;   // q: the part's bottom (part_submit) or top (part_begin) timestamp query, UINT32_MAX = none; queue: its Vulkan queue
 static part_sync g_psy;   // the part being recorded
 static int g_qi;          // the submission's Vulkan queue (vka_rp_sub_begin: its NVN queue's)
-// The Vulkan queue of an NVN queue (V.multi): queues in the order they first submit; past the last Vulkan queue they share it
+// The Vulkan queue of an NVN queue (V.multi): queues in the order they first submit; past the last Vulkan queue they share it (Lichii: g_qshared, a bit per shared one)
+static unsigned g_qshared;
 static int queue_of(uint64_t serial) {
     static uint64_t ser[16]; static int n;
     if (!V.multi) return 0;
     for (int i = 0; i < n; i++) if (ser[i] == serial) return i % (V.nq - 1);
+    if (n >= V.nq - 1) g_qshared |= 1u << (n < 16 ? n % (V.nq - 1) : 0);
     if (n < 16) { ser[n] = serial; VLOG("NVN queue %llu on Vulkan queue %d", (unsigned long long)serial, n % (V.nq - 1)); return n++ % (V.nq - 1); }
     return 0;
 }
@@ -331,10 +333,13 @@ void vka_rp_sub_begin(void) {
 }
 
 // Lichii: nvnQueueWaitSync on a fence of another NVN queue. That submission was replayed before this one (the worker's FIFO); on another Vulkan queue, this submission's
-// first part waits for its timeline value. Not found (one queue, it ran on the CPU, or more than FQ_RING fences ago): nothing to wait for on the GPU
+// first part waits for its timeline value (waits on one queue merged). Not found (one queue, it ran on the CPU, or more than FQ_RING fences ago): nothing to wait for on the
+// GPU. Nor when other NVN queues share this submission's Vulkan queue: the fence's submission may wait for an event one of them signals behind this wait there, which
+// would never run
 void vka_rp_sub_wait(uint64_t fence) {
     int q; VkSemaphore s; uint64_t v;
-    if (!g_cb || !vka_fence_queue(fence, &q, &s, &v) || q == g_qi) return;
+    if (!g_cb || g_qshared >> g_qi & 1 || !vka_fence_queue(fence, &q, &s, &v) || q == g_qi) return;
+    for (uint32_t i = 0; i < g_psy.nw; i++) if (g_psy.ws[i] == s) { if (g_psy.wv[i] < v) g_psy.wv[i] = v; return; }
     if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = s; g_psy.wv[g_psy.nw++] = v; } else VRED_ONCE("more than %d waits in one part", PWS);
 }
 

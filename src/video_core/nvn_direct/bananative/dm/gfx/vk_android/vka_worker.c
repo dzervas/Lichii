@@ -36,7 +36,7 @@ typedef struct {
     int kind;
     uint64_t serial, fence, frame; int origin_ll;   // J_SUB: the queue, its window origin, the fence reserved for it, the game's frame when it submitted
     const uint8_t **h; int nh;                   // J_SUB: the command handles, in order
-    uint64_t wait[8]; int nwait;                 // J_SUB: the fences it waits for (mtl_sub_wait)
+    uint64_t wait[NVN_QUEUE_WAITS]; int nwait;   // J_SUB: the fences it waits for (mtl_sub_wait)
     uint64_t ticket; tex_t t; double period; int has_crop, crop[4];   // J_PRESENT
     volatile uint32_t *ev; int ev_mode; uint32_t ev_v;                // J_EVENT: a CPU signal (mtl_event_cpu)
 } job_t;
@@ -194,7 +194,7 @@ void mtl_sub_begin(void) {
 }
 void mtl_sub_wait(uint64_t fence) {
     if (!g_in_sub) { vka_rp_sub_wait(fence); return; }
-    if (g_cur.nwait < 8) g_cur.wait[g_cur.nwait++] = fence;
+    if (g_cur.nwait < NVN_QUEUE_WAITS) g_cur.wait[g_cur.nwait++] = fence;
 }
 void mtl_exec(const uint8_t *handle) {
     if (!g_in_sub) { vka_rp_exec(handle, 0); return; }

@@ -884,14 +884,19 @@ NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = ((const queue_t *)q)->last_fence; }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
-// Lichii: the replay may run NVN queues on several Vulkan queues (V.multi), so a fence of QueueFenceSync goes with the queue's next submission, which waits for it on the GPU (mtl_sub_wait)
+// Lichii: the replay may run NVN queues on several Vulkan queues (V.multi), so a fence of QueueFenceSync goes with the queue's next submission, which waits for it on the GPU (mtl_sub_wait).
+// A fence done already or kept already adds nothing. When NVN_QUEUE_WAITS fences not done yet are kept, this one is waited for here (at most the replay's hang time)
 NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
     const sync_t *y = (const sync_t *)s; static int once;
     if (!y->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait");
-    if (y->fenced == 1 && y->fence) {
-        queue_t *o = (queue_t *)q; dm_host_mutex_lock(&g_sub_mu);
-        if (o->nwait < 8) o->wait_fence[o->nwait++] = y->fence; else { static int full; if (!full++) LOG("[RED] QueueWaitSync: more than 8 waits before a submission: the rest are not waited for"); }
+    if (y->fenced == 1 && y->fence && !mtl_wait(y->fence, 0)) {
+        queue_t *o = (queue_t *)q; int kept = 0, full = 0; dm_host_mutex_lock(&g_sub_mu);
+        for (int i = 0; i < o->nwait; i++) kept |= o->wait_fence[i] == y->fence;
+        if (!kept && o->nwait == NVN_QUEUE_WAITS) { int n = 0; for (int i = 0; i < o->nwait; i++) if (!mtl_wait(o->wait_fence[i], 0)) o->wait_fence[n++] = o->wait_fence[i]; o->nwait = n; }
+        if (!kept) { if (o->nwait < NVN_QUEUE_WAITS) o->wait_fence[o->nwait++] = y->fence; else full = 1; }
         pthread_mutex_unlock(&g_sub_mu);
+        uint64_t vka_hang_ns(void);
+        if (full && !mtl_wait(y->fence, vka_hang_ns())) { static int n; if (!n++) LOG("[RED] QueueWaitSync: more than %d fences to wait for before a submission, and fence %llu was not reached in time: not waited for", NVN_QUEUE_WAITS, (unsigned long long)y->fence); }
     }
     return 1;
 }
