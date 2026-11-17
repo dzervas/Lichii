@@ -558,8 +558,11 @@ static void mkdir_p(const char *path) {   // the capture's folder
     mkdir(d, 0777);
 }
 
+// Lichii: the present hook runs on the presenting thread, outside the submit lock, and both hooks use the same writer, buffers and registries: each runs under g_cap_mu
+// (taken after the submit lock)
+static pthread_mutex_t g_cap_mu = PTHREAD_MUTEX_INITIALIZER;
 // Hook: nvnQueueSubmitCommands, under the submit lock, before the submission is replayed
-void nvn_cap_submit(int n, const uint64_t *h) {
+static void cap_submit(int n, const uint64_t *h) {
     if (!nvn_cap_enabled() || !g_cap_frame || g_cap_presents + 1 != (uint64_t)g_cap_frame) return;
     uint64_t t0 = now_ns();
     mtl_finish();
@@ -587,8 +590,10 @@ void nvn_cap_submit(int n, const uint64_t *h) {
     g_cap_ns += now_ns() - t0;
 }
 
+void nvn_cap_submit(int n, const uint64_t *h) { pthread_mutex_lock(&g_cap_mu); cap_submit(n, h); pthread_mutex_unlock(&g_cap_mu); }
+
 // Hook: nvnQueuePresentTexture, before the present is queued
-void nvn_cap_present(const tex_t *t, const int crop[4]) {
+static void cap_present(const tex_t *t, const int crop[4]) {
     if (!nvn_cap_enabled()) return;
     g_cap_presents++;
     if (!g_cap_frame) {   // @seconds: the next frame is the one
@@ -626,4 +631,5 @@ void nvn_cap_present(const tex_t *t, const int crop[4]) {
         (unsigned long long)g_cap_tex_skip, (unsigned long long)g_cap_unmapped, (unsigned long long)g_cap_gone, (unsigned long long)g_cap_nostore, raw / 1048576.0, p.capture_ms, g_cap_path, ok ? "" : " (write failed)", hex, p.width, p.height, p.pixfmt);
     g_cap_active = 0; g_cap_done = 1;
 }
+void nvn_cap_present(const tex_t *t, const int crop[4]) { pthread_mutex_lock(&g_cap_mu); cap_present(t, crop); pthread_mutex_unlock(&g_cap_mu); }
 #endif
