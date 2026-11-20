@@ -96,6 +96,7 @@ add_executable(tests
     core/npdm_kac.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
+    frontend_common/cloud_sync_zip.cpp
     core/vfs_vector.cpp
     core/kip_ini.cpp
     core/add_on_application_id.cpp
