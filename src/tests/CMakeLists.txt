@@ -38,6 +38,7 @@ add_executable(tests
     core/nx2_zip.cpp
     core/nx2_present_pacer.cpp
     core/nx2_fence_action.cpp
+    core/nvn_direct_choice.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
@@ -96,6 +97,15 @@ add_executable(tests
     core/npdm_kac.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
+    frontend_common/cloud_sync_zip.cpp
+    frontend_common/cloud_sync_save.cpp
+    frontend_common/cloud_sync_auth.cpp
+    frontend_common/cloud_sync_drive.cpp
+    frontend_common/cloud_sync_engine.cpp
+    frontend_common/cloud_sync_profiles.cpp
+    frontend_common/cloud_sync_machine.h
+    frontend_common/fake_drive.h
+    frontend_common/fake_google.h
     core/vfs_vector.cpp
     core/kip_ini.cpp
     core/add_on_application_id.cpp
@@ -380,6 +390,40 @@ if ((HAS_NCE AND LINUX) OR HAS_HYPERVISOR)
         arm_cpu_guest_dynarmic arm_cpu_guest_${native_backend}_fault
         arm_cpu_guest_${native_backend}_permission_fault
         PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
+endif()
+
+if (TARGET nvn_direct AND NOT WIN32)
+    set(NVN_DIRECT_DIR ../video_core/nvn_direct)
+    add_executable(nvn_tracking_tests
+        video_core/nvn_tracking.c
+        ${NVN_DIRECT_DIR}/nvn_tracking.c)
+    target_include_directories(nvn_tracking_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/gen
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn
+        ${NVN_DIRECT_DIR}/bananative/dm/host)
+    set_target_properties(nvn_tracking_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_definitions(nvn_tracking_tests PRIVATE __ANDROID__ _GNU_SOURCE)
+    target_link_libraries(nvn_tracking_tests PRIVATE Threads::Threads Vulkan::Headers)
+    add_test(NAME nvn_tracking_tests COMMAND nvn_tracking_tests)
+
+    add_executable(nvn_present_tests
+        video_core/nvn_present.c
+        ${NVN_DIRECT_DIR}/nvn_present.c)
+    target_include_directories(nvn_present_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/shim
+        ${NVN_DIRECT_DIR}/bananative/gen
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn/include
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android
+        ${NVN_DIRECT_DIR}/bananative/dm/host
+        ${NVN_DIRECT_DIR})
+    set_target_properties(nvn_present_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_definitions(nvn_present_tests PRIVATE __ANDROID__ _GNU_SOURCE)
+    # nvn_present.c and the replay functions the test stubs declare each other where they are
+    # used, as the nvn_direct library does (built with -w)
+    target_compile_options(nvn_present_tests PRIVATE -Wno-missing-declarations)
+    target_link_libraries(nvn_present_tests PRIVATE Threads::Threads Vulkan::Headers)
+    add_test(NAME nvn_present_tests COMMAND nvn_present_tests)
 endif()
 
 add_executable(profile_migration_tests
