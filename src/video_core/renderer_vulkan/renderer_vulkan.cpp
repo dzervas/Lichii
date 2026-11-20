@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -351,12 +352,33 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         },
         .pipeline_context = &shader_notify,
         .async_pipelines = Settings::values.use_asynchronous_shaders.GetValue(),
+        .pipeline_creation_cache_control = device.IsPipelineCreationCacheControlSupported(),
         .shader_translate = &NvnDirectShaders::Translate,
         .shader_free = &NvnDirectShaders::Free,
         .shader_context = &shaders,
         .scale_up = Settings::values.resolution_info.up_scale,
         .scale_shift = Settings::values.resolution_info.down_shift,
         .debug_labels = device.HasDebuggingToolAttached() || Settings::values.renderer_debug.GetValue(),
+        // Only a lost device counts as done (Refresh reported it): another error is "not known",
+        // which keeps the image the composite's (and the replay stops if it persists).
+        .tick_done = [](void* context, uint64_t tick) -> int {
+            auto& scheduler = *static_cast<Scheduler*>(context);
+            try {
+                scheduler.GetMasterSemaphore().Refresh();
+            } catch (const vk::Exception& exception) {
+                if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                    return 1;
+                }
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true)) {
+                    LOG_ERROR(Render_Vulkan, "NVN direct: reading the composite's tick failed: {}",
+                              exception.what());
+                }
+                return -1;
+            }
+            return scheduler.IsFree(tick);
+        },
+        .tick_context = &scheduler,
     };
     for (size_t index = 0; index < queues.size(); ++index) {
         adopted.queues[index] = queues[(index + 1) % queues.size()];
@@ -591,6 +613,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
             !nvn_direct_present_frame(address & ~NVN_DIRECT_FRAME_TAG, &replay_frame)) {
             return;
         }
+        // Drawn on a replay queue: the first submission that samples it waits for that queue's
+        // timeline (the CPU wait in nvn_direct_present_frame orders the work, not its writes).
+        if (replay_frame.semaphore != VK_NULL_HANDLE) {
+            scheduler.WaitOnNextSubmit(replay_frame.semaphore, replay_frame.semaphore_value);
+        }
         rasterizer.SetDirectDisplayFrame(&replay_frame);
     }
     SCOPE_EXIT {
@@ -616,6 +643,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
+#ifdef LICHII_NVN_DIRECT
+        if (device.IsNvnDirect()) {
+            // The applet capture may have sampled the replay's image: submitted now, so the
+            // game's next acquire of it does not wait for a later composite.
+            nvn_direct_present_composited(replay_frame.id, scheduler.Flush());
+        }
+#endif
         return;
     }
 
@@ -671,7 +705,12 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (const auto mark = scheduler.NextFrameMark(); mark != Scheduler::FrameMark::None) {
         scheduler.MarkFrameEnd(++trace_frame, mark);
     }
-    scheduler.Flush(*frame->render_ready);
+    [[maybe_unused]] const u64 composite_tick = scheduler.Flush(*frame->render_ready);
+#ifdef LICHII_NVN_DIRECT
+    if (device.IsNvnDirect()) {
+        nvn_direct_present_composited(replay_frame.id, composite_tick);
+    }
+#endif
 #ifdef EGLANTINE_STREAMLINE
     {
         const Streamline::FrameGenFrame ended = Streamline::FrameGenEndFrame();

@@ -201,7 +201,7 @@ static void pc_open_once(void) {
     void *data = NULL; size_t n = 0;
     FILE *f = g_pc_path[0] ? fopen(g_pc_path, "rb") : NULL;
     if (f) {
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        fseeko(f, 0, SEEK_END); int64_t sz = ftello(f); fseeko(f, 0, SEEK_SET);
         if (sz > 32 && (data = malloc((size_t)sz)) && fread(data, 1, (size_t)sz, f) == (size_t)sz) n = (size_t)sz;
         fclose(f);
         // The header names the device: a cache of another driver is dropped here (the driver would ignore it too)
@@ -854,8 +854,8 @@ static void pw_note(int kind, vka_shader *const sh[5], const void *kb, uint32_t 
 static void pw_load(void) {
     if (!g_pw_path[0]) return;
     FILE *f = fopen(g_pw_path, "rb"); if (!f) { VLOG("prewarm list %s: none yet (written as this run makes pipelines)", g_pw_path); return; }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t *d = sz > (long)sizeof(pwhdr) ? malloc((size_t)sz) : NULL;
+    fseeko(f, 0, SEEK_END); int64_t sz = ftello(f); fseeko(f, 0, SEEK_SET);
+    uint8_t *d = sz > (int64_t)sizeof(pwhdr) ? malloc((size_t)sz) : NULL;
     int ok = d && fread(d, 1, (size_t)sz, f) == (size_t)sz; fclose(f);
     pwhdr2 h; memset(&h, 0, sizeof h); if (ok) memcpy(&h, d, (size_t)sz < sizeof h ? sizeof(pwhdr) : sizeof h);
     int v2 = ok && !memcmp(h.magic, PW_MAGIC2, 8) && (size_t)sz >= sizeof(pwhdr2), v1 = ok && !memcmp(h.magic, PW_MAGIC, 8);
@@ -1047,7 +1047,7 @@ static int gfx_make(gval *g, const gkey_full *fk, size_t len, vka_shader *const 
     if (P && pstate_fill(P, sh, lay, k)) {   // (else logged by vka_shader_module)
         const int gpl = gpl_on() && !P->mesh && !P->vrs && !k->excl;   // (a mesh pipeline is made whole: the libraries here are cut for vertex input pipelines; Lichii: so are those with a shading rate attachment or an exclusive scissor)
         // The pipeline cache may already hold the optimized one (made in an earlier run): then it is made at once, else linked from parts
-        if (mode == MK_FRAME && (gpl || async)) p = cache_probe(P);
+        if (mode == MK_FRAME && (gpl || async) && V.cache_ctl) p = cache_probe(P);   // (the cache-only try needs pipelineCreationCacheControl; without it, as a miss)
         if (!p && mode != MK_PREWARM && gpl) {
             uint64_t t1 = now_ns();
             t_lib_peek = async; p = gpl_link(P, k); t_lib_peek = 0;
