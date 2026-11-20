@@ -100,6 +100,9 @@ add_executable(tests
     frontend_common/cloud_sync_save.cpp
     frontend_common/cloud_sync_auth.cpp
     frontend_common/cloud_sync_drive.cpp
+    frontend_common/cloud_sync_engine.cpp
+    frontend_common/cloud_sync_machine.h
+    frontend_common/fake_drive.h
     frontend_common/fake_google.h
     core/vfs_vector.cpp
     core/kip_ini.cpp
