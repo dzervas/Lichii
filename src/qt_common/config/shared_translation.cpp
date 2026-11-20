@@ -105,6 +105,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, cpu_ticks, tr("Custom CPU Ticks"),
            tr("Set a custom value of CPU ticks. Higher values can increase performance, but may "
               "cause deadlocks. A range of 77-21000 is recommended."));
+    INSERT(Settings, yield_backoff, tr("Back off spinning threads"),
+           tr("When a game thread keeps yielding with nothing else to run, briefly gives its "
+              "host CPU core away instead of spinning.\nSaves CPU time and power, but on hosts "
+              "that lower their clocks with the load it can cost some frame pacing."));
     INSERT(Settings, cpu_backend, tr("Backend:"), QString());
 
     // Cpu Debug
@@ -411,6 +415,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "shaders of recent sessions are built there and the rest in the background or when "
               "the game first needs them.\nLoading takes longer and uses more memory, about 0.3 "
               "MB per shader, up to a quarter of the RAM. Takes effect when a game starts."));
+    INSERT(Settings, nvn_direct_renderer, tr("NVN direct renderer (experimental)"),
+           tr("Runs the game's graphics calls (NVN) directly on Vulkan instead of emulating the "
+              "Switch GPU. Can be much faster, but is experimental: some games may render wrong "
+              "or crash.\nGames it cannot run (32-bit games, games without NVN) use the normal "
+              "renderer; the status bar says why. Vulkan only. Takes effect when a game starts."));
     INSERT(Settings, native_async_draws, tr("Switch 2 draws and compute with unbuilt shaders:"),
            tr("Only applies when \"Don't wait for shaders that are still compiling\" is on. Decides "
               "what Switch 2 work does when its pipeline is still building. Only work that redraws "

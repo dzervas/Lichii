@@ -237,6 +237,30 @@ void Scheduler::FlushDeferred() {
     }
 }
 
+bool Scheduler::IdleGpuAwaitsWork() {
+    // Mario Kart World: the back records ~1 ms of draws per 128-draw submission while the GPU
+    // sits idle, then what waits on that work (a command list copy, a fence-delayed semaphore
+    // release) waits for the GPU to run all of it. 100 us left the least of that wait among 50,
+    // 100 and 200 us.
+    static constexpr auto age = std::chrono::microseconds{100};
+    // Not inside a render pass: ending passes early tripled the submissions and cost the back
+    // about as much as the wait saved.
+    if (state.renderpass || !RecordedSinceSubmit()) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_flush < age || now < next_idle_gpu_check) {
+        return false;
+    }
+    // At most one semaphore read per bound while the GPU stays busy.
+    next_idle_gpu_check = now + age;
+    const u64 last_submitted = CurrentTick() - 1;
+    if (!IsFree(last_submitted)) {
+        master_semaphore->Refresh();
+    }
+    return IsFree(last_submitted);
+}
+
 bool Scheduler::WaitSubmitted(u64 tick) {
     if (IsSubmitted(tick)) {
         return true;
@@ -1161,7 +1185,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    const VkSemaphore wait_timeline = std::exchange(next_wait_timeline, VkSemaphore{});
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, wait_timeline,
+                            wait_value = next_wait_value, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1198,7 +1224,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
 
         std::scoped_lock lock{submit_mutex};
         switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, wait_timeline,
+                    wait_value, signal_value)) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&

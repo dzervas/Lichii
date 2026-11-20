@@ -81,6 +81,9 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#ifdef LICHII_NVN_DIRECT
+#include "video_core/nvn_direct/nvn_direct.h"
+#endif
 
 namespace Vulkan {
 
@@ -4112,6 +4115,24 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (!framebuffer_addr) {
         return {};
     }
+#ifdef LICHII_NVN_DIRECT
+    if (device.IsNvnDirect()) {
+        // NVN2 direct mode: the replay's image of the frame the address names
+        // (core/nvn_hook.cpp PresentDirect), taken by the composite in progress once the GPU
+        // finished it (RendererVulkan::Composite). Nothing else presents.
+        if ((framebuffer_addr & NVN_DIRECT_FRAME_TAG) == 0 || !direct_display_frame) {
+            return {};
+        }
+        return FramebufferTextureInfo{
+            .image = direct_display_frame->image,
+            .image_view = direct_display_frame->view,
+            .width = direct_display_frame->width,
+            .height = direct_display_frame->height,
+            .scaled_width = direct_display_frame->scaled_width,
+            .scaled_height = direct_display_frame->scaled_height,
+        };
+    }
+#endif
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
@@ -4206,7 +4227,13 @@ void RasterizerVulkan::FlushWork() {
         }();
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
-    switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
+    auto action = SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget);
+    if (action != SubmissionPolicy::Action::Flush && native && !android &&
+        scheduler.IdleGpuAwaitsWork()) {
+        draw_counter = 0;
+        action = SubmissionPolicy::Action::Flush;
+    }
+    switch (action) {
     case SubmissionPolicy::Action::None:
         break;
     case SubmissionPolicy::Action::Dispatch:
