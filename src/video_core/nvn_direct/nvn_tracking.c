@@ -51,6 +51,10 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t g_rw = PTHREAD_RWLOCK_INITIALIZER;
 static _Atomic uint64_t g_now = 1;
 static _Atomic uint64_t g_faults, g_preps;
+// The generation of a page whose arming failed: writes to it may go unseen, so every texture over
+// it counts as written until a later arming of it succeeds (upstream's GEN_UNPROT).
+#define GEN_UNPROT UINT64_MAX
+static int g_unprot_seen; // an arming failed once: arming looks for GEN_UNPROT pages (under g_mu)
 
 static uintptr_t page_lo(uintptr_t a) { return a & ~(uintptr_t)(PAGE_SIZE - 1); }
 static uintptr_t page_hi(uintptr_t e) { return page_lo(e - 1) + PAGE_SIZE; }
@@ -134,7 +138,60 @@ fail:
     LOG("[RED] pool %p+%#zx: out of memory for its write tracking: CPU writes to its textures after their first upload are not seen", mem, size);
 }
 
-// Arms or disarms pages in [lo, hi) in runs (caller holds g_mu).
+static void wlog_add(uintptr_t lo, uintptr_t hi);
+
+// Sets the arm bit of the pages [lo, hi) in every span over them (caller holds g_mu); unprot gives
+// them GEN_UNPROT, restamp gives those that had it a new generation.
+static void set_armed(uintptr_t lo, uintptr_t hi, int armed, int unprot, int restamp, uint64_t* g) {
+    for (int i = first_after(lo); i < g_nspans && g_spans[i]->lo < hi; i++) {
+        span_t* s = g_spans[i];
+        if (s->hi <= lo) continue;
+        const uintptr_t base = page_lo(s->lo), end = page_hi(s->hi);
+        const uintptr_t b = base > lo ? base : lo, e = end < hi ? end : hi;
+        for (uintptr_t j = (b - base) >> PAGE_SHIFT; j < (e - base) >> PAGE_SHIFT; j++) {
+            s->armed[j] = (uint8_t)armed;
+            if (unprot) {
+                atomic_store(&s->gen[j], GEN_UNPROT);
+            } else if (restamp && atomic_load(&s->gen[j]) == GEN_UNPROT) {
+                if (!*g) *g = atomic_load(&g_now) + 1;
+                atomic_store(&s->gen[j], *g);
+            }
+        }
+    }
+}
+
+// Records whether arming (on) or disarming the pages [lo, hi) worked (caller holds g_mu). A page
+// counts as armed while it may be protected, so the next write or host write
+// (dm_guest_write_prepare) releases it. A failed arming is undone and a failed disarming tried
+// again, page by page where the whole run cannot be released (Windows may have changed part of
+// it, as upstream's nvn_dirty.c): pages left protected stay armed. The pages of a failed arming get
+// GEN_UNPROT and are logged as written, so the textures over them are uploaded again at each
+// check, whose upload tries to arm them again. Once that works, pages still GEN_UNPROT count as
+// written now (one more upload) and are tracked from there.
+static void track_result(uintptr_t lo, uintptr_t hi, int on, int done) {
+    uint64_t g = 0;
+    if (done) {
+        set_armed(lo, hi, on, 0, on && g_unprot_seen, &g);
+    } else {
+        if (on) g_unprot_seen = 1;
+        if (on && nvn_direct_track_pages(nvn_direct_guest_of(lo), hi - lo, 0)) {
+            set_armed(lo, hi, 0, 1, 0, &g);
+        } else {
+            for (uintptr_t a = lo; a < hi; a += PAGE_SIZE) {
+                const int released = nvn_direct_track_pages(nvn_direct_guest_of(a), PAGE_SIZE, 0);
+                set_armed(a, a + PAGE_SIZE, !released, on, 0, &g);
+            }
+        }
+        if (on) g = atomic_load(&g_now) + 1;
+    }
+    if (g) {
+        wlog_add(lo, hi);
+        atomic_store(&g_now, g);
+    }
+}
+
+// Arms or disarms pages in [lo, hi) of s in runs, each run's result recorded in every span over it
+// (caller holds g_mu).
 static void arm_pages(span_t* s, uintptr_t lo, uintptr_t hi, int on) {
     const uintptr_t base = page_lo(s->lo);
     const uintptr_t p = (lo - base) >> PAGE_SHIFT, q = (hi - base) >> PAGE_SHIFT;
@@ -143,18 +200,18 @@ static void arm_pages(span_t* s, uintptr_t lo, uintptr_t hi, int on) {
     for (uintptr_t i = p; i <= q; i++) {
         const int change = i < q && s->armed[i] != on && !(on && s->host[i]);
         if (change) {
-            s->armed[i] = (uint8_t)on;
             if (!open) { run = i; open = 1; }
             continue;
         }
         if (open) {
-            nvn_direct_track_pages(nvn_direct_guest_of(base + (run << PAGE_SHIFT)), (i - run) << PAGE_SHIFT, on);
+            const uintptr_t run_lo = base + (run << PAGE_SHIFT), run_hi = base + (i << PAGE_SHIFT);
+            track_result(run_lo, run_hi, on, nvn_direct_track_pages(nvn_direct_guest_of(run_lo), run_hi - run_lo, on));
             open = 0;
         }
     }
 }
 
-// Update all copies of an arm bit, but change the protection only on the first span over a page.
+// Change the protection only on the first span over a page; every span over it gets the result.
 static void arm_shared(int first, uintptr_t lo, uintptr_t hi, int on) {
     uintptr_t done = lo;
     for (int i = first; i < g_nspans && g_spans[i]->lo < hi; i++) {
@@ -162,11 +219,8 @@ static void arm_shared(int first, uintptr_t lo, uintptr_t hi, int on) {
         if (s->hi <= lo) continue;
         const uintptr_t base = page_lo(s->lo), end = page_hi(s->hi);
         uintptr_t b = base > lo ? base : lo;
+        if (b < done) b = done;
         const uintptr_t e = end < hi ? end : hi;
-        for (; b < e && b < done; b += PAGE_SIZE) {
-            const uintptr_t j = (b - base) >> PAGE_SHIFT;
-            s->armed[j] = (uint8_t)(on && !s->host[j]);
-        }
         if (b < e) {
             arm_pages(s, b, e, on);
             done = e;
