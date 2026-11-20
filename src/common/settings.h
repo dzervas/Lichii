@@ -298,6 +298,9 @@ struct Values {
                                            true,
                                            &use_custom_cpu_ticks};
 
+    // Give the host core away while a guest thread spins on yields that find nothing to switch to.
+    SwitchableSetting<bool> yield_backoff{linkage, false, "yield_backoff", Category::Cpu};
+
     Setting<bool> cpuopt_page_tables{linkage, true, "cpuopt_page_tables", Category::CpuDebug};
     Setting<bool> cpuopt_block_linking{linkage, true, "cpuopt_block_linking", Category::CpuDebug};
     Setting<bool> cpuopt_return_stack_buffer{linkage, true, "cpuopt_return_stack_buffer",
@@ -727,6 +730,12 @@ struct Values {
     SwitchableSetting<bool> build_all_cached_shaders{linkage, false, "build_all_cached_shaders",
                                                      Category::RendererAdvanced};
 
+    // Runs the game's NVN calls in the NVN direct renderer (video_core/nvn_direct) instead of
+    // emulating its GPU. Read when a game boots (Core::NvnHook::Install), which falls back to
+    // the GPU emulation for a game the direct renderer cannot run.
+    SwitchableSetting<bool> nvn_direct_renderer{linkage, false, "nvn_direct_renderer",
+                                                Category::RendererAdvanced};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
@@ -1113,6 +1122,11 @@ struct Values {
     SwitchableSetting<bool> airplane_mode{linkage, true, "airplane_mode", Category::Network};
     Setting<bool> lan_play{linkage, false, "lan_play", Category::Network};
     Setting<bool> nextendo_enabled{linkage, false, "nextendo_enabled", Category::Network};
+    // Google Drive sync of profiles and saves (frontend_common/cloud_sync).
+    Setting<bool> cloud_sync_enabled{linkage, false, "cloud_sync_enabled", Category::Network};
+    // Also syncs the web service login (eden_username, eden_token) on "Sync now".
+    Setting<bool> cloud_sync_web_service{linkage, true, "cloud_sync_web_service",
+                                         Category::Network};
     // Replaces the current user's nickname and icon with the Nextendo account's.
     Setting<bool> nextendo_sync_profile{linkage, false, "nextendo_sync_profile", Category::Network};
     Setting<std::string> nextendo_server_ip{linkage, "51.178.29.194", "nextendo_server_ip",

@@ -28,6 +28,7 @@
 #include "common/nextendo_game_catalog.h"
 #include "common/settings_enums.h"
 #include "core/file_sys/nup_writer.h"
+#include "frontend_common/cloud_sync/sync_engine.h"
 #include "frontend_common/content_manager.h"
 #include "input_common/drivers/tas_input.h"
 #include "qt_common/config/qt_config.h"
@@ -58,6 +59,8 @@ class GRenderWindow;
 class LoadingScreen;
 class OverlayDialog;
 class BugReportDialog;
+class CloudSyncController;
+class QToolButton;
 class ControllerDialog;
 class QLabel;
 class MultiplayerState;
@@ -184,7 +187,7 @@ class MainWindow : public QMainWindow {
 public:
     void filterBarSetChecked(bool state);
     void UpdateUITheme();
-    explicit MainWindow(bool has_broken_vulkan);
+    explicit MainWindow(bool has_broken_vulkan, bool relaunch_global_settings);
     ~MainWindow() override;
 
     bool DropAction(QDropEvent* event);
@@ -498,6 +501,11 @@ private slots:
     void SyncNextendoProfile(bool force);
 
 private:
+    /// Starts a fresh Lichii that waits for this one to exit, then boots `filename` with the same
+    /// user dir, profile and environment: the NVN direct renderer of an earlier game in this
+    /// process could not be reset (Core::NvnHook::DirectNeedsFreshProcess). Returns whether it
+    /// started.
+    bool RelaunchForGame(const QString& filename, StartGameType type);
     void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
     void OnGameListEditNxMetadata(const std::string& game_path);
     void RemovePlayTimeData(u64 program_id);
@@ -513,6 +521,7 @@ private:
     void UpdateAAText();
     void UpdatePostShaderText();
     void UpdateFrameGenButton();
+    void UpdateCloudSyncButton();
 
     void UpdateVolumeUI();
     void UpdateStatusBar();
@@ -594,6 +603,9 @@ private:
     QTimer nextendo_social_timer;
     QFutureWatcher<void> nextendo_social_watcher;
     QFutureWatcher<std::optional<Common::Nextendo::ProfilePull>> nextendo_profile_watcher;
+    CloudSyncController* cloud_sync = nullptr;
+    // The title booted with cloud sync, whose saves are pushed when it stops.
+    std::optional<FrontendCommon::CloudSync::Title> cloud_sync_title;
     Common::UUID nextendo_profile_user;
     // A forced pull that has to wait for the game to stop or for the running pull.
     bool nextendo_profile_force{};
@@ -626,6 +638,9 @@ private:
     QPushButton* aa_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
     QPushButton* frame_gen_status_button = nullptr;
+    QToolButton* cloud_sync_button = nullptr;
+    // Keeps the cloud sync tooltip's "7m ago" current.
+    QTimer cloud_sync_button_timer;
 
     VideoCore::FrameGenState frame_gen_state{};
     u64 frame_gen_frames = 0;
@@ -696,6 +711,7 @@ private:
 
     // Last game booted, used for multi-process apps
     QString last_filename_booted;
+    StartGameType current_game_start_type{StartGameType::Normal};
 
     // Applets
     QtAmiiboSettingsDialog* cabinet_applet = nullptr;

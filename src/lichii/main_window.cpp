@@ -46,6 +46,8 @@
 #include "ryujinx_dialog.h"
 #include "set_play_time_dialog.h"
 #include "util/util.h"
+#include "frontend_common/cloud_sync/google_auth.h"
+#include "lichii/cloud_sync_controller.h"
 #include "lichii/game/game_list.h"
 #include "lichii/mod_store/mod_store_dialog.h"
 #include "lichii/nup_dialogs.h"
@@ -92,6 +94,9 @@
 
 #include <QActionGroup>
 #include <QCheckBox>
+#include <QDateTime>
+#include <QToolButton>
+#include <QPainter>
 #include <QClipboard>
 #include <QDate>
 #include <QDesktopServices>
@@ -106,6 +111,7 @@
 #include <QInputDialog>
 #include <QMimeData>
 #include <QPalette>
+#include <QProcess>
 #include <QProgressDialog>
 #include <QScreen>
 #include <QSet>
@@ -191,6 +197,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/loader/nx.h"
+#include "core/nvn_hook.h"
 
 #include "core/tools/renderdoc.h"
 
@@ -457,7 +464,7 @@ inline static bool isDarkMode() {
 }
 #endif // _WIN32
 
-MainWindow::MainWindow(bool has_broken_vulkan)
+MainWindow::MainWindow(bool has_broken_vulkan, bool relaunch_global_settings)
     : ui{std::make_unique<Ui::MainWindow>()},
       input_subsystem{std::make_shared<InputCommon::InputSubsystem>()}, user_data_migrator{this} {
     QtCommon::Init(this);
@@ -600,7 +607,10 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 if (pull && Common::Nextendo::OnlinePlayActive() &&
                     Settings::values.nextendo_sync_profile.GetValue()) {
                     // A game that booted meanwhile reads the profile: write it once the game stops.
+                    // Nor while a cloud sync may be changing the profiles.
                     if (QtCommon::system->IsPoweredOn() ||
+                        FrontendCommon::CloudSync::SyncRunning() ||
+                        (cloud_sync && cloud_sync->Busy()) ||
                         !WriteNextendoProfile(QtCommon::system->GetProfileManager(),
                                               nextendo_profile_user, *pull)) {
                         nextendo_profile_force = true;
@@ -769,6 +779,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     if (launch) {
         const auto& lp = *launch;
+        user_flag_cmd_line =
+            lp.selected_user && profile_manager.UserExistsIndex(*lp.selected_user);
 
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {
@@ -776,7 +788,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         }
 
         if (!lp.filepath.empty()) {
-            BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
+            BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters(),
+                     relaunch_global_settings ? StartGameType::Global : StartGameType::Normal);
         } else if (lp.launch_setup) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
         } else if (!launch_home && lp.launch_hlaunch) {
@@ -1242,6 +1255,36 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusText(), 0);
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusIcon(), 0);
+
+    // Cloud sync, beside the network status: a light blue cloud when on, a grey one when off or
+    // signed out. When it last synced is in the tooltip.
+    cloud_sync_button = new QToolButton();
+    cloud_sync_button->setAutoRaise(true);
+    cloud_sync_button->setFocusPolicy(Qt::NoFocus);
+    cloud_sync_button->setIconSize(QSize{16, 16});
+    connect(cloud_sync_button, &QToolButton::clicked, this, [this] {
+        if (FrontendCommon::CloudSync::SignedInSnapshot()) {
+            Settings::values.cloud_sync_enabled.SetValue(
+                !Settings::values.cloud_sync_enabled.GetValue());
+            UpdateCloudSyncButton();
+        } else {
+            OnConfigure();
+        }
+    });
+    cloud_sync_button->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(cloud_sync_button, &QToolButton::customContextMenuRequested, this,
+            [this](const QPoint& menu_location) {
+                QMenu context_menu;
+                QAction* const sync_now =
+                    context_menu.addAction(tr("Sync Now"), [this] { cloud_sync->SyncAll(); });
+                sync_now->setEnabled(cloud_sync && cloud_sync->Enabled() && !cloud_sync->Busy());
+                context_menu.addAction(tr("Configure..."), this, &MainWindow::OnConfigure);
+                context_menu.exec(cloud_sync_button->mapToGlobal(menu_location));
+            });
+    connect(&cloud_sync_button_timer, &QTimer::timeout, this, &MainWindow::UpdateCloudSyncButton);
+    cloud_sync_button_timer.start(std::chrono::seconds{30});
+    UpdateCloudSyncButton();
+    statusBar()->addPermanentWidget(cloud_sync_button, 0);
 
     tas_label = new QLabel();
     tas_label->setObjectName(QStringLiteral("TASlabel"));
@@ -1806,6 +1849,28 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::GameChosen, this, &MainWindow::OnGameListLoadFile);
     connect(game_list, &GameList::OpenDirectory, this, &MainWindow::OnGameListOpenDirectory);
     connect(game_list, &GameList::OpenFolderRequested, this, &MainWindow::OnGameListOpenFolder);
+    cloud_sync = new CloudSyncController(this);
+    cloud_sync->SetTitleSource([this] {
+        std::vector<FrontendCommon::CloudSync::Title> titles;
+        for (const auto& [program_id, name] : game_list->GameTitles()) {
+            titles.push_back({program_id, name.toStdString()});
+        }
+        return titles;
+    });
+    connect(cloud_sync, &CloudSyncController::StatusMessage, this,
+            [this](const QString& message) { statusBar()->showMessage(message, 15000); });
+    connect(cloud_sync, &CloudSyncController::SettingsChanged, this, &MainWindow::OnSaveConfig);
+    // A Nextendo profile pulled during the sync was left for now.
+    connect(cloud_sync, &CloudSyncController::BusyChanged, this, [this](bool busy) {
+        UpdateCloudSyncButton();
+        if (!busy) {
+            SyncNextendoProfile(false);
+        }
+    });
+    connect(game_list, &GameList::SyncSaveRequested, this,
+            [this](u64 program_id, const QString& title) {
+                cloud_sync->SyncTitle({program_id, title.toStdString()});
+            });
     connect(game_list, &GameList::OpenTransferableShaderCacheRequested, this,
             [this](u64 program_id) { QtCommon::Path::OpenShaderCache(program_id, this); });
     connect(game_list, &GameList::RemoveInstalledEntryRequested, this,
@@ -2452,6 +2517,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         boot_in_progress = false;
         LOG_INFO(Frontend, "Launch finished: elapsed_ms={} running={}", boot_timer.elapsed(),
                  emulation_running);
+        if (!emulation_running && cloud_sync_title) {
+            cloud_sync->GuestStopped(*cloud_sync_title, false);
+            cloud_sync_title.reset();
+        }
         if (!emulation_running && !close_pending) {
             game_list->SetScanEnabled(true);
             game_list->PopulateAsync(UISettings::values.game_dirs);
@@ -2497,6 +2566,13 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     const auto loader =
         Loader::GetLoader(*QtCommon::system, v_file, params.program_id, params.program_index);
 
+    bool loaded_game_settings = false;
+    SCOPE_EXIT {
+        if (loaded_game_settings && !emulation_running) {
+            Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
+            QtCommon::system->HIDCore().ReloadInputDevices();
+        }
+    };
     if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
         type == StartGameType::Normal) {
         // Load per game settings
@@ -2506,6 +2582,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                           ? Common::FS::PathToUTF8String(file_path.filename())
                                           : fmt::format("{:016X}", title_id);
         QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
+        loaded_game_settings = true;
         QtCommon::system->HIDCore().ReloadInputDevices();
         QtCommon::system->ApplySettings();
     }
@@ -2513,6 +2590,22 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
     speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
+
+    // No cloud sync touches the title (or, while it runs, the profiles) from here on; the saves
+    // changed on Drive come in first. A cancelled or failed pull still boots. Before the user
+    // picker, which reads the profiles a sync may be changing.
+    {
+        std::string name = QtCommon::Game::ReadCustomTitle(title_id);
+        if (name.empty() && loader) {
+            loader->ReadTitle(name);
+        }
+        cloud_sync_title = FrontendCommon::CloudSync::Title{
+            title_id, name.empty() ? fmt::format("{:016X}", title_id) : name};
+        cloud_sync->PrepareBoot(*cloud_sync_title);
+        if (close_pending) {
+            return;
+        }
+    }
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
         const Core::Frontend::ProfileSelectParameters parameters{
@@ -2530,6 +2623,13 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     // game startup only. If the user stops emulation and starts a new one, go back to the expected
     // behavior of asking.
     user_flag_cmd_line = false;
+
+    if (params.program_id == 0 && params.program_index == 0 &&
+        params.launch_type == Service::AM::LaunchType::FrontendInitiated &&
+        Core::NvnHook::DirectNeedsFreshProcess() && RelaunchForGame(filename, type)) {
+        close_pending = true;
+        return;
+    }
 
     FileSys::VirtualFile prepared_romfs;
     if (loader && loader->GetFileType() == Loader::FileType::DeconstructedRomDirectory) {
@@ -2589,6 +2689,31 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         return;
     }
     LOG_INFO(Frontend, "Core load completed: elapsed_ms={}", load_timer.elapsed());
+
+    if (const auto choice = Core::NvnHook::Choice(); Core::NvnHook::IsFallback(choice)) {
+        using Core::NvnHook::RendererChoice;
+        const QString reason = [&] {
+            switch (choice) {
+            case RendererChoice::NotBuilt:
+                return tr("this build does not include it");
+            case RendererChoice::NotVulkan:
+                return tr("it needs the Vulkan graphics API");
+            case RendererChoice::Not64Bit:
+                return tr("the game is 32-bit");
+            case RendererChoice::NoNvn:
+                return tr("the game does not use NVN");
+            case RendererChoice::NoFastmem:
+                return tr("it needs a usable fastmem arena");
+            case RendererChoice::NotReset:
+                return tr("an earlier game used it and it could not be reset");
+            case RendererChoice::ReplayFailed:
+            default:
+                return tr("it could not start on this GPU");
+            }
+        }();
+        message_label->setText(
+            tr("NVN direct renderer not used (%1): normal renderer").arg(reason));
+    }
 
     const auto report_program_id = QtCommon::system->GetApplicationProcessProgramID();
     if (Settings::CurrentProgramIsSwitch2() && report_program_id != 0) {
@@ -2688,8 +2813,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     });
 
     QtCommon::system->RegisterApplicationChangedCallback([this](u64 changed_program_id) {
-        if (QtCommon::emu_thread)
+        // NVN Direct keeps the replay cache adopted at boot, not a per-subprogram Maxwell cache.
+        if (QtCommon::emu_thread && !Core::NvnHook::IsDirect(Core::NvnHook::Choice())) {
             QtCommon::emu_thread->RequestDiskShaderCacheReload(changed_program_id);
+        }
 
         QMetaObject::invokeMethod(
             this, [this, changed_program_id] { this->OnApplicationChanged(changed_program_id); },
@@ -2782,6 +2909,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     loading_screen->Prepare(QtCommon::system->GetAppLoader());
     loading_screen->show();
 
+    current_game_start_type = type;
     emulation_running = true;
     if (ui->action_Fullscreen->isChecked()) {
         ShowFullscreen();
@@ -3015,6 +3143,10 @@ void MainWindow::OnEmulationStopped() {
 
     emulation_running = false;
     nextendo_version_check.reset();
+    if (cloud_sync_title) {
+        cloud_sync->GuestStopped(*cloud_sync_title, true);
+        cloud_sync_title.reset();
+    }
 
     nextendo_social_timer.stop();
     if (Common::Nextendo::OnlinePlayActive()) {
@@ -3056,6 +3188,7 @@ void MainWindow::OnEmulationStopped() {
     }
     game_list->SetFilterFocus();
     tas_label->clear();
+    message_label->clear();
     input_subsystem->GetTas()->Stop();
     OnTasStateChanged();
     render_window->FinalizeCamera();
@@ -3964,6 +4097,50 @@ void MainWindow::OnStartGame() {
     Common::FeralGamemode::Start();
 }
 
+bool MainWindow::RelaunchForGame(const QString& filename, StartGameType type) {
+    const QString appimage = qEnvironmentVariable("APPIMAGE");
+    const QString program =
+        appimage.isEmpty() ? QCoreApplication::applicationFilePath() : appimage;
+    QStringList arguments{QStringLiteral("-g"), filename, QStringLiteral("-u"),
+                          QString::number(Settings::values.current_user.GetValue())};
+    if (ui->action_Fullscreen->isChecked()) {
+        arguments << QStringLiteral("-f");
+    }
+    auto environment = UpdateDialog::RestartEnvironment();
+    environment.insert(QStringLiteral("LICHII_RELAUNCH_WAIT_PID"),
+                       QString::number(QCoreApplication::applicationPid()));
+    environment.insert(QStringLiteral("LICHII_RELAUNCH_GLOBAL_SETTINGS"),
+                       type == StartGameType::Global ? QStringLiteral("1") : QStringLiteral("0"));
+    QStringList carried;
+    const auto inherited_environment = QProcessEnvironment::systemEnvironment();
+    for (const auto& key : inherited_environment.keys()) {
+        if (key.startsWith(QStringLiteral("EDEN_NX2_"))) {
+            environment.insert(key, inherited_environment.value(key));
+            carried << key;
+        }
+    }
+    carried.sort();
+    LOG_INFO(Frontend,
+             "Relaunching Lichii for {}: the NVN direct renderer of an earlier game in this "
+             "process could not be reset. User dir {}, working dir {}, "
+             "environment carried: {}",
+             filename.toStdString(), Common::FS::GetEdenPathString(Common::FS::EdenPath::EdenDir),
+             QDir::currentPath().toStdString(),
+             carried.isEmpty() ? std::string{"no EDEN_NX2_* variables"}
+                               : carried.join(QStringLiteral(" ")).toStdString());
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(arguments);
+    process.setWorkingDirectory(QDir::currentPath());
+    process.setProcessEnvironment(environment);
+    if (!process.startDetached()) {
+        LOG_ERROR(Frontend, "Could not relaunch {}: {}; the game falls back to GPU emulation",
+                  program.toStdString(), process.errorString().toStdString());
+        return false;
+    }
+    return true;
+}
+
 void MainWindow::OnRestartGame() {
     if (!QtCommon::system->IsPoweredOn()) {
         return;
@@ -3973,7 +4150,7 @@ void MainWindow::OnRestartGame() {
         // Make a copy since ShutdownGame edits game_path
         const auto current_game = QString(current_game_path);
         ShutdownGame();
-        BootGame(current_game, ApplicationAppletParameters());
+        BootGame(current_game, ApplicationAppletParameters(), current_game_start_type);
     }
 }
 
@@ -5481,8 +5658,14 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         !Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
-    const auto stale = ShaderWarm::WarmFilesStale(warm_file);
-    const bool pending = ShaderWarm::WarmPending(title_id);
+    const bool native = Core::NvnHook::DirectRequested();
+    auto stale = ShaderWarm::WarmFilesStale(warm_file);
+    if (!stale && native && ShaderWarm::NativeWarmFilesStale(title_id)) {
+        stale = "NVN Direct precache is missing or outdated";
+    }
+    // Ask is a per-game choice. Either renderer's completed precache means the game was
+    // precached before; the renderer that actually boots still checks its own files and stamp.
+    const bool pending = ShaderWarm::WarmPending(title_id) && ShaderWarm::WarmPending(title_id, true);
     if (!pending && !stale) {
         // Precached before: the renderer runs it again only when the driver or the file changed.
         ShaderWarm::RequestWarmBeforeStart(true);
@@ -5520,7 +5703,8 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         });
         dialog.Start();
         dialog.exec();
-        if (!std::filesystem::exists(warm_file, ec)) {
+        if (!std::filesystem::exists(warm_file, ec) &&
+            (!native || ShaderWarm::NativeWarmFilesStale(title_id))) {
             return;
         }
     }
@@ -5917,6 +6101,7 @@ void MainWindow::SyncNextendoProfile(bool force) {
     nextendo_profile_force |= force;
     if (!Common::Nextendo::OnlinePlayActive() ||
         !Settings::values.nextendo_sync_profile.GetValue() || QtCommon::system->IsPoweredOn() ||
+        FrontendCommon::CloudSync::SyncRunning() || (cloud_sync && cloud_sync->Busy()) ||
         nextendo_profile_watcher.isRunning()) {
         return;
     }
@@ -6487,6 +6672,54 @@ void MainWindow::UpdateStatusButtons() {
     UpdateAAText();
     UpdateFrameGenButton();
     UpdateVolumeUI();
+    UpdateCloudSyncButton();
+}
+
+void MainWindow::UpdateCloudSyncButton() {
+    namespace CloudSync = FrontendCommon::CloudSync;
+    const bool signed_in = CloudSync::SignedInSnapshot();
+    const bool active = Settings::values.cloud_sync_enabled.GetValue() && signed_in;
+
+    // Lichii's grey cloud, tinted light blue when sync is on.
+    const QIcon cloud{QStringLiteral(":/lichii/icons/cloud.png")};
+    if (!active) {
+        cloud_sync_button->setIcon(cloud);
+    } else {
+        QPixmap pixmap = cloud.pixmap(QSize{16, 16}, devicePixelRatioF());
+        QPainter painter{&pixmap};
+        painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        painter.fillRect(pixmap.rect(), QColor{0x7d, 0xd3, 0xfc});
+        painter.end();
+        cloud_sync_button->setIcon(QIcon{pixmap});
+    }
+
+    if (!active) {
+        cloud_sync_button->setToolTip(
+            signed_in ? tr("Google Drive sync is off. Click to turn it on.")
+                      : tr("Not signed in to Google Drive. Click to set up cloud sync."));
+        return;
+    }
+    QString status;
+    if (cloud_sync && cloud_sync->Busy()) {
+        status = tr("Syncing with Google Drive...");
+    } else if (const auto last = CloudSync::LastSyncTime(); !last) {
+        status = tr("Not synced with Google Drive yet.");
+    } else {
+        const s64 ago = std::max<s64>(QDateTime::currentSecsSinceEpoch() - *last, 0);
+        QString when;
+        if (ago < 60) {
+            when = tr("just now");
+        } else if (ago < 60 * 60) {
+            when = tr("%1m ago", "minutes since the last cloud sync").arg(ago / 60);
+        } else if (ago < 24 * 60 * 60) {
+            when = tr("%1h ago", "hours since the last cloud sync").arg(ago / (60 * 60));
+        } else {
+            when = tr("%1d ago", "days since the last cloud sync").arg(ago / (24 * 60 * 60));
+        }
+        status = tr("Synced with Google Drive %1.").arg(when);
+    }
+    cloud_sync_button->setToolTip(
+        tr("%1\nClick to turn sync off; right-click to sync now.").arg(status));
 }
 
 // TODO(crueter): Use this for game list stuff
@@ -6755,6 +6988,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
     LOG_INFO(Frontend, "Closing frontend after emulation cleanup");
+    cloud_sync->Shutdown();
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
