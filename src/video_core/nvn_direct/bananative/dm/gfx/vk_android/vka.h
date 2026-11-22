@@ -243,6 +243,24 @@ int vka_pool_bda(uint64_t addr, VkDeviceAddress *bda);   // the device address o
 void *vka_mem_mapped(size_t n);   // no placed maps: a mapped allocation as a segment where the driver maps it (the selftest on an emulator)
 int vka_mem_chunks(uint64_t *lo, uint64_t *hi, uint64_t *bda, int max);   // the placed segments by address (guest range and device address); the count
 uint64_t vka_mem_placed_bytes(uint64_t *peak);     // bytes of placed Vulkan memory now (and the peak)
+// Lichii: device-local mirrors of the segments shaders write with atomics, each owned by one Vulkan queue (vka_mem.c "Mirrors"). The recording thread brackets each
+// submission (its Vulkan queue q; cb outside a pass): vka_mem_sub_begin makes the mirrors asked for and acquires (the queue's mirrors take what the CPU and other queues
+// wrote), vka_mem_sub_end and vka_mem_mirror_release (before an event signal) release (the owner publishes what it wrote, another queue marks its writes),
+// vka_mem_mirror_acquire after each wait. Each GPU write the replay records into guest memory is reported: [addr, addr + n) (bound: a storage buffer of a shader with
+// storage atomics, which may ask for a mirror), or anywhere (raw global stores). Host writes past the CPU write tracker (nvn_direct_writable) go to vka_mem_host_wrote
+void vka_mem_sub_begin(VkCommandBuffer cb, int q);
+void vka_mem_sub_end(VkCommandBuffer cb, uint64_t fence);
+void vka_mem_mirror_release(VkCommandBuffer cb);
+void vka_mem_mirror_acquire(VkCommandBuffer cb);
+int vka_mem_mirror_owned(void);                    // the recording thread's queue owns pool mirrors (an acquire may have work)
+int vka_mem_mirrored_here(uint64_t addr, uint64_t n);   // [addr, addr + n) lies in a pool mirror the recording thread's queue uses
+void vka_mem_mirror_put(VkCommandBuffer cb, uint64_t addr, const void *data, uint32_t n);   // bytes the replay writes into guest memory as it records, into that mirror in GPU order (outside a pass)
+uint64_t vka_rp_queue_last(int q);   // vka_exec.c: the last submission on Vulkan queue q
+int vka_rp_queue_gated(int q);       // vka_exec.c: a submission of q not done yet waits ahead of a signal (a gate)
+int vka_rp_wait_fence(uint64_t fence);   // vka_exec.c: the part being recorded waits for fence's submission (1; 0 = not known)
+void vka_mem_gpu_wrote(uint64_t addr, uint64_t n, int bound);
+void vka_mem_gpu_wrote_any(void);
+void vka_mem_host_wrote(uint64_t addr, uint64_t n);
 
 // ---------- Textures (vka_tex.c) ----------
 typedef struct {
@@ -404,6 +422,7 @@ typedef struct vka_shader {
     vka_span loop_guard;                // Lichii: a recompiled shader's loop guard word (static memory; none when it has no loops)
     uint16_t scale_tex_binding;         // Lichii: a recompiled shader's first texture binding and that texture's bit in the render scale's push constants
     uint8_t scale_tex_bit, scale_tex_bits;   // (nvn_direct.h nvn_direct_scale_texture_bit; scale_tex_bits 0: no textures)
+    uint8_t sb_atomics;                 // Lichii: it makes atomics on storage buffers (vka_spv_storage_atomics): its written ones get device-local mirrors (vka_mem.c "Mirrors")
 } vka_shader;
 // by NVN stage; bad: stages whose shader is refused (bit = NVN stage) or VKA_BAD_MISSING (their draws are skipped). Lichii: depth, recompiled shaders' depth mode
 // (1 + gl_depth: the pre-rasterization stages are translated for one, vka_rc_shader; 0: any)

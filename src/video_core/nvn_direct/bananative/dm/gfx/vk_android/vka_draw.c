@@ -832,7 +832,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             switch (r[i].what) {
             case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
-                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
+                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) { vka_tex_gw_opaque(r[i].addr, bi->range); vka_mem_gpu_wrote(r[i].addr, bi->range, sh->sb_atomics); }   // the shader may store into it (Lichii: with atomics, a mirror of its segment)
                 break;
             case VKA_R_C1: if (sh->c1_len) *bi = (VkDescriptorBufferInfo){sh->c1.buf, sh->c1.off, (sh->c1_len + 15) & ~(VkDeviceSize)15}; else ok = 0; break;
             case VKA_R_SUPPORT:
@@ -850,7 +850,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                 if (g_prof) g_ps[3] += cntvct() - td_;
                 break; }
             case VKA_R_GMEM_MAP: ok = gmem_map(bi); break;
-            case VKA_R_GMEM_LOG: ok = gmem_log(bi); break;
+            case VKA_R_GMEM_LOG: ok = gmem_log(bi); vka_mem_gpu_wrote_any(); break;   // (Lichii: its stores may land in any mirror)
             case VKA_R_SHARED_SPILL: ok = st == 5 && g_spill_range && g_spill.buf; if (ok) *bi = (VkDescriptorBufferInfo){g_spill.buf, g_spill.off, g_spill_range}; break;
             case VKA_R_LOOP_GUARD: ok = sh->loop_guard.buf != VK_NULL_HANDLE; if (ok) *bi = (VkDescriptorBufferInfo){sh->loop_guard.buf, sh->loop_guard.off, 16}; break;   // (Lichii, nvn_recompile.c)
             default: ok = 0; break;

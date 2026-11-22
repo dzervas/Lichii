@@ -154,16 +154,18 @@ static void post_run(void *ops_, int n) {   // the completion thread, in submiss
             else ns = g > back ? g - back : 0;
             uint64_t tk = nvn_timestamp_from_ns(ns), tt = ops[i].type;
             uint64_t rec[2] = {DM_GAME_RENDER_COND ? 0 : tk, tk}; (void)tt;
-            if (ops[i].mode) { memcpy((uint8_t *)nvn_direct_writable(ops[i].addr) + 8, &rec[1], 8); continue; }   // (Lichii: its counter written at replay, rc_counter)
-            memcpy(nvn_direct_writable(ops[i].addr), rec, sizeof rec); continue;   // Lichii: through the backing memory (write tracking never protects it)
+            if (ops[i].mode) memcpy((uint8_t *)nvn_direct_writable(ops[i].addr) + 8, &rec[1], 8);   // (Lichii: its counter written at replay, rc_counter)
+            else memcpy(nvn_direct_writable(ops[i].addr), rec, sizeof rec);   // Lichii: through the backing memory (write tracking never protects it)
+            vka_mem_host_wrote(ops[i].addr, sizeof rec); continue;   // (Lichii: a mirror of the segment copies it in at its next acquire)
         }
-        if (ops[i].kind == 1) { volatile uint32_t *v = (volatile uint32_t *)nvn_direct_writable(ops[i].addr); if (ops[i].mode == NVN_EVENT_SIGNAL_MODE_ADD) *v += ops[i].v; else *v = ops[i].v; }
+        if (ops[i].kind == 1) { volatile uint32_t *v = (volatile uint32_t *)nvn_direct_writable(ops[i].addr); if (ops[i].mode == NVN_EVENT_SIGNAL_MODE_ADD) *v += ops[i].v; else *v = ops[i].v; vka_mem_host_wrote(ops[i].addr, 4); }
         else {
             if (g > last_ts) last_ts = g;
             // A timestamp report's counter: the time, or 0 under render_cond (as on the GPU, nvn_mtl.m rc_value). Samples passed: 1, so occlusion culling keeps everything visible until draws count
             uint64_t t = ops[i].type, rec[2] = {t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? (DM_GAME_RENDER_COND ? 0 : ticks) : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : 0, ticks};
             if (ops[i].mode) memcpy((uint8_t *)nvn_direct_writable(ops[i].addr) + 8, &rec[1], 8);   // (Lichii: its counter written at replay, rc_counter)
             else memcpy(nvn_direct_writable(ops[i].addr), rec, sizeof rec);
+            vka_mem_host_wrote(ops[i].addr, sizeof rec);
         }
     }
     free(ops);
@@ -342,8 +344,9 @@ void vka_rp_sub_begin(void) {
     vka_gp_sub_begin(g_cb, g_frame);
     vka_enc_start(g_cb);
     vka_barrier(g_cb);   // the host's writes to guest memory before this submission (made available by the submit), and earlier submissions' writes
+    vka_mem_sub_begin(g_cb, g_qi);   // (Lichii: mirrors made, and this queue's take what the CPU and other queues wrote: its acquire)
     vka_tex_prepare(g_cb);
-    vka_barrier(g_cb);   // the re-uploads of CPU-written textures before the submission's draws read them
+    vka_barrier(g_cb);   // the re-uploads of CPU-written textures (and the mirrors' copies) before the submission's draws read them
     vka_draw_sub_begin(g_cb, k);
     { void vka_pso_pause(int on); vka_pso_pause(0); }   // the game submits: resumed (mtl_drain paused the pipeline threads)
     g_chunk_draws = VKA_ENV("DM_VK_CHUNK", 600);   // live: from the next submission
@@ -432,6 +435,7 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) {
     vka_rp_end();
     labels_close();
     vka_tex_writeback(g_cb);   // linear textures the GPU wrote, back into their storage for the CPU
+    vka_mem_sub_end(g_cb, fence);   // (Lichii: and what it wrote into mirrors or other queues' imports: its release)
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT};
     vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vka_enc_stop();   // every call made: the command buffer is complete
@@ -488,7 +492,7 @@ void mtl_drain(void) { vka_pso_pause(1); vka_pso_save(1); mtl_present_flush(); m
 
 // ---------- Buffers ----------
 static void buf_copy(uint64_t src, uint64_t dst, uint64_t n) {
-    vka_tex_gw_copy(src, dst, n);
+    vka_tex_gw_copy(src, dst, n); vka_mem_gpu_wrote(dst, n, 0);
     while (n) {
         VkBuffer sb, db; VkDeviceSize so, dof;
         uint64_t a = vka_addr_run(src, n, &sb, &so), b = vka_addr_run(dst, n, &db, &dof), k = a < b ? a : b;
@@ -498,7 +502,7 @@ static void buf_copy(uint64_t src, uint64_t dst, uint64_t n) {
     }
 }
 static void buf_fill(uint64_t dst, uint64_t n, uint32_t value) {
-    vka_tex_gw_fill(dst, n, value);
+    vka_tex_gw_fill(dst, n, value); vka_mem_gpu_wrote(dst, n, 0);
     if ((dst | n) & 3) { VRED_ONCE("buffer fill at %#llx of %llu bytes is not 4-byte aligned", (unsigned long long)dst, (unsigned long long)n); return; }
     while (n) {
         VkBuffer b; VkDeviceSize o; uint64_t k = vka_addr_run(dst, n, &b, &o);
@@ -507,7 +511,7 @@ static void buf_fill(uint64_t dst, uint64_t n, uint32_t value) {
     }
 }
 static void buf_update(const void *data, uint64_t dst, uint64_t n) {   // inline data, in GPU order: through scratch memory
-    vka_tex_gw_update(dst, n, data);
+    vka_tex_gw_update(dst, n, data); vka_mem_gpu_wrote(dst, n, 0);
     vka_span s; if (!n || !vka_scratch(n, 16, &s)) return;
     memcpy(s.ptr, data, n);
     for (uint64_t done = 0; done < n;) {
@@ -765,7 +769,7 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
         {asp, lv, is3d ? 0 : l0 + (uint32_t)c->r.zoffset, is3d ? 1 : (uint32_t)nz}, {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0}, {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
     if (to_tex) { vk.vkCmdCopyBufferToImage(g_cb, bounce ? s.buf : b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg); vka_img_written(im); }
     else {
-        vka_tex_gw_opaque(c->src, span);
+        vka_tex_gw_opaque(c->src, span); vka_mem_gpu_wrote(c->src, span, 0);
         vk.vkCmdCopyImageToBuffer(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, bounce ? s.buf : b, 1, &rg);
         if (bounce) {
             vka_barrier(g_cb);
@@ -854,6 +858,7 @@ static void coopvec_convert(const p_coopvec_convert *c) {
         VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
         if (vk.vkCreateSemaphore(V.dev, &si, NULL, &g_coop_sem)) { g_coop_sem = VK_NULL_HANDLE; VRED_ONCE("cooperative-vector conversion: no timeline semaphore: converted without waiting for the GPU"); }
     }
+    if (g_cb) { vka_rp_end(); vka_mem_mirror_release(g_cb); }   // (Lichii: what this queue wrote into pool mirrors, into guest memory before the CPU reads it)
     if (g_cb && g_coop_sem) {
         vka_rp_end();
         int signalled = g_psy.ns < PWS;
@@ -869,6 +874,7 @@ static void coopvec_convert(const p_coopvec_convert *c) {
         }
     }
     nvn_coopvec_convert((const uint8_t *)(uintptr_t)c->src, &c->sd, (uint8_t *)(uintptr_t)c->dst, &c->dd, (uint32_t)c->rows, (uint32_t)c->cols);
+    if (g_cb) vka_mem_mirror_acquire(g_cb);   // (Lichii: the CPU's result, into this queue's pool mirrors before the work after it reads them)
 }
 
 static void not_yet(uint32_t op) {
@@ -906,6 +912,8 @@ static int rc_counter(uint64_t a, uint32_t t) {
     if (ts && !DM_GAME_RENDER_COND) return 0;   // (a timestamp's counter is the time otherwise: known at completion only)
     uint64_t v = t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : 0;
     memcpy(nvn_direct_writable(a), &v, 8);
+    vka_mem_host_wrote(a, 8);
+    if (g_cb && vka_mem_mirrored_here(a, 8)) { vka_rp_end(); vka_mem_mirror_put(g_cb, a, &v, 8); }   // (Lichii: and in GPU order into this queue's pool mirror)
     return 1;
 }
 static void seg_write(const void *a) { struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w; memcpy(&w, a, sizeof w); qf.write(w.cb, w.st, g_sqp, w.q); }
@@ -972,6 +980,18 @@ static void evsem_wrote(evsem *e, uint32_t v, int q, uint64_t t) {
 static void psy_wait(VkSemaphore s, uint64_t v) {
     for (uint32_t i = 0; i < g_psy.nw; i++) if (g_psy.ws[i] == s) { if (g_psy.wv[i] < v) g_psy.wv[i] = v; return; }
     if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = s; g_psy.wv[g_psy.nw++] = v; } else VRED_ONCE("more than %d event waits in one part", PWS);
+}
+// Lichii: a pool mirror's handoff (vka_mem.c "Mirrors"): the last submission on Vulkan queue q; whether one of q's submissions not done yet recorded a wait ahead of
+// its signal (a gate: it may wait for work recorded later, so nothing recorded now may wait for it); the part being recorded made to wait for fence (0 = not known)
+static uint64_t g_qgate[NVN_DIRECT_MAX_QUEUES];   // the last submission on each Vulkan queue that recorded a gate wait
+uint64_t vka_rp_queue_last(int q) { return q >= 0 && q < NVN_DIRECT_MAX_QUEUES ? g_qtail[q] : 0; }
+int vka_rp_queue_gated(int q) { return q >= 0 && q < NVN_DIRECT_MAX_QUEUES && g_qgate[q] && !vka_wait_fence(g_qgate[q], 0); }
+int vka_rp_wait_fence(uint64_t fence) {
+    int q; VkSemaphore sm; uint64_t v;
+    if (!fence || vka_wait_fence(fence, 0)) return 1;
+    if (!g_cb || !vka_fence_queue(fence, &q, &sm, &v)) return 0;
+    if (q != g_qi) psy_wait(sm, v);   // (on this queue, queue order puts it first)
+    return 1;
 }
 static void psy_signal(VkSemaphore s, uint64_t v) {
     for (uint32_t i = 0; i < g_psy.ns; i++) if (g_psy.ss[i] == s) { if (g_psy.sv[i] < v) g_psy.sv[i] = v; return; }
@@ -1046,6 +1066,7 @@ static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   
     evsem_wrote(e, v, g_qi, t);
     evtr('S', e, v, t);
     vka_rp_end();
+    vka_mem_mirror_release(g_cb);   // (Lichii: what this queue wrote, published or marked before a waiter may read it)
     if (s) psy_signal(s, t);
     for (int i = 0; i < e->ng; i++) { evgate *g = &e->g[i];
         if (!g->pending || !gate_met(g, v)) continue;
@@ -1057,32 +1078,48 @@ static void evsem_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {   
         g->pending = 0; g->wn = 0; }
     if (!chunk()) VRED_ONCE("an event signal in a submission of more than %d parts: made at its end", NCHUNK);
 }
+// Lichii: a wait the GPU needs no semaphore for (met already, or let through) is still a point where the queue may observe work from elsewhere: its pool mirrors
+// acquire there (vka_mem.c "Mirrors"); the pass ends for it only when the queue owns mirrors
+static void mirror_acquire_now(void) { if (g_cb && vka_mem_mirror_owned()) { vka_rp_end(); vka_mem_mirror_acquire(g_cb); } }
 static void evsem_wait(const p_wait_event *w) {   // a wait walked here: met on this queue already, or the part ends and the next waits
     evsem *e = evsem_of(w->val); if (!e || !g_cb) return;
     int eq = w->mode == NVN_EVENT_WAIT_MODE_EQUAL;
     if (!w->value && !eq) return;   // (at least 0: met)
     int k = 0; while (k < e->nw && !(eq ? e->w[k].v == w->value : e->w[k].v >= w->value)) k++;
     evgate *g = k < e->nw ? NULL : gate_of(e, w->value, eq);
-    if (k == e->nw && !g) return;   // (let through: gate_of said why)
+    if (k == e->nw && !g) { mirror_acquire_now(); return; }   // (let through: gate_of said why)
     VkSemaphore s = g ? g->sem : e->w[k].q >= 0 ? e->qs[e->w[k].q] : VK_NULL_HANDLE;
     uint64_t t = g ? (g->pending = ++g->val) : e->w[k].t;
     if (g && g_qn >= 0 && g_qn < 32) g->wn |= 1u << g_qn;
-    if (!t || !s || (!g && e->w[k].q == g_qi)) { evtr('w', e, w->value, t); return; }   // reached already, or signalled earlier on this queue: queue order
+    if (g) g_qgate[g_qi] = g_cur_fence ? g_cur_fence : vka_fence_last() + 1;   // (Lichii: vka_rp_queue_gated)
+    if (!t || !s || (!g && e->w[k].q == g_qi)) {   // reached already, or signalled earlier on this queue: queue order
+        evtr('w', e, w->value, t);
+        if (g || e->w[k].q != g_qi) mirror_acquire_now();   // (Lichii: what the signaller wrote, into this queue's mirrors: an acquire all the same)
+        return;
+    }
     evtr(g ? 'G' : 'W', e, w->value, t);
     vka_rp_end();
     if (!chunk()) VRED_ONCE("an event wait in a submission of more than %d parts: the whole part waits", NCHUNK);
     psy_wait(s, t);
+    vka_mem_mirror_acquire(g_cb);   // (Lichii: what the signaller (another queue, or the CPU) wrote, into this queue's mirrors once the wait is met)
 }
 // Lichii: CommandBufferWaitSync. The sync's fence is read as the command runs; a submission on another Vulkan queue that has not completed is waited
 // for from here on: the part ends and the next one waits for that queue's timeline value (as vka_rp_sub_wait for QueueWaitSync). One queue, or other NVN queues sharing
 // this one: queue order already puts the fence's submission first
 static void wait_sync(uint64_t fence) {
     int q; VkSemaphore sm; uint64_t v;
-    if (!g_cb || !V.multi || g_qshared >> g_qi & 1 || vka_wait_fence(fence, 0) || !vka_fence_queue(fence, &q, &sm, &v) || q == g_qi) return;
+    if (!g_cb) return;
+    const int known = V.multi && vka_fence_queue(fence, &q, &sm, &v);
+    if (!V.multi || g_qshared >> g_qi & 1 || vka_wait_fence(fence, 0) || !known || q == g_qi) {
+        if (!known || q != g_qi) mirror_acquire_now();   // (Lichii: met already or let through: the acquire all the same)
+        return;
+    }
     vka_rp_end();
     if (!chunk()) VRED_ONCE("a sync wait in a submission of more than %d parts: the whole part waits", NCHUNK);
-    for (uint32_t i = 0; i < g_psy.nw; i++) if (g_psy.ws[i] == sm) { if (g_psy.wv[i] < v) g_psy.wv[i] = v; return; }
-    if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = sm; g_psy.wv[g_psy.nw++] = v; } else VRED_ONCE("more than %d waits in one part", PWS);
+    int k = 0; while (k < (int)g_psy.nw && g_psy.ws[k] != sm) k++;
+    if (k < (int)g_psy.nw) { if (g_psy.wv[k] < v) g_psy.wv[k] = v; }
+    else if (g_psy.nw < PWS) { g_psy.ws[g_psy.nw] = sm; g_psy.wv[g_psy.nw++] = v; } else VRED_ONCE("more than %d waits in one part", PWS);
+    vka_mem_mirror_acquire(g_cb);   // (Lichii: what the fence's submission wrote, into this queue's mirrors once the wait is met)
 }
 // Lichii: debug groups and markers as VK_EXT_debug_utils labels (V.label_begin: a debugging tool or renderer debug). Groups are kept balanced in each
 // of the replay's command buffers: a pop with none open there is dropped, and the ones still open when it ends are closed (labels_close)

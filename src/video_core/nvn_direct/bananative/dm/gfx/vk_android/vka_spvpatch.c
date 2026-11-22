@@ -511,3 +511,30 @@ int vka_spv_set_remap(uint32_t *w, size_t nw, uint32_t from, uint32_t to) {
     }
     return n;
 }
+
+// Lichii: whether module w (nw words) makes an atomic on a storage buffer (vka_shader.c: such a shader's written storage buffers get device-local mirrors, vka_mem.c
+// "Mirrors"): an OpAtomic* whose pointer is of a StorageBuffer, PhysicalStorageBuffer or Uniform (BufferBlock) pointer type, through the variables, access chains and
+// function parameters that carry it. Atomics on shared memory or images do not count
+int vka_spv_storage_atomics(const uint32_t *w, size_t nw) {
+    enum { OpFunctionParameter = 55, OpPtrAccessChain = 67, OpCopyObject = 83, OpAtomicLoad = 227, OpAtomicStore = 228, OpAtomicXor = 242, OpAtomicFMinEXT = 5614,
+           OpAtomicFMaxEXT = 5615, OpAtomicFAddEXT = 6035, SCUniform = 2, SCStorageBuffer = 12, SCPhysicalStorageBuffer = 5349 };
+    if (nw < 5 || w[0] != 0x07230203) return 0;
+    const uint32_t bound = w[3];
+    uint32_t *sc = calloc(bound ? bound : 1, sizeof *sc), *ty = calloc(bound ? bound : 1, sizeof *ty);   // sc[pointer type] = 1 + storage class; ty[id] = its type
+    int found = 0;
+    if (!sc || !ty) { free(sc); free(ty); return 0; }
+    for (size_t i = 5; i < nw && !found;) {
+        const uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) break;
+        if (op == OpTypePointer && len >= 3 && w[i + 1] < bound) sc[w[i + 1]] = w[i + 2] + 1;
+        else if ((op == OpVariable || op == OpAccessChain || op == OpInBoundsAccessChain || op == OpPtrAccessChain || op == OpFunctionParameter || op == OpCopyObject ||
+                  op == OpLoad || op == OpBitcast) && len >= 3 && w[i + 2] < bound) ty[w[i + 2]] = w[i + 1];
+        else if ((op >= OpAtomicLoad && op <= OpAtomicXor) || op == OpAtomicFMinEXT || op == OpAtomicFMaxEXT || op == OpAtomicFAddEXT) {
+            const uint32_t p = op == OpAtomicStore ? (len >= 2 ? w[i + 1] : 0) : (len >= 4 ? w[i + 3] : 0), t = p < bound ? ty[p] : 0, c = t < bound ? sc[t] : 0;
+            found = c == SCStorageBuffer + 1 || c == SCPhysicalStorageBuffer + 1 || c == SCUniform + 1;
+        }
+        i += len;
+    }
+    free(sc); free(ty);
+    return found;
+}

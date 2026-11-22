@@ -931,6 +931,7 @@ static void ev_signal(const ev_t *e, int mode, uint32_t v) {
     volatile uint32_t *w = (volatile uint32_t *)nvn_direct_writable((uint64_t)(uintptr_t)e->val);   // Lichii: through the backing memory (nvn_tracking.c)
     uint32_t r = mode == NVN_EVENT_SIGNAL_MODE_ADD ? *w + v : v; *w = r;
 #if defined(__ANDROID__)
+    { void vka_mem_host_wrote(uint64_t addr, uint64_t n); vka_mem_host_wrote((uint64_t)(uintptr_t)e->val, 4); }   // (Lichii: a pool mirror's page, vka_mem.c "Mirrors")
     // (the replay's own order of signals and waits, vka_exec.c OP_WAIT_EVENT). Lichii: as the value written, which the replay's event caches take as is (an ADD they
     // would add again to the memory they seed from, which holds it already)
     mtl_event_cpu(e->val, NVN_EVENT_SIGNAL_MODE_WRITE, r);

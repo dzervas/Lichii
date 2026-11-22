@@ -398,6 +398,19 @@ if (TARGET nvn_direct AND NOT WIN32)
         ${NVN_DIRECT_DIR})
     set_target_properties(nvn_bind_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
     add_test(NAME nvn_bind_tests COMMAND nvn_bind_tests)
+
+    add_executable(nvn_spvpatch_tests
+        video_core/nvn_spvpatch.c
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android/vka_spvpatch.c)
+    target_include_directories(nvn_spvpatch_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android)
+    set_target_properties(nvn_spvpatch_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    add_test(NAME nvn_spvpatch_tests COMMAND nvn_spvpatch_tests)
+
+    add_executable(nvn_mirror_model_tests video_core/nvn_mirror_model.c)
+    target_include_directories(nvn_mirror_model_tests PRIVATE ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android)
+    set_target_properties(nvn_mirror_model_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    add_test(NAME nvn_mirror_model_tests COMMAND nvn_mirror_model_tests)
 endif()
 
 if ((HAS_NCE AND LINUX) OR HAS_HYPERVISOR)

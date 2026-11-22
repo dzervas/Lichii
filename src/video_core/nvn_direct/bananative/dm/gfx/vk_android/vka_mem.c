@@ -22,6 +22,7 @@
 #include "../nvn/nvn_mtl.h"
 #include "../nvn/nvn_dirty.h"
 #include "vka_place.h"
+#include "vka_mirror_spv.h"   // (Lichii: Mirrors)
 #include "../../host/dm.h"
 #include "nvn_direct_front.h"
 #include "../../../../nvn_direct.h"
@@ -41,16 +42,45 @@
 #include <unistd.h>
 #include <time.h>
 
-struct pack;
-typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs; VkDeviceSize boff; void *view; int import; struct pack *pack; } seg_t;   // boff: where lo is in buf (0, but for a virtual pool's alias: mtl_pool_alias, and a packed import); view: Lichii's import view (import_seg; NULL for a udmabuf); import: Lichii's import of guest memory; pack: the udmabuf pack it lies in (Packs below)
+struct pack; struct vkm;
+typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs; VkDeviceSize boff; void *view; int import; struct pack *pack; struct vkm *mir; VkDeviceSize moff; } seg_t;   // boff: where lo is in buf (0, but for a virtual pool's alias: mtl_pool_alias, and a packed import); view: Lichii's import view (import_seg; NULL for a udmabuf); import: Lichii's import of guest memory; pack: the udmabuf pack it lies in (Packs below); mir: its device-local mirror, or a virtual pool alias's physical segment's at moff (Mirrors below)
 // Lichii: the table is keyed by the game's addresses (nvn_direct_guest_of), not by the host pointers the front end passes: GPU addresses the game wrote into its own data
 // (shader-loaded pointers through raw global memory's table, c0's storage table) are guest addresses, and look the same memory up without a translation. Every entry
 // point takes either and keys it (key); a virtual pool's own range (outside the arena) keeps its host address
 static inline uintptr_t key(uintptr_t a) { return (uintptr_t)nvn_direct_guest_of(a); }
+// Lichii: a segment's device-local mirror (Mirrors below). The lookups answer with it on the thread that records a submission of its owning Vulkan queue (t_mq), with
+// the import elsewhere
+enum { MS_WANT, MS_ON, MS_DRAIN, MS_OFF };
+typedef struct { uint64_t lo, hi; } mrange;   // bytes from the segment's start
+typedef struct vkm {
+    uintptr_t lo, hi;              // the segment's guest range
+    _Atomic int state; int q;      // MS_*; q: the owning Vulkan queue (the one whose binding asked for it)
+    _Atomic int contested;         // MS_WANT: another queue touched the segment (it is never made)
+    uint64_t born;                 // MS_WANT: g_nsub when it was asked for (DM_VK_MIRROR_LEARN)
+    uint64_t drain; int proven;    // MS_DRAIN: the owner's last submission when another queue touched it; whether the toucher's parts could wait for it (mir_touch)
+    _Atomic uint32_t unproven;     // MS_DRAIN: touches by another queue that could not wait for the owner (the documented race)
+    VkBuffer buf; VkDeviceMemory mem; VkDeviceAddress bda;   // the mirror, then its shadow (as many bytes again)
+    uint32_t pg, npg;              // its pages' slots in the page table (mir_acquire)
+    void *watch;                   // the CPU write tracker's handle on its page states (nvn_dirty_watch)
+    mrange *wr; int nwr, capwr, all;      // what the owner's submission being recorded wrote into it since its last release point (all: anywhere): published at the next
+    uint64_t vat; int vq, gone; _Atomic int vskip;   // DM_VK_MIRROR_VERIFY: where its next check starts; vq: 1 + the queue of the check in flight; vskip: another queue
+                                                     // touched it meanwhile; gone: the segment went during the check, which frees the record
+} vkm;
+static __thread int t_mq = -1;     // the Vulkan queue of the submission this thread records (vka_mem_sub_begin to vka_mem_sub_end)
+static _Atomic int g_mir_on;       // mirrors in use (MS_ON or MS_DRAIN)
+static void mir_touch(vkm *m);     // (Mirrors below)
+// The mirror the recording thread's queue uses for segment g (a lookup for a GPU access: another queue's is a touch, mir_touch)
+static inline const vkm *mir_use(const seg_t *g) {
+    vkm *m = g->mir;
+    if (t_mq < 0 || !m) return NULL;
+    if (m->q != t_mq) { mir_touch(m); return NULL; }
+    return atomic_load_explicit(&m->state, memory_order_relaxed) == MS_ON ? m : NULL;
+}
 static seg_t *g_sg; static int g_nsg, g_sgcap;   // sorted by lo, disjoint
 // Bumped (under g_rw for writing) whenever a segment comes or goes: the replay's per-thread lookup cache (vka_addr, vka_addr_run) holds while it stands
 static _Atomic uint64_t g_sg_gen = 1;
-uint64_t vka_mem_gen(void) { return atomic_load_explicit(&g_sg_gen, memory_order_acquire); }   // (vka_draw.c gmem_map: the table is kept while it stands)
+// (vka_draw.c gmem_map: the table is kept while it stands. Lichii: per Vulkan queue while mirrors are in use: vka_mem_chunks answers with them on their owner only)
+uint64_t vka_mem_gen(void) { return atomic_load_explicit(&g_sg_gen, memory_order_acquire) * 32 + (atomic_load_explicit(&g_mir_on, memory_order_relaxed) ? (uint64_t)(t_mq + 1) : 0); }
 static pthread_rwlock_t g_rw = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_mutex_t g_pl = PTHREAD_MUTEX_INITIALIZER;   // table changes and placements, one at a time (see Locks above)
 static int lock_whole(void) { static int v = -1; if (v < 0) { v = VKA_ENV("DM_VK_MEM_LOCK_WHOLE", 0) != 0; if (v) VLOG("DM_VK_MEM_LOCK_WHOLE=1: placements hold the segment table's write lock (lookups wait for them)"); } return v; }
@@ -695,7 +725,7 @@ static VkDeviceSize g_pack_dead, g_pack_dead_round; static int g_npack; static u
 static VkDeviceSize pack_seg_max(void) { return V.udmabuf_max / 4; }
 static int pack_loose(const pack_t *p) { return p->size < V.udmabuf_max / 2 || p->live * 2 < p->size; }   // (caller holds g_packmu)
 static int pack_cand(const seg_t *s) {   // (caller holds g_packmu)
-    return s->mem && s->import && s->hi - s->lo <= pack_seg_max() && (!s->pack || pack_loose(s->pack));
+    return s->mem && s->import && !s->mir && s->hi - s->lo <= pack_seg_max() && (!s->pack || pack_loose(s->pack));   // (Lichii: a mirror's page table holds its import's device address)
 }
 // A segment of n bytes leaves pack p; 1 = it was the last: p is out of the counts, for pack_free. Caller holds g_packmu
 static int pack_leave(pack_t *p, VkDeviceSize n) {
@@ -798,8 +828,10 @@ static void pack_maybe(void) {
              (unsigned long long)rounds, packed, nsolo, made, bytes / 1048576.0, (mono_ns() - t0) / 1e6, np, dead / 1048576.0, nimp);
 }
 #endif
+static void mir_gone(struct vkm *m);   // (Mirrors below)
 static void unplace(const seg_t *sp) {
     seg_t s = *sp; size_t n = s.hi - s.lo;
+    if (s.mir) mir_gone(s.mir);   // (Lichii)
     uint64_t fence = vka_fence_last();
     // Lichii: an import keeps the guest's pages where they are (its view is a mapping of its own), so it is freed once the GPU is past the fence, without
     // the caller waiting: with the NVN queues as Vulkan queues the last fence may be a queue's submission that waits for an event the game signals only after it gave the
@@ -1002,7 +1034,9 @@ int vka_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off, VkDe
     addr = key((uintptr_t)addr);
     seg_t tmp; const seg_t *g = lookup((uintptr_t)addr, &tmp);
     int ok = g && addr + len <= g->hi;
-    if (ok) { if (buf) *buf = g->buf; if (off) *off = addr - g->lo + g->boff; if (bda) *bda = g->bda ? g->bda + (addr - g->lo) : 0; }
+    const vkm *m = ok && (buf || bda) ? mir_use(g) : NULL;   // (a check without them is not a GPU access)
+    if (m) { if (buf) *buf = m->buf; if (off) *off = addr - g->lo + g->moff; if (bda) *bda = m->bda + g->moff + (addr - g->lo); }
+    else if (ok) { if (buf) *buf = g->buf; if (off) *off = addr - g->lo + g->boff; if (bda) *bda = g->bda ? g->bda + (addr - g->lo) : 0; }
     return ok;
 }
 
@@ -1019,7 +1053,8 @@ void vka_mem_describe(uint64_t addr, char *out, size_t n) {
 uint64_t vka_addr_run(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     addr = key((uintptr_t)addr);
     seg_t tmp; const seg_t *g = lookup((uintptr_t)addr, &tmp); uint64_t n = 0;
-    if (g) { n = g->hi - addr; if (n > len) n = len; *buf = g->buf; *off = addr - g->lo + g->boff; }
+    const vkm *m = g ? mir_use(g) : NULL;
+    if (g) { n = g->hi - addr; if (n > len) n = len; *buf = m ? m->buf : g->buf; *off = addr - g->lo + (m ? g->moff : g->boff); }
     return n;
 }
 
@@ -1035,7 +1070,7 @@ static void alias_cut(uintptr_t lo, uintptr_t hi) {   // caller holds g_pl and g
         if (s.mem || s.hi <= lo || s.lo >= hi) continue;   // (only aliases have no memory of their own)
         memmove(&g_sg[i], &g_sg[i + 1], (size_t)(g_nsg - i - 1) * sizeof *g_sg); g_nsg--; atomic_fetch_add(&g_sg_gen, 1);
         if (s.lo < lo) { seg_t a = s; a.hi = lo; sg_insert(&a); }
-        if (s.hi > hi) { seg_t b = s; b.boff += hi - s.lo; if (b.bda) b.bda += hi - s.lo; b.lo = hi; sg_insert(&b); }
+        if (s.hi > hi) { seg_t b = s; b.boff += hi - s.lo; b.moff += hi - s.lo; if (b.bda) b.bda += hi - s.lo; b.lo = hi; sg_insert(&b); }
         i = -1;   // (the table moved)
     }
 }
@@ -1056,7 +1091,7 @@ void mtl_pool_alias(const void *va, uint64_t n, const void *phys) {
         int k = sg_find(p);
         if (k < 0 || !g_sg[k].mem || p >= g_sg[k].hi) { ok = 0; break; }
         uintptr_t q = g_sg[k].hi < e ? g_sg[k].hi : e; VkDeviceSize o = p - g_sg[k].lo;
-        seg_t a = {v, v + (q - p), VK_NULL_HANDLE, g_sg[k].buf, g_sg[k].bda ? g_sg[k].bda + o : 0, 0, g_sg[k].boff + o, NULL};
+        seg_t a = {v, v + (q - p), VK_NULL_HANDLE, g_sg[k].buf, g_sg[k].bda ? g_sg[k].bda + o : 0, 0, g_sg[k].boff + o, NULL, .mir = g_sg[k].mir, .moff = o};   // (Lichii: the physical segment's mirror at o, Mirrors)
         sg_insert(&a); v += q - p; p = q;
     }
     pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
@@ -1068,10 +1103,472 @@ void mtl_pool_alias(const void *va, uint64_t n, const void *phys) {
 // The placed segments in address order (raw global memory's table, vka_draw.c gmem_map): at most max, the count returned
 int vka_mem_chunks(uint64_t *lo, uint64_t *hi, uint64_t *bda, int max) {
     pthread_rwlock_rdlock(&g_rw);
-    int n = 0; for (int i = 0; i < g_nsg && n < max; i++) if (g_sg[i].bda) { lo[n] = g_sg[i].lo; hi[n] = g_sg[i].hi; bda[n] = g_sg[i].bda; n++; }
+    int n = 0; for (int i = 0; i < g_nsg && n < max; i++) if (g_sg[i].bda) { const vkm *m = mir_use(&g_sg[i]); lo[n] = g_sg[i].lo; hi[n] = g_sg[i].hi; bda[n] = m ? m->bda + g_sg[i].moff : g_sg[i].bda; n++; }
     if (n == max && n < g_nsg) VRED_ONCE("more than %d placed segments: raw global memory sees the first %d", max, max);
     pthread_rwlock_unlock(&g_rw);
     return n;
+}
+
+// ---------- Mirrors (Lichii) ----------
+// Pools are guest memory imported in system RAM (import_seg), so on a discrete GPU every access to them crosses the bus. Streamed reads and writes cost little, but each
+// atomic a shader makes on a storage buffer there is a round trip (float adds are compare-and-swap loops: f32_add_cas). Ocarina of Time's opening (RTX 5080, PCIe 4 x16,
+// DM_VK_GPUPROF) spent ~27 of its ~40 ms of GPU time a frame in ~100 compute dispatches, single ones 3-10 ms, whose written buffers were 0x40-0x5b40 bytes in segments of
+// 8-24 KiB. So a segment that a shader with storage buffer atomics (vka_spv_storage_atomics) writes through a storage binding of at most DM_VK_MIRROR_BIND_KB (1024)
+// gets a device-local copy, its mirror (after dkb-pc-recomp's VRAM mirror of buffer-bound pools, runtime/vk_memory.c "VRAM mirror"). Segments of at most
+// DM_VK_MIRROR_SEG_MB (64), DM_VK_MIRROR_MB (512) of mirrors in all, made while the device's use leaves 256 MiB of its budget; each takes twice its segment in device
+// memory (the shadow below). Mirroring every small written buffer cost more than it saved (Mario Kart World's intro: 385 mirrors, 58 -> 44 fps).
+//
+// The protocol: a mirror has one owner, the Vulkan queue whose binding asked for it (vkm.q), and only that queue may touch the segment. Only the owner's submissions use
+// it: on the recording thread (t_mq) the lookups for GPU accesses (vka_addr with a buffer or address asked for, vka_addr_run, raw global memory's table, virtual pool
+// aliases at their offset: moff) answer with the mirror for the owner. So every access to the mirror and its shadow, the guest's and the copies', runs on the owner's
+// queue in its order, and no other queue's work ever meets the segment's guest memory while a mirror holds it:
+// - Single queue: from the first request (mir_want) the segment is watched for DM_VK_MIRROR_LEARN (600) submissions (about 10 s in Ocarina of Time, where every
+//   segment touched by two queues was seen within it); a GPU access of another queue meanwhile (a lookup, a write, raw global stores or raw global memory's table)
+//   marks it contested, and it is never made. Atomics of two queues on one word cannot meet two
+//   copies of it, and nothing but the CPU writes the guest memory under a mirror, so no marks between queues are needed.
+// - A touch of another queue after that (mir_touch) stops the mirror (MS_DRAIN): the owner's later submissions use guest memory, and the toucher's parts wait for the
+//   owner's last submission (whose releases publish what it wrote) when that submission and those before it on the owner's queue wait for nothing recorded later (no
+//   gate: vka_rp_queue_gated), so the wait cannot be met only by work recorded after it. When they do, the toucher goes on without the wait: a documented race (logged
+//   and counted, "unproven"), bounded to the owner's submissions in flight. Either way the mirror goes for the rest of the run once those are done.
+// - Release: at each point where the owner's work becomes visible elsewhere, an event signal (before the part ends with its semaphore signal), the submission's end
+//   (before its fence, which every CPU read of GPU results follows: fence waits, event values the completion thread writes) and a cooperative-vector conversion (before
+//   the CPU reads), the owner publishes what it wrote since its last release (mir_release: the bytes of the mirror that differ from the shadow, over the hull of every
+//   range it wrote or bound for writing, the whole mirror after raw global stores), so mirror == shadow after every release.
+// - Acquire: at each point where the owner may observe what the CPU wrote, the submission's start (after the waits of its first part: QueueWaitSync), after each event
+//   wait and command buffer sync wait (those met already or let through included: vka_exec.c mirror_acquire_now) and after a cooperative-vector conversion, the owner
+//   copies in (mir_acquire, one pass over its pages) the pages the CPU write tracker shows written (nvn_dirty_watch: not armed, or its count moved since the owner last
+//   looked): the bytes of guest memory that differ from the shadow go into the mirror and the shadow. A CPU write ordered before the acquire by the guest is in guest
+//   memory before it, and a write the owner made before such a CPU write was published at the release that ordered them, so the shadow holds it and an ordered CPU
+//   write of any value, the old one too, differs from the shadow when it differs from the mirror.
+// - CPU and host writers of guest memory and who tells the owner: the CPU through the arena (the tracker's faults); the completion thread's event values and counter
+//   reports (nvn_direct_writable: vka_mem_host_wrote stamps the pages), the front end's in-place command records (nvn_direct_host_written: never armed, so always
+//   copied), CPU event signals (hle_nvn.c ev_signal: vka_mem_host_wrote), host writes before texture readbacks and the cooperative-vector conversion
+//   (dm_guest_write_prepare stamps); counter reports the replay writes as it records (vka_exec.c rc_counter) also go into the mirror in GPU order (vka_mem_mirror_put).
+//   Every GPU write into pool memory is a replay op of some queue (buffer copies, fills, inline updates, texture -> buffer copies, linear textures' copy-back, storage
+//   stores: vka_mem_gpu_wrote, raw global stores: vka_mem_gpu_wrote_any): the owner's go to the mirror and are published, another queue's are touches. The host's own
+//   queue (present, readbacks) writes no pool memory.
+// - Bytes: both copies move the changed bytes of a word, publish merging them into guest memory with a compare-and-swap (the CPU may have written the word's other bytes).
+// - Made only when the GPU has done every submission recorded so far (vka_done() reached the last one committed), so nothing recorded against the import still writes it:
+//   the import is copied into the mirror and then the mirror into the shadow (one snapshot) in an upload batch, which every submission handed to any queue after it waits
+//   for (vka_dev.c). Imports with a mirror are never repacked (pack_cand): the page table holds their device addresses.
+// - NVN queues that share a Vulkan queue (vka_exec.c queue_of) share its mirrors: queue order serializes them, and their release / acquire points are on that timeline.
+// - DM_VK_MIRROR=0 keeps every segment imported (the default on a GPU that is not discrete: an integrated one reads system memory as its own; also without device
+//   addresses or upload batches); DM_VK_MIRROR_VERIFY=1 checks published ranges and idle submission ends (mir_verify). The model test
+//   (src/tests/video_core/nvn_mirror_model.c) replays the reviews' interleavings through the copy rules (vka_mirror_words.h, which the shaders implement).
+// Open: the same bytes written without guest synchronization by the CPU and the owner keep one of the values, as on the console. A touch that cannot wait (above). CPU
+// writes after a submission is recorded reach the owner's GPU after a CPU-signalled event's wait by the visibility the import path already relies on for them (a host
+// semaphore signal after host-coherent writes). Ocarina of Time's hottest segment (0x222dc36000: its two queues' atomics hit disjoint words of one shared binding,
+// bead lichii-25x.122) is contested and stays imported.
+static pthread_mutex_t g_mmu = PTHREAD_MUTEX_INITIALIZER;   // the list and the mirrors' fields (lock order: g_mmu, g_pl, g_rw); state and buf change on the recording thread
+static vkm **g_mir; static _Atomic int g_nmir; static int g_capmir;   // (g_nmir changes under g_mmu; read without it to skip the work when there is none)
+static uint64_t g_mir_bytes, g_ms_pub, g_ms_t, g_mv_bad, g_mv_pages, g_mv_n, g_mv_skip, g_ms_wait, g_ms_acq;   // (under g_mmu) since the last line
+static int g_ms_made, g_ms_contested, g_ms_drained;
+static _Atomic uint32_t g_qowned[NVN_DIRECT_MAX_QUEUES];   // mirrors in use by owner (changed under g_mmu)
+static uint64_t g_nsub;             // submissions begun (recording thread)
+static uint64_t g_commit_last;      // the fence of the last submission committed (vka_mem_sub_end; recording thread)
+static __thread uint64_t t_stamp;   // nvn_dirty_now() at the start of the submission this thread records (mir_verify)
+enum { MV_BYTES = 4 << 20 };   // DM_VK_MIRROR_VERIFY: the most of a mirror one check copies (mir_verify)
+static struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; _Atomic int busy; int failed; } g_mv;
+static struct { VkPipeline back, in; VkPipelineLayout lay; } g_mpipe;
+// The page table of mir_acquire, a slot a mirrored page: in host-visible memory the slot's device addresses (mirror, shadow and import page), its owner, and the
+// tracker's state word (nvn_dirty_watch); in device memory the owner's seen count. Slots go back to the free list once the GPU is done with their mirror
+typedef struct { VkDeviceAddress mir, shadow, src; uint32_t queue, pad; } mpage;
+static struct { VkBuffer hbuf, sbuf; VkDeviceMemory hmem, smem; VkDeviceAddress hbda, sbda; uint8_t *hptr; uint32_t cap, hw; mrange *free; int nfree, capfree; int failed; } g_pt;
+static mpage *pt_page(uint32_t i) { return (mpage *)(void *)g_pt.hptr + i; }
+static _Atomic uint32_t *pt_state(uint32_t i) { return (_Atomic uint32_t *)(void *)(g_pt.hptr + (size_t)g_pt.cap * sizeof(mpage)) + i; }
+static VkDeviceSize pt_seen(uint32_t i) { return (VkDeviceSize)i * 4; }   // (byte offsets in sbuf)
+static VkResult mir_buffer(VkDeviceSize n, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid, VkBuffer *b, VkDeviceMemory *m, VkDeviceAddress *bda, void **map) {
+    VkMemoryRequirements mr; VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY; *m = VK_NULL_HANDLE;
+    if (!(*b = seg_buffer(n, NULL))) return r;
+    vk.vkGetBufferMemoryRequirements(V.dev, *b, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, want, avoid);
+    if (t == UINT32_MAX) t = vka_mem_type(mr.memoryTypeBits, want, 0);
+    VkMemoryAllocateFlagsInfo af = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &af, .allocationSize = mr.size, .memoryTypeIndex = t};
+    if (t != UINT32_MAX && !(r = vk.vkAllocateMemory(V.dev, &ai, NULL, m)) && !(r = vk.vkBindBufferMemory(V.dev, *b, *m, 0)) && map) r = vk.vkMapMemory(V.dev, *m, 0, VK_WHOLE_SIZE, 0, map);
+    if (r) { if (*m) vk.vkFreeMemory(V.dev, *m, NULL); vk.vkDestroyBuffer(V.dev, *b, NULL); *b = VK_NULL_HANDLE; *m = VK_NULL_HANDLE; return r; }
+    VkBufferDeviceAddressInfo bi = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = *b}; *bda = vk.vkGetBufferDeviceAddress(V.dev, &bi);
+    return VK_SUCCESS;
+}
+static int mir_pipelines(void) {
+    VkPushConstantRange pc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &pc};
+    VkResult r = vk.vkCreatePipelineLayout(V.dev, &li, NULL, &g_mpipe.lay);
+    for (int k = 0; k < 2 && !r; k++) {
+        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = k ? sizeof vka_mirror_in_comp : sizeof vka_mirror_back_comp, .pCode = k ? vka_mirror_in_comp : vka_mirror_back_comp};
+        VkShaderModule mod = VK_NULL_HANDLE;
+        if ((r = vk.vkCreateShaderModule(V.dev, &mi, NULL, &mod))) break;
+        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main"},
+                                          .layout = g_mpipe.lay};
+        r = vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, k ? &g_mpipe.in : &g_mpipe.back);
+        vk.vkDestroyShaderModule(V.dev, mod, NULL);
+    }
+    if (r) VRED("pool mirrors: no copy pipelines (%d): off", r);
+    return !r;
+}
+static int g_mir_mode = -1;
+static int mir_mode(void) {
+    int v = g_mir_mode;
+    if (v < 0) {
+        const int discrete = V.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && V.host_import;
+        v = VKA_ENV("DM_VK_MIRROR", discrete) != 0;
+        if (v && (!V.bda || !vka_up_on())) { v = 0; VLOG("pool mirrors: off: they need device addresses and upload batches"); }
+        else {
+            if (v) v = mir_pipelines();
+            VLOG("pool mirrors: %s (%s GPU, DM_VK_MIRROR): segments that one Vulkan queue's shaders write with atomics through small storage buffers %s", v ? "on" : "off",
+                 discrete ? "a discrete" : "not a discrete", v ? "get device-local copies for that queue" : "stay in system memory");
+        }
+        g_mir_mode = v;
+    }
+    return v;
+}
+static uint64_t mir_seg_max(void) { return (uint64_t)VKA_ENV("DM_VK_MIRROR_SEG_MB", 64) << 20; }
+static uint64_t mir_bind_max(void) { return (uint64_t)VKA_ENV("DM_VK_MIRROR_BIND_KB", 1024) << 10; }
+static uint64_t mir_max(void) { return (uint64_t)VKA_ENV("DM_VK_MIRROR_MB", 512) << 20; }
+static uint64_t mir_learn(void) { return (uint64_t)VKA_ENV("DM_VK_MIRROR_LEARN", 600); }
+static int fence_done(uint64_t f) { return vka_done() >= f || vka_wait_fence(f, 0); }
+// n page slots (caller holds g_mmu); UINT32_MAX: none. The table is made at the first, for DM_VK_MIRROR_MB of mirrors
+static uint32_t pt_take(uint32_t n) {
+    if (!g_pt.hbuf && !g_pt.failed) {
+        uint64_t cap = mir_max() >> 12; if (cap > (1u << 24)) cap = 1u << 24;
+        void *p = NULL;
+        VkResult r = mir_buffer(cap * (sizeof(mpage) + 4), VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, &g_pt.hbuf, &g_pt.hmem, &g_pt.hbda, &p);
+        if (!r) r = mir_buffer(cap * 4, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &g_pt.sbuf, &g_pt.smem, &g_pt.sbda, NULL);
+        if (r) { g_pt.failed = 1; VRED("pool mirrors: no page table (%d): none are made", r); return UINT32_MAX; }
+        g_pt.hptr = p; g_pt.cap = (uint32_t)cap; memset(p, 0, cap * (sizeof(mpage) + 4));
+    }
+    if (g_pt.failed) return UINT32_MAX;
+    for (int i = 0; i < g_pt.nfree; i++) if (g_pt.free[i].hi - g_pt.free[i].lo >= n) { uint32_t s = (uint32_t)g_pt.free[i].lo; g_pt.free[i].lo += n; if (g_pt.free[i].lo == g_pt.free[i].hi) g_pt.free[i] = g_pt.free[--g_pt.nfree]; return s; }
+    if (g_pt.hw + n > g_pt.cap) return UINT32_MAX;
+    g_pt.hw += n; return g_pt.hw - n;
+}
+typedef struct { VkBuffer buf; VkDeviceMemory mem; vkm *m; uint32_t pg, npg; } mir_free_t;
+static void mir_free_run(void *arg) {
+    mir_free_t *f = arg;
+    if (!vka_hung()) { if (f->buf) vk.vkDestroyBuffer(V.dev, f->buf, NULL); if (f->mem) vk.vkFreeMemory(V.dev, f->mem, NULL); }
+    if (f->npg) {   // (its slots' states are 0 since nvn_dirty_unwatch)
+        pthread_mutex_lock(&g_mmu);
+        if (g_pt.nfree == g_pt.capfree) { g_pt.capfree = g_pt.capfree ? 2 * g_pt.capfree : 16; g_pt.free = realloc(g_pt.free, (size_t)g_pt.capfree * sizeof *g_pt.free); }
+        g_pt.free[g_pt.nfree++] = (mrange){f->pg, (uint64_t)f->pg + f->npg};
+        pthread_mutex_unlock(&g_mmu);
+    }
+    if (f->m) { free(f->m->wr); free(f->m); }
+    free(f);
+}
+static void mir_free_after(VkBuffer buf, VkDeviceMemory mem, vkm *m, uint32_t pg, uint32_t npg) {   // once the GPU is past every submission reserved so far, and the one being recorded
+    mir_free_t *f = malloc(sizeof *f); *f = (mir_free_t){buf, mem, m, pg, npg};
+    vka_after(vka_fence_last() + 1, mir_free_run, f);
+}
+static int mir_import(const vkm *m, VkBuffer *b, VkDeviceSize *o, VkDeviceAddress *bda) {   // where the import of m's segment is; 0: the segment went
+    pthread_rwlock_rdlock(&g_rw);
+    int k = sg_find(m->lo), ok = k >= 0 && g_sg[k].lo == m->lo && g_sg[k].mir == m && (!bda || g_sg[k].bda);
+    if (ok) { *b = g_sg[k].buf; *o = g_sg[k].boff; if (bda) *bda = g_sg[k].bda; }
+    pthread_rwlock_unlock(&g_rw);
+    return ok;
+}
+// The mirror's page states stop; its memory and slots (and record: rec) go once the GPU is past the submissions that use it (buf stays readable meanwhile: the recording
+// thread may have read the state just before). Caller holds g_mmu; m is MS_ON or MS_DRAIN
+static void mir_drop(vkm *m, vkm *rec) {
+    g_mir_bytes -= m->hi - m->lo; atomic_fetch_sub(&g_mir_on, 1); atomic_fetch_sub(&g_qowned[m->q], 1);
+    nvn_dirty_unwatch(m->watch, pt_state(m->pg));
+    for (uint32_t i = 0; i < m->npg; i++) atomic_store(pt_state(m->pg + i), 0);
+    atomic_store(&m->state, MS_OFF); atomic_fetch_add(&g_sg_gen, 1);
+    mir_free_after(m->buf, m->mem, rec, m->pg, m->npg);
+}
+// unplace: the segment goes (any thread), its aliases with it (alias_drop_buf)
+static void mir_gone(vkm *m) {
+    pthread_mutex_lock(&g_mmu);
+    for (int i = 0; i < g_nmir; i++) if (g_mir[i] == m) { g_mir[i] = g_mir[g_nmir - 1]; atomic_fetch_sub(&g_nmir, 1); break; }
+    m->gone = m->vq != 0;
+    const int st = atomic_load(&m->state);
+    if (st == MS_ON || st == MS_DRAIN) mir_drop(m, m->gone ? NULL : m);
+    else { atomic_store(&m->state, MS_OFF); if (!m->gone) mir_free_after(VK_NULL_HANDLE, VK_NULL_HANDLE, m, 0, 0); }
+    pthread_mutex_unlock(&g_mmu);
+}
+// A GPU access of the recording thread's queue (not the owner) to m's segment (recording thread; from the lookups, so no lock: g_rw may be held). Before the mirror is
+// made: it never will be. After: it stops (MS_DRAIN), and this part waits for the owner's submissions when that is proven safe (Mirrors above)
+static void mir_touch(vkm *m) {
+    int st = atomic_load(&m->state);
+    if (st == MS_WANT) { atomic_store(&m->contested, 1); return; }
+    if (st == MS_ON) {
+        m->drain = vka_rp_queue_last(m->q); m->proven = !vka_rp_queue_gated(m->q);
+        atomic_store(&m->state, MS_DRAIN); atomic_fetch_add(&g_sg_gen, 1);
+        st = MS_DRAIN;
+    }
+    if (st != MS_DRAIN) return;
+    atomic_store(&m->vskip, 1);
+    if (!m->proven || !vka_rp_wait_fence(m->drain)) atomic_fetch_add(&m->unproven, 1);
+}
+static void mir_refuse(vkm *m, const char *why) {   // (caller holds g_mmu) it stays imported for good
+    atomic_store(&m->state, MS_OFF);
+    static int nl; if (nl++ < 16) VLOG("pool mirror of %#lx+%#lx: stays imported: %s", (unsigned long)m->lo, (unsigned long)(m->hi - m->lo), why);
+}
+// A small storage binding of a shader with storage atomics writes into the segment at lo in the recording submission: a mirror owned by its queue, made after the learning
+// window unless another queue touches the segment meanwhile (caller holds g_mmu)
+static void mir_want(uintptr_t lo) {
+    vkm *m = calloc(1, sizeof *m); if (!m) return;
+    pthread_rwlock_wrlock(&g_rw);
+    int k = sg_find(lo);
+    if (k < 0 || g_sg[k].lo != lo || g_sg[k].mir) { pthread_rwlock_unlock(&g_rw); free(m); return; }
+    m->lo = lo; m->hi = g_sg[k].hi; m->q = t_mq; m->state = MS_WANT; m->born = g_nsub;
+    g_sg[k].mir = m; atomic_fetch_add(&g_sg_gen, 1);
+    pthread_rwlock_unlock(&g_rw);
+    if (g_nmir == g_capmir) { g_capmir = g_capmir ? 2 * g_capmir : 64; g_mir = realloc(g_mir, (size_t)g_capmir * sizeof *g_mir); }
+    g_mir[g_nmir] = m; atomic_fetch_add(&g_nmir, 1);
+}
+// [lo, hi) of the segment (bytes from its start), written by the recording submission (caller holds g_mmu): by its owner into the mirror (published at its next release),
+// by another queue a touch. The ranges stay disjoint; past 64 of them, one range over all. (Writes before the mirror is made need nothing: it is made once they are done)
+static void mir_wrote(vkm *m, uint64_t lo, uint64_t hi) {
+    if (m->q != t_mq) { mir_touch(m); return; }
+    if (atomic_load(&m->state) != MS_ON || m->all) return;
+    for (int i = 0; i < m->nwr; i++) if (lo <= m->wr[i].hi && hi >= m->wr[i].lo) {
+        if (m->wr[i].lo < lo) lo = m->wr[i].lo;
+        if (m->wr[i].hi > hi) hi = m->wr[i].hi;
+        m->wr[i--] = m->wr[--m->nwr];
+    }
+    if (m->nwr == 64) { for (int i = 0; i < m->nwr; i++) { if (m->wr[i].lo < lo) lo = m->wr[i].lo; if (m->wr[i].hi > hi) hi = m->wr[i].hi; } m->nwr = 0; }
+    if (m->nwr == m->capwr) { m->capwr = m->capwr ? 2 * m->capwr : 8; m->wr = realloc(m->wr, (size_t)m->capwr * sizeof *m->wr); }
+    m->wr[m->nwr++] = (mrange){lo, hi};
+}
+void vka_mem_gpu_wrote(uint64_t addr, uint64_t n, int bound) {
+    if (!n || t_mq < 0 || !mir_mode()) return;
+    for (uintptr_t a = key((uintptr_t)addr), e = a + n; a < e;) {
+        seg_t tmp; const seg_t *g = lookup(a, &tmp);
+        if (!g) return;
+        const uintptr_t lo = g->lo, b = e < g->hi ? e : g->hi;
+        if (g->mir || (bound && n <= mir_bind_max() && g->mem && g->hi - g->lo <= mir_seg_max())) {
+            pthread_mutex_lock(&g_mmu);
+            if (g->mir) mir_wrote(g->mir, a - lo + g->moff, b - lo + g->moff); else mir_want(lo);
+            pthread_mutex_unlock(&g_mmu);
+        }
+        a = b;
+    }
+}
+void vka_mem_gpu_wrote_any(void) {   // (raw global stores land anywhere: the owner's in its mirrors, another queue's touch every one)
+    if (!atomic_load(&g_nmir) || t_mq < 0) return;
+    pthread_mutex_lock(&g_mmu);
+    for (int i = 0; i < g_nmir; i++) { vkm *m = g_mir[i]; if (m->q != t_mq) mir_touch(m); else if (atomic_load(&m->state) == MS_ON) m->all = 1; }
+    pthread_mutex_unlock(&g_mmu);
+}
+void vka_mem_host_wrote(uint64_t addr, uint64_t n) {
+    if (!n || !atomic_load_explicit(&g_mir_on, memory_order_relaxed)) return;
+    const uintptr_t a = key((uintptr_t)addr); int hit = 0;
+    pthread_mutex_lock(&g_mmu);
+    for (int i = 0; i < g_nmir && !hit; i++) { const int st = atomic_load(&g_mir[i]->state); hit = (st == MS_ON || st == MS_DRAIN) && a < g_mir[i]->hi && a + n > g_mir[i]->lo; }
+    pthread_mutex_unlock(&g_mmu);
+    if (hit) dm_guest_write_prepare((void *)(uintptr_t)nvn_direct_host_of(a), n);
+}
+// Made at a submission's start (caller holds g_mmu). 0 = not now (the GPU has not done every submission recorded so far, a placement or packing round runs, the device
+// is near its budget, no upload batch) or not at all (then it stays imported)
+static int mir_make(vkm *m) {
+    const uint64_t n = m->hi - m->lo; uint64_t use, bud;
+    if (atomic_load(&m->contested)) { g_ms_contested++; mir_refuse(m, "another Vulkan queue touches the segment"); return 0; }
+    if (g_nsub - m->born < mir_learn()) return 0;
+    if (vka_done() < g_commit_last) return 0;
+    if (g_mir_bytes + n > mir_max()) { mir_refuse(m, "DM_VK_MIRROR_MB would be exceeded"); return 0; }
+    if (vka_mem_budget(&use, &bud) && use + 2 * n + (256ull << 20) > bud) return 0;
+    if (pthread_mutex_trylock(&g_pl)) return 0;   // (no packing round in between: pack_cand leaves segments with a mirror alone, and this one keeps its import while made)
+    VkBuffer ib; VkDeviceSize io; VkDeviceAddress ibda;
+    if (!mir_import(m, &ib, &io, &ibda)) { pthread_mutex_unlock(&g_pl); mir_refuse(m, "its import has no device address"); return 0; }
+    const uint32_t npg = (uint32_t)(n >> 12), pg = pt_take(npg);
+    if (pg == UINT32_MAX) { pthread_mutex_unlock(&g_pl); mir_refuse(m, "no page table slots"); return 0; }
+    VkResult r = mir_buffer(2 * n, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &m->buf, &m->mem, &m->bda, NULL);   // (the shadow after the mirror)
+    void *w = r ? NULL : nvn_dirty_watch((const void *)(uintptr_t)nvn_direct_host_of(m->lo), n, pt_state(pg));
+    VkCommandBuffer up = w ? vka_up_begin() : VK_NULL_HANDLE;
+    if (!up) {
+        pthread_mutex_unlock(&g_pl);
+        if (w) nvn_dirty_unwatch(w, pt_state(pg));
+        for (uint32_t i = 0; i < npg; i++) atomic_store(pt_state(pg + i), 0);
+        mir_free_after(m->buf, m->mem, NULL, pg, npg); m->buf = VK_NULL_HANDLE; m->mem = VK_NULL_HANDLE;
+        if (r) { static int nr; if (nr++ < 4) VRED("pool mirror of %#lx+%#lx: no device memory (%d): it stays imported", (unsigned long)m->lo, (unsigned long)n, r); }
+        if (r || !w) mir_refuse(m, r ? "no device memory" : "its pages are not in a tracked pool");
+        return 0;
+    }
+    for (uint32_t i = 0; i < npg; i++) *pt_page(pg + i) = (mpage){m->bda + ((uint64_t)i << 12), m->bda + n + ((uint64_t)i << 12), ibda + ((uint64_t)i << 12), (uint32_t)m->q, 0};
+    VkBufferCopy c = {io, 0, n};
+    vk.vkCmdCopyBuffer(up, ib, m->buf, 1, &c);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+    vk.vkCmdPipelineBarrier(up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    VkBufferCopy cs = {0, n, n};
+    vk.vkCmdCopyBuffer(up, m->buf, m->buf, 1, &cs);   // (the shadow from the mirror: one snapshot of guest memory; the CPU's writes after it are the tracker's)
+    vk.vkCmdFillBuffer(up, g_pt.sbuf, pt_seen(pg), (VkDeviceSize)npg * 4, 0);   // (the states' counts start at 1: the first acquire looks at every page once)
+    vka_up_end();
+    m->watch = w; m->pg = pg; m->npg = npg; atomic_store(&m->state, MS_ON); g_mir_bytes += n; g_ms_made++; atomic_fetch_add(&g_qowned[m->q], 1);
+    pthread_rwlock_wrlock(&g_rw);   // virtual pool aliases made before over the segment: its mirror at their offset
+    for (int i = 0; i < g_nsg; i++) if (!g_sg[i].mem && g_sg[i].buf == ib && g_sg[i].boff >= io && g_sg[i].boff < io + n) { g_sg[i].mir = m; g_sg[i].moff = g_sg[i].boff - io; }
+    atomic_fetch_add(&g_sg_gen, 1);
+    pthread_rwlock_unlock(&g_rw);
+    pthread_mutex_unlock(&g_pl);
+    atomic_fetch_add(&g_mir_on, 1);
+    static int nl; if (nl++ < 16 || !(nl & (nl - 1))) VLOG("pool mirror of %#lx+%#lx in device-local memory for Vulkan queue %d (%d made, %.1f MiB of mirrors in use)",
+                                                           (unsigned long)m->lo, (unsigned long)n, m->q, nl, g_mir_bytes / 1048576.0);
+    vka_mem_grew(2 * n);
+    return 1;
+}
+// Acquire: queue q's mirrors take what the CPU wrote into their guest memory (mirror_in.comp; caller holds g_mmu, cb outside a pass, barriers around it)
+static void mir_acquire(VkCommandBuffer cb, int q) {
+    if (!atomic_load(&g_qowned[q]) || !g_pt.hw) return;
+    const uint32_t gx = g_pt.hw < 65535 ? g_pt.hw : 65535, gy = (g_pt.hw + gx - 1) / gx;
+    struct { VkDeviceAddress pages, state, seen; uint32_t n, queue; } pc = {g_pt.hbda, g_pt.hbda + (VkDeviceAddress)g_pt.cap * sizeof(mpage), g_pt.sbda + pt_seen(0), g_pt.hw, (uint32_t)q};
+    vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_mpipe.in);
+    vk.vkCmdPushConstants(cb, g_mpipe.lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vk.vkCmdDispatch(cb, gx, gy, 1);
+    g_ms_acq++;
+}
+static void mir_verify(VkCommandBuffer cb, uint64_t fence, vkm *only, uint64_t lo, uint64_t hi);
+// Release: what the owner's submission being recorded wrote since its last release, published (mirror_back.comp over each mirror's written hull). Caller holds g_mmu;
+// cb outside a pass
+static void mir_release(VkCommandBuffer cb, uint64_t fence) {
+    int any = 0, verify = VKA_ENV("DM_VK_MIRROR_VERIFY", 0) && !atomic_load(&g_mv.busy);
+    vkm *vm = NULL; uint64_t vlo = 0, vhi = 0;
+    for (int i = 0; i < g_nmir; i++) {
+        vkm *m = g_mir[i];
+        if (m->q != t_mq || (!m->nwr && !m->all)) continue;   // (an MS_DRAIN mirror's writes were published by the submissions that made them)
+        uint64_t lo = m->all ? 0 : UINT64_MAX, hi = m->all ? m->hi - m->lo : 0;
+        for (int j = 0; j < m->nwr; j++) { if (m->wr[j].lo < lo) lo = m->wr[j].lo; if (m->wr[j].hi > hi) hi = m->wr[j].hi; }
+        m->nwr = m->all = 0;
+        if (hi > m->hi - m->lo) hi = m->hi - m->lo;
+        if (!any) vka_barrier(cb);   // (the writes before the pass)
+        any = 1;
+        VkBuffer ib; VkDeviceSize io; VkDeviceAddress ibda; if (!mir_import(m, &ib, &io, &ibda)) continue;
+        lo &= ~(uint64_t)3; hi = (hi + 3) & ~(uint64_t)3;
+        const uint64_t words = (hi - lo) / 4, groups = (words + 63) / 64;
+        if (!words) continue;
+        const uint32_t gx = groups < 65535 ? (uint32_t)groups : 65535, gy = (uint32_t)((groups + gx - 1) / gx);
+        struct { VkDeviceAddress mir, shadow, dst; uint32_t n, pad; } pc = {m->bda + lo, m->bda + (m->hi - m->lo) + lo, ibda + lo, (uint32_t)words, 0};
+        vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_mpipe.back);
+        vk.vkCmdPushConstants(cb, g_mpipe.lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vk.vkCmdDispatch(cb, gx, gy, 1);
+        g_ms_pub += hi - lo;
+        if (verify && !vm) { vm = m; vlo = lo; vhi = hi; }
+    }
+    if (any) vka_barrier(cb);   // (the pass's reads of the mirrors before later writes into them, its writes before the signal)
+    if (vm) mir_verify(cb, fence, vm, vlo, vhi);
+}
+void vka_mem_sub_begin(VkCommandBuffer cb, int q) {
+    t_mq = q; t_stamp = nvn_dirty_now(); g_nsub++;
+    if (!atomic_load(&g_nmir)) return;
+    pthread_mutex_lock(&g_mmu);
+    for (int i = 0; i < g_nmir; i++) {
+        vkm *m = g_mir[i]; const int st = atomic_load(&m->state);
+        if (st == MS_WANT) { if (!mir_make(m)) g_ms_wait++; }
+        else if (st == MS_ON && m->q == q) nvn_dirty_rearm(m->watch, pt_state(m->pg));   // (a write from now on moves the page's count: the acquire, recorded after)
+        else if (st == MS_DRAIN && fence_done(m->drain)) {   // the owner's submissions from before the touch are done: gone for the rest of the run
+            static int nl; if (nl++ < 16) VLOG("pool mirror of %#lx+%#lx (Vulkan queue %d): another queue touched it, back to guest memory%s (%u touches could not wait for the owner)",
+                                               (unsigned long)m->lo, (unsigned long)(m->hi - m->lo), m->q, m->proven ? " after a wait for the owner" : "", atomic_load(&m->unproven));
+            if (atomic_load(&m->unproven)) { static _Atomic int nr; if (atomic_fetch_add(&nr, 1) < 8) VRED("pool mirror of %#lx+%#lx: %u touches of another queue ran beside the owner's work in flight (a gate on its queue: no wait could be proven)", (unsigned long)m->lo, (unsigned long)(m->hi - m->lo), atomic_load(&m->unproven)); }
+            mir_drop(m, NULL); g_ms_drained++;
+        }
+    }
+    mir_acquire(cb, q);
+    const uint64_t now = mono_ns();
+    if (!g_ms_t) g_ms_t = now;
+    if (now - g_ms_t >= 10000000000ull) {
+        int on = 0, want = 0; for (int i = 0; i < g_nmir; i++) { const int st = atomic_load(&g_mir[i]->state); on += st == MS_ON || st == MS_DRAIN; want += st == MS_WANT; }
+        char vf[128] = ""; if (g_mv.buf) snprintf(vf, sizeof vf, "; verify: %llu checks (%llu dropped), %llu of %llu pages differ", (unsigned long long)g_mv_n, (unsigned long long)g_mv_skip,
+                                                 (unsigned long long)g_mv_bad, (unsigned long long)g_mv_pages);
+        char qs[96] = ""; size_t o = 0; for (int k = 0; k < NVN_DIRECT_MAX_QUEUES && o < sizeof qs; k++) if (atomic_load(&g_qowned[k])) o += (size_t)snprintf(qs + o, sizeof qs - o, "%s%u on queue %d", o ? ", " : "", atomic_load(&g_qowned[k]), k);
+        VLOG("pool mirrors: %d in device-local memory (%.1f MiB and as much for their shadows; %s), %d to be made or learning, %d stay imported; in %.0f s: %d made, %d refused "
+             "as touched by two queues, %d back to guest memory after a touch, %llu acquires, %.1f MiB published%s", on, g_mir_bytes / 1048576.0, qs, want, g_nmir - on - want,
+             (now - g_ms_t) / 1e9, g_ms_made, g_ms_contested, g_ms_drained, (unsigned long long)g_ms_acq, g_ms_pub / 1048576.0, vf);
+        g_ms_t = now; g_ms_pub = g_ms_wait = g_ms_acq = 0; g_ms_made = g_ms_contested = g_ms_drained = 0; g_mv_bad = g_mv_pages = g_mv_n = g_mv_skip = 0;
+    }
+    pthread_mutex_unlock(&g_mmu);
+}
+// The release before an event signal (vka_exec.c evsem_signal: the part ends with the signal) and the acquire after a wait (evsem_wait, wait_sync: the part that
+// begins with the wait); cb outside a pass
+void vka_mem_mirror_release(VkCommandBuffer cb) {
+    if (!atomic_load(&g_mir_on) || t_mq < 0) return;
+    pthread_mutex_lock(&g_mmu); mir_release(cb, vka_fence_last() + 1); pthread_mutex_unlock(&g_mmu);
+}
+void vka_mem_mirror_acquire(VkCommandBuffer cb) {
+    if (!atomic_load(&g_mir_on) || t_mq < 0) return;
+    pthread_mutex_lock(&g_mmu);
+    if (atomic_load(&g_qowned[t_mq])) { vka_barrier(cb); mir_acquire(cb, t_mq); vka_barrier(cb); }
+    pthread_mutex_unlock(&g_mmu);
+}
+int vka_mem_mirror_owned(void) { return t_mq >= 0 && atomic_load(&g_mir_on) && atomic_load(&g_qowned[t_mq]); }
+int vka_mem_mirrored_here(uint64_t addr, uint64_t n) {
+    if (t_mq < 0 || !atomic_load(&g_mir_on)) return 0;
+    const uintptr_t a = key((uintptr_t)addr); seg_t tmp; const seg_t *g = lookup(a, &tmp);
+    return g && a + n <= g->hi && g->mir && g->mir->q == t_mq && atomic_load(&g->mir->state) == MS_ON;
+}
+void vka_mem_mirror_put(VkCommandBuffer cb, uint64_t addr, const void *data, uint32_t n) {   // (mirror and shadow both: guest memory holds the bytes already)
+    const uintptr_t a = key((uintptr_t)addr); seg_t tmp; const seg_t *g = lookup(a, &tmp);
+    if (!g || !g->mir || g->mir->q != t_mq || atomic_load(&g->mir->state) != MS_ON || (n & 3) || ((a - g->lo + g->moff) & 3)) return;
+    const vkm *m = g->mir; const VkDeviceSize off = a - g->lo + g->moff;
+    vka_barrier(cb);
+    vk.vkCmdUpdateBuffer(cb, m->buf, off, n, data); vk.vkCmdUpdateBuffer(cb, m->buf, (m->hi - m->lo) + off, n, data);
+    vka_barrier(cb);
+}
+// DM_VK_MIRROR_VERIFY=1: up to MV_BYTES of a mirror and of its import, copied side by side into host memory on the owner's queue and compared once the submission is done:
+// right after a publish (only), over what it published, and at the end of a submission that every earlier submission is done before (one the replay did not run ahead
+// of). They must match but for the pages the CPU wrote since the submission began (t_stamp). A check during which another queue touched the segment is dropped (vskip).
+// One check in flight at a time
+typedef struct { vkm *m; uint64_t off, n, stamp; } mv_job;
+static void mir_verify_done(void *arg) {
+    mv_job *j = arg; uint64_t bad = 0, pages = 0, first = UINT64_MAX;
+    pthread_mutex_lock(&g_mmu);
+    const int skip = atomic_load(&j->m->vskip) || atomic_load(&j->m->state) != MS_ON; const uintptr_t lo = j->m->lo;
+    j->m->vq = 0; atomic_store(&j->m->vskip, 0);
+    if (j->m->gone) mir_free_after(VK_NULL_HANDLE, VK_NULL_HANDLE, j->m, 0, 0);   // (after what is being recorded now, as mir_gone would have)
+    pthread_mutex_unlock(&g_mmu);
+    const uint8_t *host = (const uint8_t *)(uintptr_t)nvn_direct_host_of(lo + j->off);
+    for (uint64_t p = 0; p < j->n && !skip; p += 4096) {
+        const uint64_t k = j->n - p < 4096 ? j->n - p : 4096;
+        if (nvn_dirty_since(host + p, k, j->stamp)) continue;
+        pages++;
+        if (memcmp(g_mv.ptr + p, g_mv.ptr + MV_BYTES + p, k)) { bad++; if (first == UINT64_MAX) first = p; }
+    }
+    if (bad) {   // (the first word that differs, and how many words of its page do)
+        uint64_t w = first, nw = 0; while (w + 4 <= j->n && !memcmp(g_mv.ptr + w, g_mv.ptr + MV_BYTES + w, 4)) w += 4;
+        for (uint64_t x = first; x + 4 <= j->n && x < first + 4096; x += 4) nw += memcmp(g_mv.ptr + x, g_mv.ptr + MV_BYTES + x, 4) != 0;
+        static _Atomic int nr; uint32_t mw = 0, gw = 0; memcpy(&mw, g_mv.ptr + w, 4); memcpy(&gw, g_mv.ptr + MV_BYTES + w, 4);
+        if (atomic_fetch_add(&nr, 1) < 32) VRED("pool mirror verify: %#lx+%#llx: %llu of %llu pages differ from the import (the first word at %#lx: mirror %08x, import %08x; %llu words of its page differ)",
+                                              (unsigned long)(lo + j->off), (unsigned long long)j->n, (unsigned long long)bad, (unsigned long long)pages, (unsigned long)(lo + j->off + w), mw, gw, (unsigned long long)nw);
+    }
+    pthread_mutex_lock(&g_mmu); g_mv_bad += bad; g_mv_pages += pages; g_mv_n += !skip; g_mv_skip += skip; pthread_mutex_unlock(&g_mmu);
+    atomic_store(&g_mv.busy, 0);
+    free(j);
+}
+// The check of [lo, hi) of only (a publish), or of the next mirror of the recording queue in turn (only NULL: an idle submission end). Caller holds g_mmu
+static void mir_verify(VkCommandBuffer cb, uint64_t fence, vkm *only, uint64_t lo, uint64_t hi) {
+    if (atomic_load(&g_mv.busy) || g_mv.failed || (!only && vka_done() + 1 < fence)) return;
+    if (!g_mv.buf) {
+        VkDeviceAddress unused; void *p = NULL;
+        VkResult r = mir_buffer(2 * MV_BYTES, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0, &g_mv.buf, &g_mv.mem, &unused, &p);
+        if (r) { g_mv.failed = 1; VRED("pool mirror verify: no host memory to compare in (%d): off", r); return; }
+        g_mv.ptr = p;
+        VLOG("pool mirror verify: on (DM_VK_MIRROR_VERIFY): what each publish published, and up to %d MiB of a mirror at idle submission ends, compared with guest memory", MV_BYTES >> 20);
+    }
+    static int rr;
+    vkm *m = only;
+    for (int i = 0; !m && i < g_nmir; i++) {
+        vkm *c = g_mir[(rr + i) % g_nmir];
+        if (atomic_load(&c->state) == MS_ON && c->q == t_mq) { m = c; rr = (rr + i + 1) % g_nmir; }
+    }
+    if (!m) return;
+    VkBuffer ib; VkDeviceSize io; if (!mir_import(m, &ib, &io, NULL)) return;
+    const uint64_t size = m->hi - m->lo;
+    if (!only) { if (m->vat >= size) m->vat = 0; lo = m->vat; hi = size - lo < MV_BYTES ? size : lo + MV_BYTES; m->vat = hi; }
+    lo &= ~(uint64_t)4095; if (hi - lo > MV_BYTES) hi = lo + MV_BYTES;   // (whole pages from lo: the CPU's writes are told by page)
+    mv_job *j = malloc(sizeof *j); *j = (mv_job){m, lo, hi - lo, t_stamp};
+    m->vq = t_mq + 1; atomic_store(&m->vskip, 0);
+    VkBufferCopy cm = {j->off, 0, j->n}, ci = {io + j->off, MV_BYTES, j->n};
+    vka_barrier(cb);
+    vk.vkCmdCopyBuffer(cb, m->buf, g_mv.buf, 1, &cm); vk.vkCmdCopyBuffer(cb, ib, g_mv.buf, 1, &ci);
+    vka_barrier(cb);
+    atomic_store(&g_mv.busy, 1);
+    vka_after(fence, mir_verify_done, j);   // (the record outlives it: mir_gone leaves it to mir_verify_done)
+}
+void vka_mem_sub_end(VkCommandBuffer cb, uint64_t fence) {
+    g_commit_last = fence;
+    if (!atomic_load(&g_nmir) || t_mq < 0) { t_mq = -1; return; }
+    pthread_mutex_lock(&g_mmu);
+    mir_release(cb, fence);
+    if (VKA_ENV("DM_VK_MIRROR_VERIFY", 0)) mir_verify(cb, fence, NULL, 0, 0);
+    pthread_mutex_unlock(&g_mmu);
+    t_mq = -1;
 }
 
 // ---------- Pools ----------
@@ -1286,6 +1783,20 @@ void vka_mem_destroy(void) {
     }
     free(g_sg); g_sg = NULL; g_nsg = 0;
     pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
+    pthread_mutex_lock(&g_mmu);   // (Lichii: mirrors; those of segments that went were freed with the deferred work)
+    for (int i = 0; i < g_nmir; i++) { vkm *m = g_mir[i]; if (atomic_load(&m->state) == MS_ON || atomic_load(&m->state) == MS_DRAIN) { vk.vkDestroyBuffer(V.dev, m->buf, NULL); vk.vkFreeMemory(V.dev, m->mem, NULL); } free(m->wr); free(m); }
+    free(g_mir); g_mir = NULL; atomic_store(&g_nmir, 0); g_capmir = 0; g_mir_bytes = 0; atomic_store(&g_mir_on, 0); g_mir_mode = -1; g_commit_last = 0; for (int k = 0; k < NVN_DIRECT_MAX_QUEUES; k++) atomic_store(&g_qowned[k], 0); g_nsub = 0;
+    if (g_mpipe.back) vk.vkDestroyPipeline(V.dev, g_mpipe.back, NULL);
+    if (g_mpipe.in) vk.vkDestroyPipeline(V.dev, g_mpipe.in, NULL);
+    if (g_mpipe.lay) vk.vkDestroyPipelineLayout(V.dev, g_mpipe.lay, NULL);
+    memset(&g_mpipe, 0, sizeof g_mpipe);
+    if (g_pt.hbuf) { vk.vkDestroyBuffer(V.dev, g_pt.hbuf, NULL); vk.vkFreeMemory(V.dev, g_pt.hmem, NULL); }
+    if (g_pt.sbuf) { vk.vkDestroyBuffer(V.dev, g_pt.sbuf, NULL); vk.vkFreeMemory(V.dev, g_pt.smem, NULL); }
+    free(g_pt.free); memset(&g_pt, 0, sizeof g_pt);
+    if (g_mv.buf) vk.vkDestroyBuffer(V.dev, g_mv.buf, NULL);
+    if (g_mv.mem) vk.vkFreeMemory(V.dev, g_mv.mem, NULL);
+    memset(&g_mv, 0, sizeof g_mv);
+    pthread_mutex_unlock(&g_mmu);
     pthread_mutex_lock(&g_pmu);
     for (int i = 0; i < g_npool; i++) { free(g_pool[i].gmap); free(g_pool[i].segs.lo); }
     free(g_pool); g_pool = NULL; g_npool = 0;

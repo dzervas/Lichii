@@ -222,6 +222,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
         const dmsh_vk_module *m = why ? NULL : vka_shlib_module(L, e, DMSH_VK_MOD_BASE);
         if (!why && !m) why = "no base module";
         if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, &why, err, sizeof err);
+        if (!why) { size_t nb = 0; uint32_t *w = vka_shlib_spirv(L, m, &nb, err, sizeof err); s->sb_atomics = w && vka_spv_storage_atomics(w, nb / 4); free(w); }   // (Lichii)
         if (!why && e->stage == DMSH_VK_STAGE_GS && VKA_ENV("DM_VK_GS_CLAIM", 1)) {   // memory writes: made once per primitive (vka_spv_gs_claim)
             char e2[256] = ""; s->gs_fx = gs_words(s, NULL, NULL, e2, sizeof e2);
             if (s->gs_fx < 0) VRED("geometry shader %016llx: memory writes not put under a claim (%s): drawn as it is, its writes repeated by the device's runs of each primitive", (unsigned long long)key, e2);
