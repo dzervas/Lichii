@@ -145,8 +145,38 @@ static void test_partial_protection(void) {
     lenient = 0;
 }
 
+// A mirror's page states: every change of a watched page's arming counts, a page not armed (or past
+// the tracked range, or written in place by the front end) says so, and nothing moves once unwatched.
+static void test_mirror_watch(void) {
+    nvn_dirty_add_range(arena, 2 * PAGE + 16); // pages 0-2 tracked; page 3 is past the range
+    nvn_dirty_protect(arena, 2 * PAGE + 16);
+    _Atomic uint32_t st[4];
+    CHECK(!nvn_dirty_watch(arena + 8, 4 * PAGE, st));
+    CHECK(!nvn_dirty_watch(arena + 6 * PAGE, PAGE, st));
+    void* h = nvn_dirty_watch(arena, 4 * PAGE, st);
+    CHECK(h);
+    for (int i = 0; i < 3; i++) CHECK(st[i] == (NVN_DIRTY_ST_ACTIVE | 1));
+    CHECK(st[3] == (NVN_DIRTY_ST_ACTIVE | NVN_DIRTY_ST_UNARMED | 1));
+
+    nvn_direct_cpu_written(GUEST_BASE + PAGE + 4, 1); // a write disarms its page
+    CHECK(st[1] == (NVN_DIRTY_ST_ACTIVE | NVN_DIRTY_ST_UNARMED | 2) && st[0] == (NVN_DIRTY_ST_ACTIVE | 1));
+    nvn_dirty_rearm(h, st); // armed again: counted once more
+    CHECK(st[1] == (NVN_DIRTY_ST_ACTIVE | 3) && st[2] == (NVN_DIRTY_ST_ACTIVE | 1));
+
+    nvn_direct_host_written(arena, 8); // written in place: never armed again
+    CHECK(st[0] == (NVN_DIRTY_ST_ACTIVE | NVN_DIRTY_ST_UNARMED | 2));
+    nvn_dirty_rearm(h, st);
+    CHECK(st[0] & NVN_DIRTY_ST_UNARMED);
+
+    nvn_dirty_unwatch(h, st);
+    nvn_direct_cpu_written(GUEST_BASE + 2 * PAGE, 1);
+    CHECK(st[2] == (NVN_DIRTY_ST_ACTIVE | 1));
+    nvn_dirty_remove_range(arena);
+}
+
 int main(void) {
     test_failed_protection();
     test_partial_protection();
+    test_mirror_watch();
     nvn_tracking_destroy();
 }

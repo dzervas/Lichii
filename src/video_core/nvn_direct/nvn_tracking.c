@@ -40,7 +40,9 @@ typedef struct {
     uint8_t* armed;        // per page: Lichii tracks writes to it (under g_mu)
     uint8_t* host;         // per page: the front end writes it in place (nvn_direct_host_written): never armed
     _Atomic int live;
+    struct watch* w; int nw, capw; // Lichii: device-local mirrors' page states over it (nvn_dirty_watch; under g_mu)
 } span_t;
+struct watch { uintptr_t p0, n; _Atomic uint32_t* st; }; // pages [p0, p0 + n) of the span, their states from st
 
 static span_t** g_spans; // live spans by lo (under g_mu for changes, g_rw for lookups)
 static int g_nspans, g_capspans;
@@ -111,6 +113,7 @@ static void wlog_add(uintptr_t lo, uintptr_t hi);
 // GEN_UNPROT and are logged as written, so the textures over them are uploaded again at each
 // check, whose upload tries to arm them again. Once that works, pages still GEN_UNPROT count as
 // written now (one more upload) and are tracked from there.
+static void watch_note(span_t* s, uintptr_t p, uintptr_t q);
 static void track_result(span_t* s, uintptr_t p, uintptr_t q, int on, int done) {
     uint64_t g = 0;
     if (done) {
@@ -142,6 +145,7 @@ static void track_result(span_t* s, uintptr_t p, uintptr_t q, int on, int done) 
         wlog_add(s->lo + (p << PAGE_SHIFT), s->lo + (q << PAGE_SHIFT));
         atomic_store(&g_now, g);
     }
+    watch_note(s, p, q);
 }
 
 // Arms (on) or disarms the pages [p, q] of s that are not already so, in runs, each run's result
@@ -195,6 +199,7 @@ void nvn_tracking_destroy(void) {
             free(spans[i]->gen);
             free(spans[i]->armed);
             free(spans[i]->host);
+            free(spans[i]->w);
             free(spans[i]);
         }
         free(spans);
@@ -325,6 +330,56 @@ int nvn_dirty_bounds_since(const void* span, const void* addr, size_t len, uint6
     *lo = b0 > a ? b0 - a : 0;
     *hi = b1 - a < len ? b1 - a : len;
     return 1;
+}
+
+// Device-local mirrors (vka_mem.c "Mirrors") read a page's state on the GPU when they copy in what the CPU
+// wrote, after the replay recorded the copy: a page is copied while it is not armed (its writes may go
+// unseen) and whenever its count moved since the last copy. Every change of a watched page's arming
+// counts once (a write disarms it, an arming arms it), so a page armed again after writes the GPU had not
+// copied yet still counts as changed. States are written under g_mu.
+static void watch_note(span_t* s, uintptr_t p, uintptr_t q) {
+    for (int k = 0; k < s->nw; k++) {
+        const struct watch* w = &s->w[k];
+        const uintptr_t a = p > w->p0 ? p : w->p0, b = q < w->p0 + w->n ? q : w->p0 + w->n;
+        for (uintptr_t i = a; i < b; i++) {
+            const uint32_t old = atomic_load(&w->st[i - w->p0]);
+            atomic_store(&w->st[i - w->p0], NVN_DIRTY_ST_ACTIVE | (s->armed[i] ? 0 : NVN_DIRTY_ST_UNARMED) | ((old + 1) & NVN_DIRTY_ST_COUNT));
+        }
+    }
+}
+void* nvn_dirty_watch(const void* addr, size_t len, _Atomic uint32_t* st) {
+    const uintptr_t a = (uintptr_t)addr, pages = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    if (!len || a & (PAGE_SIZE - 1)) return NULL;
+    pthread_mutex_lock(&g_mu);
+    span_t* s = find(a, 1);
+    if (!s) { pthread_mutex_unlock(&g_mu); return NULL; }
+    const uintptr_t p0 = (a - s->lo) >> PAGE_SHIFT, tracked = ((s->hi - 1 - s->lo) >> PAGE_SHIFT) + 1;
+    const uintptr_t n = p0 + pages <= tracked ? pages : tracked - p0;
+    if (s->nw == s->capw) {
+        const int cap = s->capw ? 2 * s->capw : 4;
+        struct watch* w = realloc(s->w, (size_t)cap * sizeof *w);
+        if (!w) { pthread_mutex_unlock(&g_mu); return NULL; }
+        s->w = w;
+        s->capw = cap;
+    }
+    s->w[s->nw++] = (struct watch){p0, n, st};
+    for (uintptr_t i = 0; i < pages; i++) // pages past the tracked range are never armed
+        atomic_store(&st[i], NVN_DIRTY_ST_ACTIVE | (i < n && s->armed[p0 + i] ? 0 : NVN_DIRTY_ST_UNARMED) | 1);
+    pthread_mutex_unlock(&g_mu);
+    return s;
+}
+void nvn_dirty_rearm(void* h, _Atomic uint32_t* st) {
+    span_t* s = h;
+    pthread_mutex_lock(&g_mu);
+    for (int k = 0; k < s->nw; k++)
+        if (s->w[k].st == st && atomic_load(&s->live) && s->w[k].n) arm_pages(s, s->w[k].p0, s->w[k].p0 + s->w[k].n - 1, 1);
+    pthread_mutex_unlock(&g_mu);
+}
+void nvn_dirty_unwatch(void* h, _Atomic uint32_t* st) {
+    span_t* s = h;
+    pthread_mutex_lock(&g_mu);
+    for (int k = 0; k < s->nw; k++) if (s->w[k].st == st) s->w[k--] = s->w[--s->nw];
+    pthread_mutex_unlock(&g_mu);
 }
 
 // Upstream's placement swap held the tracker over a range it remapped; imports remap nothing.

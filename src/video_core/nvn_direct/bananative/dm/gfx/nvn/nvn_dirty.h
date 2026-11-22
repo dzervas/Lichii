@@ -24,4 +24,14 @@ void nvn_dirty_debug(const void *span, const void *addr, size_t len, uint64_t st
 // overflowed (the taker checks every image)
 typedef struct { uintptr_t lo, hi; } nvn_dirty_range;
 int nvn_dirty_take(nvn_dirty_range *out, int max);
+// Lichii: page states of a device-local mirror (vka_mem.c "Mirrors"), which the GPU reads to know what to copy in: from nvn_dirty_watch until nvn_dirty_unwatch the
+// tracker keeps st[i] for page i of [addr, addr + len) (addr page-aligned, in a tracked range): NVN_DIRTY_ST_ACTIVE, NVN_DIRTY_ST_UNARMED while a CPU write to the page
+// may go unseen (pages past the tracked range always), and a count that moves at each change of the page's arming. Returns a handle (NULL: not tracked) for
+// nvn_dirty_rearm (the watched pages armed again) and nvn_dirty_unwatch
+#define NVN_DIRTY_ST_UNARMED 0x80000000u
+#define NVN_DIRTY_ST_ACTIVE 0x40000000u
+#define NVN_DIRTY_ST_COUNT 0x3fffffffu
+void *nvn_dirty_watch(const void *addr, size_t len, _Atomic uint32_t *st);
+void nvn_dirty_rearm(void *h, _Atomic uint32_t *st);
+void nvn_dirty_unwatch(void *h, _Atomic uint32_t *st);
 void nvn_tracking_destroy(void);                                  // Lichii: the teardown frees every span (nvn_tracking.c)
