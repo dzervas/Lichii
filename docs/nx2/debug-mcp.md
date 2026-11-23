@@ -326,10 +326,12 @@ How the reads are safe:
 
 ### Input (implemented)
 
-**`input`** `{buttons?, left_stick?, right_stick?, frames, timeout_s?}` holds the buttons and
-sticks for `frames` presented frames and then releases them. It returns when they are done.
-**`input_sequence`** `{steps: [{buttons?, left_stick?, right_stick?, frames}, ...], timeout_s?}`
-runs the steps back to back, at most 1000 steps and 36000 frames per call. A step with no
+**`input`** `{buttons?, left_stick?, right_stick?, frames, timeout_s?, player?}` holds the
+buttons and sticks for `frames` presented frames and then releases them. It returns when they are
+done. **`input_sequence`** `{steps: [{buttons?, left_stick?, right_stick?, frames}, ...],
+timeout_s?, player?}` runs the steps back to back, at most 1000 steps and 36000 frames per call.
+`player` (1-8, default 1) picks the controller: games that need two players to start (Orbitals'
+Play Local) get the second one this way. A step with no
 buttons and no sticks injects nothing, so it works as a pause between moves.
 
 - **Buttons** are `A B X Y L R ZL ZR Plus Minus Up Down Left Right StickL StickR` (the
@@ -344,8 +346,8 @@ every update (`src/hid_core/resources/npad/npad.cpp:449`). Injected buttons are 
 owner's, and an injected stick replaces the owner's stick and its `StickL*` or `StickR*`
 direction bits (threshold half of full scale, like a real stick). It changes no mapping, profile
 or setting, so it works with whatever the owner has mapped and leaves nothing behind. The input
-goes to player 1, or to the handheld controller when player 1 is not connected; the result names
-which. When no injector is installed, each getter costs one atomic load.
+goes to player 1 (or `player`), or to the handheld controller when player 1 is not connected; the
+result names which. When no injector is installed, each getter costs one atomic load.
 
 Timing is by presents, not wall time. Switch 1 advances the counter when a newly acquired,
 visible game buffer is composed; overlay-only updates and cached-buffer repeats do not count.

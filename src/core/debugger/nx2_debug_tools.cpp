@@ -32,6 +32,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
+#include "hid_core/hid_util.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_trace/recorder.h"
@@ -678,9 +679,10 @@ json ReadGpuMemory(ToolState& state, const json& params) {
     return result;
 }
 
-/// Holds the steps on player 1 (or the handheld controller when player 1 is not connected) from
-/// the next present on, and returns once they are done. The injector stops by itself after the
-/// last step; leaving this function by any path removes it.
+/// Holds the steps on player 1 (or the handheld controller when player 1 is not connected), or on
+/// the player params' "player" (1-8) names, from the next present on, and returns once they are
+/// done. The injector stops by itself after the last step; leaving this function by any path
+/// removes it.
 json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json& params,
               const ClientGone& client_gone) {
     u64 total = 0;
@@ -692,14 +694,19 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
             fmt::format("{} frames in total; at most {} per call", total, MAX_INPUT_FRAMES)};
     }
     auto& hid = state.system.HIDCore();
-    HID::EmulatedController* controller = hid.GetEmulatedController(HID::NpadIdType::Player1);
-    std::string name = "player1";
-    if (!controller->IsConnected()) {
+    // Another player for games that need two to start (Orbitals' Play Local); player 1 by default
+    const int player = Param<int>(params, "player", 1, 1, 8);
+    HID::EmulatedController* controller = hid.GetEmulatedController(
+        ::Service::HID::IndexToNpadIdType(static_cast<size_t>(player - 1)));
+    std::string name = fmt::format("player{}", player);
+    if (!controller->IsConnected() && player == 1) {
         controller = hid.GetEmulatedController(HID::NpadIdType::Handheld);
         name = "handheld";
     }
     if (!controller->IsConnected()) {
-        throw std::runtime_error{"neither player 1 nor the handheld controller is connected"};
+        throw std::runtime_error{player == 1
+                                     ? "neither player 1 nor the handheld controller is connected"
+                                     : fmt::format("player {} is not connected", player)};
     }
     const int timeout = Param<int>(params, "timeout_s", static_cast<int>(total / 20 + 10), 1, 900);
     const u64 start = g_nx2_present_count.load(std::memory_order_relaxed) + 1;
@@ -744,6 +751,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
 json Input(ToolState& state, const json& params, const ClientGone& client_gone) {
     json step = params;
     step.erase("timeout_s");
+    step.erase("player");
     return RunInput(state, {ParseInputStep(step)}, params, client_gone);
 }
 

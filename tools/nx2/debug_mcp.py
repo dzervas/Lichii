@@ -224,7 +224,8 @@ TOOLS = [
     },
     {
         "name": "input",
-        "description": "Holds buttons and sticks on player 1 (or the handheld controller) for "
+        "description": "Holds buttons and sticks on player 1 (or the handheld controller), or "
+                       "on 'player' (1-8), for "
                        "'frames' presented frames from the next present on, then releases; returns "
                        "when done. Buttons are added to the owner's; a given stick replaces the "
                        "owner's. Fails and releases when frames stop (paused or loading) for "
@@ -237,7 +238,8 @@ TOOLS = [
                 "right_stick": STICK,
                 "frames": {"type": "integer", "minimum": 1, "maximum": 36000},
             },
-                           "timeout_s": {"type": "integer", "minimum": 1, "maximum": 900}},
+                           "timeout_s": {"type": "integer", "minimum": 1, "maximum": 900},
+                           "player": {"type": "integer", "minimum": 1, "maximum": 8}},
             "required": ["frames"],
         },
     },
@@ -259,6 +261,7 @@ TOOLS = [
             },
                                     "required": ["frames"]}},
                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": 900},
+                "player": {"type": "integer", "minimum": 1, "maximum": 8},
             },
             "required": ["steps"],
         },
