@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/resource.h>
 #include <errno.h>
+#include <limits.h>
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 // Suspend (mtl_drain, the app going to the background): the prewarm and optimizer threads stop between pipelines until the game submits again (vka_pso_pause(0) at the next
@@ -177,6 +178,7 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
 // DM_VK_PCACHE (restart): unset = $DM_TEMP/vk_pipelines[-<driver>].bin; a path = that file; 0 = no file (the run starts empty and keeps nothing: a cold run). Before 2026-11-03 "0"
 // was taken as a file named 0 in the working folder, so a second "cold" run read the first one's pipelines back (stutter-agent cold2gpl: 10 MB read, warm)
 static VkPipelineCache g_pc; static char g_pc_path[1024], g_pw_path[1100]; static uint64_t g_made, g_saved_at, g_save_ns; static double g_create_ms;
+static int g_pc_restored;
 static uint64_t g_ngfx, g_ncs, g_nfail, g_ncs_over, g_create_ns, g_frame_made;   // all pipelines made (frame path, background and prewarm); g_frame_made / g_create_ns: on the frame path only
 static uint64_t g_probe_hit, g_probe_miss, g_probe_miss_ns;          // GPL: the cache-only try before a link (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
 static _Atomic uint64_t g_save_ns_total, g_hy_draws, g_pw_wait_ns;
@@ -207,11 +209,12 @@ static void pc_open_once(void) {
         // The header names the device: a cache of another driver is dropped here (the driver would ignore it too)
         uint32_t hl, ver, vendor, devid; uint8_t uuid[VK_UUID_SIZE];
         if (n) { memcpy(&hl, data, 4); memcpy(&ver, (uint8_t *)data + 4, 4); memcpy(&vendor, (uint8_t *)data + 8, 4); memcpy(&devid, (uint8_t *)data + 12, 4); memcpy(uuid, (uint8_t *)data + 16, VK_UUID_SIZE);
-                 if (hl < 32 || ver != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || vendor != V.props.vendorID || devid != V.props.deviceID || memcmp(uuid, V.props.pipelineCacheUUID, VK_UUID_SIZE)) { VLOG("pipeline cache %s is another driver's: started empty", g_pc_path); n = 0; } }
+                 if (hl < 32 || hl > n || ver != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || vendor != V.props.vendorID || devid != V.props.deviceID || memcmp(uuid, V.props.pipelineCacheUUID, VK_UUID_SIZE)) { VLOG("pipeline cache %s is incompatible: started empty", g_pc_path); n = 0; } }
     }
     VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = n, .pInitialData = n ? data : NULL};
     VkResult r = vk.vkCreatePipelineCache(V.dev, &ci, NULL, &g_pc);
-    if (r && n) { ci.initialDataSize = 0; ci.pInitialData = NULL; r = vk.vkCreatePipelineCache(V.dev, &ci, NULL, &g_pc); }
+    g_pc_restored = r == VK_SUCCESS && n && g_pc;
+    if (r && n) { n = 0; ci.initialDataSize = 0; ci.pInitialData = NULL; r = vk.vkCreatePipelineCache(V.dev, &ci, NULL, &g_pc); }
     if (r) { g_pc = VK_NULL_HANDLE; VRED("vkCreatePipelineCache %d: pipelines are built without a cache", r); }
     else VLOG("pipeline cache %s: %zu bytes read", g_pc_path[0] ? g_pc_path : e && !strcmp(e, "0") ? "(none: DM_VK_PCACHE=0)" : "(not kept: no DM_TEMP or HOME)", n);
     free(data);
@@ -222,14 +225,17 @@ static void pc_open_once(void) {
 }
 static void pc_open(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pc_open_once); }
 void vka_pso_start(void) { vka_bindless_init(); pc_open(); }   // (Lichii, from vka_init: the layouts made ahead hold the bindless set, so it comes first)   // (the prewarm threads it starts call it too: they wait for it)
+int vka_pso_cache_ready(void) { return vka_ok() && !vka_stopping() && g_pc; }
+int nvn_direct_precache_cache_restored(void) { return vka_ok() && g_pc_restored; }
 // The cache and the prewarm list to their files. vkGetPipelineCacheData runs without g_mu (the cache is internally synchronized): holding it there kept the replay thread's
-// pipeline lookups waiting for a 17 MB copy once a minute
-static void save_now(void) {
+// pipeline lookups waiting for a 17 MB copy once a minute. Archive scratch pipelines don't increment g_made or write keys, so their save forces the driver cache only.
+static int save_now(int force_cache) {
     uint64_t t = now_ns();
     uint64_t made = __atomic_load_n(&g_made, __ATOMIC_RELAXED);
     const size_t spec = vka_rc_spec_pending();   // (before the copy: their libraries are in it)
     size_t n = 0; void *d = NULL;
-    if (g_pc && g_pc_path[0] && (made != g_saved_at || spec)) {
+    int saved = 0;
+    if (g_pc && g_pc_path[0] && (force_cache || made != g_saved_at || spec)) {
         // The cache grows between the size query and the copy while prewarm and optimizer threads add pipelines: the copy then answers VK_INCOMPLETE with a partial
         // blob. Tried up to 3 times with a quarter more room; only a complete copy (VK_SUCCESS) is written
         VkResult gr = VK_INCOMPLETE;
@@ -243,15 +249,23 @@ static void save_now(void) {
             char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", g_pc_path);
             FILE *f = fopen(tmp, "wb");
             int ok = f && fwrite(d, 1, n, f) == n; if (f && fclose(f)) ok = 0;   // (closed once, whatever failed)
-            if (ok && !rename(tmp, g_pc_path)) { g_saved_at = made; vka_rc_spec_commit(spec); }
+            if (ok && !rename(tmp, g_pc_path)) { saved = 1; g_saved_at = made; if (spec) vka_rc_spec_commit(spec); }
             else { unlink(tmp); static _Atomic int k; if (atomic_fetch_add(&k, 1) < 2) VRED("pipeline cache not written to %s", g_pc_path); free(d); d = NULL; n = 0; }
         }
     }
-    int keys = pw_save();
+    int keys = force_cache ? 0 : pw_save();
     uint64_t dt = now_ns() - t; atomic_fetch_add(&g_save_ns_total, dt);
-    if (d || keys > 0) VLOG("pipeline cache: %zu bytes written to %s (%llu pipelines made this run), prewarm list %d keys, %.0f ms (on the saver thread)", n, g_pc_path[0] ? g_pc_path : "(none)",
-                            (unsigned long long)made, keys, dt / 1e6);
+    if (saved || keys > 0) VLOG("pipeline cache: %zu bytes written to %s (%llu pipelines made this run), prewarm list %d keys, %.0f ms", n, g_pc_path[0] ? g_pc_path : "(none)",
+                                (unsigned long long)made, keys, dt / 1e6);
     free(d);
+    return saved;
+}
+int nvn_direct_save_precache(void) {
+    if (!vka_pso_cache_ready()) return 0;
+    pthread_mutex_lock(&g_save_mu);
+    const int saved = !g_pc_parked && save_now(1);
+    pthread_mutex_unlock(&g_save_mu);
+    return saved;
 }
 static void saver_wake(void) { pthread_mutex_lock(&g_sv_mu); pthread_cond_broadcast(&g_sv_cv); pthread_mutex_unlock(&g_sv_mu); }   // Lichii: the shutdown (vka_thread)
 static void *saver_main(void *a) {
@@ -259,7 +273,7 @@ static void *saver_main(void *a) {
     for (;;) {
         pthread_mutex_lock(&g_sv_mu); while (!g_sv_want && !vka_leaving()) pthread_cond_wait(&g_sv_cv, &g_sv_mu); g_sv_want = 0; pthread_mutex_unlock(&g_sv_mu);
         if (vka_leaving()) break;   // Lichii: the shutdown (after vka_pso_park's last save)
-        pthread_mutex_lock(&g_save_mu); if (!g_pc_parked) save_now(); pthread_mutex_unlock(&g_save_mu);
+        pthread_mutex_lock(&g_save_mu); if (!g_pc_parked) save_now(0); pthread_mutex_unlock(&g_save_mu);
     }
     return NULL;
 }
@@ -285,7 +299,7 @@ void vka_pso_save(int force) {
         if (g_sv_up) { pthread_mutex_lock(&g_sv_mu); g_sv_want = 1; pthread_cond_signal(&g_sv_cv); pthread_mutex_unlock(&g_sv_mu); return; }
     }
     g_save_ns = t;
-    pthread_mutex_lock(&g_save_mu); save_now(); pthread_mutex_unlock(&g_save_mu);
+    pthread_mutex_lock(&g_save_mu); save_now(0); pthread_mutex_unlock(&g_save_mu);
 }
 void vka_gpl_line(char *out, size_t n);
 void mtl_pso_line(char *out, size_t n) {
@@ -467,7 +481,7 @@ int vka_pso_park(uint64_t timeout_ns) {
         usleep(1000);
     }
     if (busy) vka_pso_wait_dump();
-    pthread_mutex_lock(&g_save_mu); if (g_pc && !g_pc_parked) save_now(); g_pc_parked = 1; pthread_mutex_unlock(&g_save_mu);
+    pthread_mutex_lock(&g_save_mu); if (g_pc && !g_pc_parked) save_now(0); g_pc_parked = 1; pthread_mutex_unlock(&g_save_mu);
     return !busy;
 }
 // The whole pipeline (optimized), with creation feedback (core in 1.3) for the line of a slow one: whether the pipeline cache had it and each stage's share. how: NULL = on the
@@ -825,7 +839,14 @@ static pthread_mutex_t g_pw_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *g_pw_buf; static size_t g_pw_len, g_pw_cap; static uint32_t g_pw_n; static int g_pw_dirty;   // every record (loaded, then new), under g_pw_mu
 static uint64_t *g_pw_set; static size_t g_pw_setcap, g_pw_setn;   // their hashes
 static uint8_t *g_pw_load; static size_t g_pw_load_len; static uint32_t g_pw_load_n;   // the loaded records, read by the prewarm threads (not changed after pw_load)
-static _Atomic uint32_t g_pw_next, g_pw_done, g_pw_made, g_pw_had, g_pw_bad; static int g_pw_threads; static uint64_t g_pw_t0;
+static _Atomic uint32_t g_pw_next, g_pw_done, g_pw_workers_done, g_pw_made, g_pw_had, g_pw_bad;
+static uint32_t g_pw_threads, g_pw_total; static uint64_t g_pw_t0;
+void nvn_direct_prewarm_progress(uint32_t *done, uint32_t *total) {
+    if (!vka_ok()) { *done = *total = 0; return; }
+    *total = g_pw_total;
+    // If the workers exited early (e.g. offset allocation failure), nothing remains to wait for.
+    *done = atomic_load(&g_pw_workers_done) == g_pw_threads ? *total : atomic_load(&g_pw_done);
+}
 static size_t pw_size(const pwrec *r) { return sizeof *r + ((r->klen + 7) & ~(size_t)7); }
 static int pw_set_add(uint64_t h) {   // 1 = new
     if (!h) h = 1;
@@ -953,14 +974,16 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
 static void *pw_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // this thread (Linux: per-thread nice), under the game's threads
-    uint32_t max = (uint32_t)VKA_ENV("DM_VK_PREWARM_MAX", 8192);
+    // Wait until pw_start knows how many threads actually started and has published the key limit.
+    pthread_mutex_lock(&g_pw_mu);
+    pthread_mutex_unlock(&g_pw_mu);
     size_t *offs = NULL;   // walked once by each thread to find the record of index i: built here (the list is small)
     uint32_t n = g_pw_load_n; offs = malloc((n ? n : 1) * sizeof *offs);
     if (offs) for (size_t o = 0, i = 0; i < n; i++) { offs[i] = o; pwrec r; memcpy(&r, g_pw_load + o, sizeof r); o += pw_size(&r); }
     for (;;) {
         if (pause_point()) break;
         uint32_t i = atomic_fetch_add(&g_pw_next, 1);
-        if (!offs || i >= n || i >= max) break;
+        if (!offs || i >= g_pw_total) break;
         vka_pipeline_notify(0);   // (Lichii: each key counts in its "building shaders")
         pwrec r; memcpy(&r, g_pw_load + offs[i], sizeof r);
         const uint8_t *kb = g_pw_load + offs[i] + sizeof r;
@@ -984,22 +1007,27 @@ static void *pw_main(void *a) {
         }
         if (made) atomic_fetch_add(&g_pw_made, 1); else if (!bad) atomic_fetch_add(&g_pw_had, 1);
         vka_pipeline_notify(1);
+        atomic_fetch_add(&g_pw_done, 1);
         setpriority(PRIO_PROCESS, 0, 10);   // back under the game's threads if a waiting frame path raised it (busy_wait)
     }
     free(offs);
-    if (atomic_fetch_add(&g_pw_done, 1) + 1 == (uint32_t)g_pw_threads)
-        VLOG("prewarm: %u of %u pipeline keys in %.1f s on %d threads: %u made, %u already there, %u dropped (shaders no longer in the library, another device's keys); the frame path waited %.0f ms for them",
+    if (atomic_fetch_add(&g_pw_workers_done, 1) + 1 == g_pw_threads)
+        VLOG("prewarm: %u of %u pipeline keys in %.1f s on %u threads: %u made, %u already there, %u dropped (shaders no longer in the library, another device's keys); the frame path waited %.0f ms for them",
              (unsigned)(atomic_load(&g_pw_made) + atomic_load(&g_pw_had) + atomic_load(&g_pw_bad)), n, (now_ns() - g_pw_t0) / 1e9, g_pw_threads, (unsigned)atomic_load(&g_pw_made),
              (unsigned)atomic_load(&g_pw_had), (unsigned)atomic_load(&g_pw_bad), atomic_load(&g_pw_wait_ns) / 1e6);
     return NULL;
 }
 static void pw_start(void) {
     int nt = VKA_ENV("DM_VK_PREWARM", 2);
-    if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (DM_VK_PREWARM=0): %u keys not made ahead", g_pw_load_n); return; }
+    const uint32_t max = (uint32_t)VKA_ENV("DM_VK_PREWARM_MAX", vka_prewarm_all_pipelines() ? INT_MAX : 8192);
+    if (nt <= 0 || !g_pw_load_n || !max) { if (g_pw_load_n) VLOG("prewarm: off: %u keys not made ahead", g_pw_load_n); return; }
     if (nt > 4) nt = 4;
-    g_pw_t0 = now_ns(); g_pw_threads = 0;
+    g_pw_t0 = now_ns();
+    pthread_mutex_lock(&g_pw_mu);
     for (int i = 0; i < nt; i++) if (!vka_thread(pw_main, NULL, NULL)) g_pw_threads++;
-    VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %d background threads (DM_VK_PREWARM=0 off)", g_pw_load_n, g_pw_threads);
+    g_pw_total = g_pw_threads ? (g_pw_load_n < max ? g_pw_load_n : max) : 0;
+    pthread_mutex_unlock(&g_pw_mu);
+    VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %u background threads (DM_VK_PREWARM=0 off)", g_pw_total, g_pw_threads);
 }
 
 // ---------- Graphics pipelines: the lookup ----------
@@ -1251,18 +1279,21 @@ static void lib_ahead_one(const ahead_item *it) {
 }
 // Lichii: a speculative translation's compute pipeline, for the caches only (nvn_recompile.c spec_one): made and destroyed, so the first dispatch of the program makes
 // its own from the pipeline and driver caches instead of compiling on the frame path when the two translations are the same. s is a vka_shader_scratch one
-void vka_cs_ahead_shader(vka_shader *s) {
-    if (!s) return;
+int vka_cs_ahead_shader(vka_shader *s) {
+    if (!s) return 0;
     const uint32_t smax = V.props.limits.maxComputeSharedMemorySize;
-    if (smax && s->e->shared > smax) return;   // (not made at its dispatch either: cs_obtain)
+    if (smax && s->e->shared > smax) return 0;   // (not made at its dispatch either: cs_obtain)
     vka_shader *sh[VKA_NSTAGE] = {0}; sh[5] = s;
     vka_layout lay; memset(&lay, 0, sizeof lay);
-    if (!layout_slow(sh, 1, &lay) || !lay.layout) return;
+    if (!layout_slow(sh, 1, &lay) || !lay.layout) return 0;
     vka_pipeline_notify(0);
     pc_open();
     VkPipeline p = VK_NULL_HANDLE;
-    if (cs_create(s, &lay, "compute pipeline (speculative)", &p) == VK_SUCCESS) vk.vkDestroyPipeline(V.dev, p, NULL);
+    const VkResult r = cs_create(s, &lay, "compute pipeline (speculative)", &p);
+    const int warmed = r == VK_SUCCESS && p && g_pc;
+    if (p) vk.vkDestroyPipeline(V.dev, p, NULL);
     vka_pipeline_notify(1);
+    return warmed;
 }
 // A speculative translation's stage library in the most common state, for the caches only (nvn_recompile.c spec_main): part 1 a vertex shader, 2 a pixel shader;
 // s is a vka_shader_scratch one

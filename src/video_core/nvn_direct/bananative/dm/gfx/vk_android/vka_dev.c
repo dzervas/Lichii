@@ -22,6 +22,7 @@ static uint64_t g_uwait_ns;   // waits for upload batches; cumulative
 void vka_qlock(void) { if (g_adopt.queue_lock) g_adopt.queue_lock(g_adopt.queue_context); else pthread_mutex_lock(&V.qmu); }
 void vka_qunlock(void) { if (g_adopt.queue_unlock) g_adopt.queue_unlock(g_adopt.queue_context); else pthread_mutex_unlock(&V.qmu); }
 int vka_async_pipelines(void) { return g_adopt.async_pipelines; }
+int vka_prewarm_all_pipelines(void) { return g_adopt.prewarm_all_pipelines; }
 int vka_host_tick_done(uint64_t tick) { return !g_adopt.tick_done || g_adopt.tick_done(g_adopt.tick_context, tick); }
 uint32_t vka_scale_up = 1, vka_scale_shift;
 int nvn_direct_adopt_device(const nvn_direct_device *d) {

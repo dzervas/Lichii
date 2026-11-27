@@ -43,6 +43,9 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#ifdef LICHII_NVN_DIRECT
+#include "video_core/shader_warm/shader_warm_builder.h"
+#endif
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_address_map.h"
@@ -353,6 +356,10 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         },
         .pipeline_context = &shader_notify,
         .async_pipelines = Settings::values.use_asynchronous_shaders.GetValue(),
+        .prewarm_all_pipelines = Settings::values.use_disk_shader_cache.GetValue() &&
+                                 VideoCommon::ShaderWarm::WarmRequested(
+                                     VideoCommon::ShaderWarm::ComputeWarmPath(
+                                         Core::NvnHook::DirectProgramId())),
         .pipeline_creation_cache_control = device.IsPipelineCreationCacheControlSupported(),
         .shader_translate = &NvnDirectShaders::Translate,
         .shader_free = &NvnDirectShaders::Free,
@@ -572,6 +579,7 @@ try
                             *nvn_direct_memory, gpu_.ShaderNotify())) {
             throw std::runtime_error{"NVN direct replay rejected the Vulkan device"};
         }
+        NvnDirectShaders::InvalidatePrecacheIfCacheLost(Core::NvnHook::DirectProgramId());
         Core::NvnHook::DirectStarted();
     }
 #endif

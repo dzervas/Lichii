@@ -66,6 +66,7 @@
 #include "video_core/nx2_profile.h"
 #ifdef LICHII_NVN_DIRECT
 #include "video_core/nvn_direct/nvn_direct.h"
+#include "video_core/renderer_vulkan/vk_nvn_direct_shaders.h"
 #endif
 #include "video_core/nx2_render_view.h"
 #include "video_core/renderer_vulkan/submission_policy.h"
@@ -6055,6 +6056,12 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
 
 void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                          const VideoCore::DiskResourceLoadCallback& callback) {
+#ifdef LICHII_NVN_DIRECT
+    if (device.IsNvnDirect()) {
+        NvnDirectShaders::LoadDiskResources(device, title_id, stop_loading, callback);
+        return;
+    }
+#endif
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 

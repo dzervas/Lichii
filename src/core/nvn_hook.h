@@ -86,6 +86,9 @@ void Uninstall();
 /// The renderer Install chose for the current (or last) boot.
 [[nodiscard]] RendererChoice Choice();
 
+/// Whether the settings request NVN Direct for the next boot, before eligibility is known.
+[[nodiscard]] bool DirectRequested();
+
 /// This process was started by MainWindow::RelaunchForGame (LICHII_RELAUNCH_WAIT_PID): it does not
 /// relaunch again (NeedsFreshProcess).
 void MarkRelaunched();

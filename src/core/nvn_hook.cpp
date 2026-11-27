@@ -852,6 +852,15 @@ RendererChoice Choice() {
     return g_choice;
 }
 
+bool DirectRequested() {
+#ifdef LICHII_NVN_DIRECT
+    return DirectAsked() &&
+           Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
+#else
+    return false;
+#endif
+}
+
 void MarkRelaunched() {
     g_relaunched = true;
 }

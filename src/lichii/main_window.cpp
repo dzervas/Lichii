@@ -2733,8 +2733,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     });
 
     QtCommon::system->RegisterApplicationChangedCallback([this](u64 changed_program_id) {
-        if (QtCommon::emu_thread)
+        // NVN Direct keeps the replay cache adopted at boot, not a per-subprogram Maxwell cache.
+        if (QtCommon::emu_thread && !Core::NvnHook::IsDirect(Core::NvnHook::Choice())) {
             QtCommon::emu_thread->RequestDiskShaderCacheReload(changed_program_id);
+        }
 
         QMetaObject::invokeMethod(
             this, [this, changed_program_id] { this->OnApplicationChanged(changed_program_id); },
@@ -5572,8 +5574,14 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         !Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
-    const auto stale = ShaderWarm::WarmFilesStale(warm_file);
-    const bool pending = ShaderWarm::WarmPending(title_id);
+    const bool native = Core::NvnHook::DirectRequested();
+    auto stale = ShaderWarm::WarmFilesStale(warm_file);
+    if (!stale && native && ShaderWarm::NativeWarmFilesStale(title_id)) {
+        stale = "NVN Direct precache is missing or outdated";
+    }
+    // Ask is a per-game choice. Either renderer's completed precache means the game was
+    // precached before; the renderer that actually boots still checks its own files and stamp.
+    const bool pending = ShaderWarm::WarmPending(title_id) && ShaderWarm::WarmPending(title_id, true);
     if (!pending && !stale) {
         // Precached before: the renderer runs it again only when the driver or the file changed.
         ShaderWarm::RequestWarmBeforeStart(true);
@@ -5611,7 +5619,8 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         });
         dialog.Start();
         dialog.exec();
-        if (!std::filesystem::exists(warm_file, ec)) {
+        if (!std::filesystem::exists(warm_file, ec) &&
+            (!native || ShaderWarm::NativeWarmFilesStale(title_id))) {
             return;
         }
     }

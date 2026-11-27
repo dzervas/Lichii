@@ -180,6 +180,8 @@ typedef struct nvn_direct_device {
     /// until asynchronous threads have made it, instead of the frame waiting for its compile
     /// (vka_pso.c async_threads).
     int async_pipelines;
+    /// Precompile All Shaders: consider the full saved key list instead of the background cap.
+    int prewarm_all_pipelines;
     /// Whether Lichii's device enabled pipelineCreationCacheControl (Vulkan 1.3 or
     /// VK_EXT_pipeline_creation_cache_control): only then does the replay ask the pipeline cache
     /// alone with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (vka_pso.c cache_probe).
@@ -229,6 +231,25 @@ static inline uint32_t nvn_direct_scale_image_bits(uint32_t nvn_stage) { return 
 /// Called once a boot, after the device exists. When it fails the boot falls back to GPU emulation
 /// (Core::NvnHook::DirectFailed).
 int nvn_direct_adopt_device(const nvn_direct_device* device);
+
+/// After successful device adoption and before guest execution, try warming the driver cache
+/// from an NVN2 compute archive entry (the complete code allocation and its control section).
+/// Calls may run concurrently; the spans need only remain valid for the call. Join the workers
+/// before stopping the replay. A successful scratch build does not install a live shader or
+/// guarantee a cache hit with the game's dispatch state.
+int nvn_direct_precache_compute(const uint8_t* code, size_t code_size, const uint8_t* control,
+                                size_t control_size);
+
+/// Historical pipeline keys processed / scheduled, or 0 / 0 if none were scheduled.
+/// If all workers leave early, done equals total so callers don't wait for abandoned work.
+void nvn_direct_prewarm_progress(uint32_t* done, uint32_t* total);
+
+/// After joining the precache workers and before stopping the replay, synchronously write the
+/// driver cache. Returns 1 only if the cache file was successfully replaced.
+int nvn_direct_save_precache(void);
+
+/// Returns 1 if the driver cache was created with compatible cache data read from disk this boot.
+int nvn_direct_precache_cache_restored(void);
 
 /// Lichii's guest memory as the replay's memory pools need it.
 typedef struct nvn_direct_memory {

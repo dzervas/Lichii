@@ -11,6 +11,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/nvn_direct/nvn_direct.h"
+#include "video_core/rasterizer_interface.h"
 
 namespace Vulkan {
 
@@ -25,6 +26,10 @@ class NvnDirectShaders {
 public:
     explicit NvnDirectShaders(const Device& device, const Shader::Profile& profile,
                               const Shader::HostTranslateInfo& host_info);
+
+    static void InvalidatePrecacheIfCacheLost(u64 title_id);
+    static void LoadDiskResources(const Device& device, u64 title_id, std::stop_token stop,
+                                  const VideoCore::DiskResourceLoadCallback& callback);
 
     /// nvn_direct_device::shader_translate and shader_free.
     static int Translate(void* context, const nvn_direct_shader_source* source,

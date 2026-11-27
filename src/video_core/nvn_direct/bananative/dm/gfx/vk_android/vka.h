@@ -169,6 +169,7 @@ void vka_up_decoded(void);                          // vka_dev.c (Lichii): an AS
 void vka_heap_line(char *o, size_t n);               // vka_dev.c (Lichii): the driver's use and budget per heap, MiB
 int vka_dev_ext(const char *name);                  // vka_dev.c (Lichii): the host's device has the extension enabled
 int vka_async_pipelines(void);                     // vka_dev.c: Lichii's asynchronous shader building setting (nvn_direct_device.async_pipelines)
+int vka_prewarm_all_pipelines(void);               // vka_dev.c: Lichii's per-game Precompile All Shaders request
 int vka_host_tick_done(uint64_t tick);             // vka_dev.c: Lichii's GPU work up to its scheduler's tick is done: 1, not yet 0, not known -1 (nvn_direct_device.tick_done)
 void vka_pipeline_notify(int built);                // vka_dev.c: a pipeline made off the frame path starts (0) or is done (1): the host's "building shaders"
 void vka_stop(void);                                // vka_dev.c: as after a hang nothing more is submitted and every fence reads as done, silently; waits return at once
@@ -448,7 +449,8 @@ size_t vka_rc_spec_pending(void);       // speculative translations whose librar
 void vka_rc_spec_commit(size_t n);      // the first n of them are: marked done in vk_recompiled.bin
 vka_shader *vka_shader_scratch(const vka_shlib *L, uint64_t key);   // a shader for a cache-only stage library: not in the shader table, given back with vka_shader_scratch_free
 void vka_shader_scratch_free(vka_shader *s);
-void vka_cs_ahead_shader(vka_shader *s);   // Lichii: a compute program's pipeline, for the caches only
+int vka_pso_cache_ready(void);            // Lichii: the adopted device's pipeline cache is available
+int vka_cs_ahead_shader(vka_shader *s);   // Lichii: a compute program's pipeline, returns whether built with the cache
 void vka_lib_ahead_shader(vka_shader *s, int part);   // a stage library (1 pre-rasterization, 2 fragment shader) in the most common state, for the caches only
 void vka_lib_counts(uint64_t *compiled, uint64_t *ahead);   // graphics pipeline libraries compiled outside the ahead threads (over 20 ms), made ahead
 void vka_rc_cs_c0(const vka_shader *sh, const vka_bstate *s, uint8_t *d);

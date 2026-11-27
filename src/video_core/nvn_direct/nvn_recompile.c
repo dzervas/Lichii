@@ -264,6 +264,10 @@ static int rc_texture(void* ctx, uint32_t handle, uint32_t* target, int32_t* vk_
     return 1;
 }
 
+// Archive translation has no guest address space or texture registry to query.
+static int rc_archive_read(void* ctx, uint64_t addr, void* out, size_t n) { return 0; }
+static int rc_archive_texture(void* ctx, uint32_t handle, uint32_t* target, int32_t* format) { return 0; }
+
 // ---------- Descriptors as binding records ----------
 static uint8_t dim_of(const nvn_direct_shader_desc* s) {
     static const uint8_t dim[9] = {0, 0 | DMSH_VK_DIM_ARRAY, 1, 1 | DMSH_VK_DIM_ARRAY, 2, 3, 3 | DMSH_VK_DIM_ARRAY, 5, 1};   // Shader::TextureType -> SPIR-V Dim
@@ -432,10 +436,11 @@ static int rc_translate(uint64_t data, const uint8_t* code, uint32_t ncode, cons
     if (!code) { snprintf(why, whyn, "could not snapshot its code area (%u bytes at %#llx)", ncode, (unsigned long long)data); return 0; }
     rc_ctx* x = calloc(1, sizeof *x); if (!x) { snprintf(why, whyn, "out of memory"); return 0; }
     x->d = d; x->st = st; x->control = control; x->code = code; x->ncode = ncode;
-    nvn_direct_shader_source src = {.nvn_stage = (uint32_t)st, .control = control->bytes, .code = x->code, .code_size = ncode, .code_address = nvn_direct_guest_of(data),
+    nvn_direct_shader_source src = {.nvn_stage = (uint32_t)st, .control = control->bytes, .code = x->code, .code_size = ncode, .code_address = data ? nvn_direct_guest_of(data) : 0,
                                     .first_binding = rc_first_binding(rc_vks(st)), .convert_depth = gl_depth, .per_primitive_inputs = st == 1 ? prim_inputs : 0,
                                     .input_topology = st == 2 && prim_inputs ? prim_inputs - 1 : 0, .context = x,
-                                    .read_cbuf = rc_cbuf, .read_memory = rc_read, .texture_info = rc_texture};
+                                    .read_cbuf = rc_cbuf, .read_memory = data ? rc_read : rc_archive_read,
+                                    .texture_info = data ? rc_texture : rc_archive_texture};
     if (st == 0 && d) {   // vertex inputs typed as the draw's attributes (the integer formats' classes): vka_draw.c then binds them retyping none
         *vin_types = d->vin_types;
         for (int loc = 0; loc < 32; loc++) src.vertex_input_types[loc] = (d->vin_types >> (2 * loc)) & 3;
@@ -743,6 +748,68 @@ static _Atomic unsigned g_spec_made, g_spec_skipped, g_spec_failed, g_spec_huge;
 // A draw that meets the shader still makes its own
 enum { SPEC_MAX_WORDS = 256 * 1024 };
 static _Atomic int g_spec_busy;
+
+static int rc_ahead_make(uint64_t key, const uint8_t* code, uint32_t size, const rc_control* control,
+                         const nvn_direct_shader* o, uint64_t vin_types, int require_warmed) {
+    const int st = (int)control->stage;
+    char why[300] = "", err[200];
+    dmsh_vk_bind* b = rc_binds(o, st, control, why, sizeof why);
+    uint32_t a, e;
+    rc_c1_range(control, &a, &e);
+    const uint32_t c1_len = a < e && e <= size ? e - a : 0;
+    vka_shlib* L = b && !*why ? rc_lib(key, rc_vks(st), 0, o, b, o->desc_count,
+                                       c1_len ? code + a : NULL, c1_len, vin_types, err, sizeof err) : NULL;
+    free(b);
+    vka_shader* s = L ? vka_shader_scratch(L, key) : NULL;
+    int made = s != NULL;
+    if (s && st == 5) {
+        const int warmed = vka_cs_ahead_shader(s);
+        if (require_warmed) made = warmed;
+    } else if (s) vka_lib_ahead_shader(s, st == 0 ? 1 : 2);
+    vka_shader_scratch_free(s);
+    if (L) { free((void*)L->base); free(L); }
+    return made;
+}
+
+int nvn_direct_precache_compute(const uint8_t* code, size_t code_size, const uint8_t* control,
+                                size_t control_size) {
+    // +0xba is the last two-byte field read by the compute binding layout.
+    if (!code || !control || control_size < 0xbc || !nvn2_control(control) || control[0x56] != 5)
+        return 0;
+    const uint32_t ncode = rd32(control, 0x44), instructions = rd32(control, 0x38);
+    const uint32_t c1 = rd32(control, 0x40);
+    if (code_size != ncode || ncode >= (1u << 24) || !instructions || instructions % 16 ||
+        c1 % 16 || instructions > c1 || c1 > ncode || !vka_pso_cache_ready()) return 0;
+    const VkPhysicalDeviceLimits* limits = &V.props.limits;
+    uint32_t invocations = limits->maxComputeWorkGroupInvocations;
+    for (unsigned i = 0; i < 3; i++) {
+        const uint32_t axis = rd32(control, 0x58 + i * 4);
+        if (!axis || axis > limits->maxComputeWorkGroupSize[i] || axis > invocations) return 0;
+        invocations /= axis;
+    }
+    if (rd32(control, 0x64) > limits->maxComputeSharedMemorySize) return 0;
+
+    rc_control* copy = calloc(1, sizeof *copy + NVN_DIRECT_NVN2_CONTROL_SIZE);
+    if (!copy) return 0;
+    copy->stage = 5;
+    copy->size = NVN_DIRECT_NVN2_CONTROL_SIZE;
+    memcpy(copy->bytes, control, control_size < copy->size ? control_size : copy->size);
+    uint8_t digest[8];
+    nvn_shader_hash(copy->bytes, code, ncode, digest);
+    const uint64_t key = rc_key(vka_shlib_key(digest));
+    nvn_direct_shader o;
+    uint64_t vin_types;
+    char why[300];
+    int warmed = 0;
+    if (rc_translate(0, code, ncode, copy, NULL, 0, 0, &o, &vin_types, why, sizeof why)) {
+        if (o.spirv_words <= SPEC_MAX_WORDS)
+            warmed = rc_ahead_make(key, code, ncode, copy, &o, vin_types, 1);
+        vka_shader_translated_free(&o);
+    }
+    free(copy);
+    return warmed;
+}
+
 // One speculative translation (g_spec_busy counts it while it runs)
 static void spec_one(spec_item it) {
     pthread_mutex_lock(&g_mu); disk_open(); int known = rc_find(&g_disk, it.key) || rc_find(&g_sh, it.key) || rc_find(&g_spec_done, it.key); pthread_mutex_unlock(&g_mu);
@@ -754,17 +821,9 @@ static void spec_one(spec_item it) {
         VLOG("recompiler: %016llx (NVN stage %d) not made ahead: %zu SPIR-V words (over %d)", (unsigned long long)it.key, st, (size_t)o.spirv_words, (int)SPEC_MAX_WORDS);
         g_spec_huge++; vka_shader_translated_free(&o); disk_spec_done(it.key); return;
     }
-    dmsh_vk_bind* b = rc_binds(&o, st, it.control, why, sizeof why);
-    uint32_t a0, c1e; rc_c1_range(it.control, &a0, &c1e); uint32_t c1_len = a0 < c1e && c1e <= it.size ? c1e - a0 : 0;
-    char err[200]; err[0] = 0;
-    vka_shlib* L = b && !*why ? rc_lib(it.key, rc_vks(st), 0, &o, b, o.desc_count, c1_len ? it.code + a0 : NULL, c1_len, vin_types, err, sizeof err) : NULL;
-    free(b); vka_shader_translated_free(&o);
-    vka_shader* s = L ? vka_shader_scratch(L, it.key) : NULL;
-    if (s && st == 5) vka_cs_ahead_shader(s);
-    else if (s) vka_lib_ahead_shader(s, st == 0 ? 1 : 2);
-    vka_shader_scratch_free(s);
-    if (L) { free((void*)L->base); free(L); }
-    if (!s) { g_spec_failed++; disk_spec_done(it.key); return; }
+    const int made = rc_ahead_make(it.key, it.code, it.size, it.control, &o, vin_types, 0);
+    vka_shader_translated_free(&o);
+    if (!made) { g_spec_failed++; disk_spec_done(it.key); return; }
     spec_made(it.key);
     unsigned n = ++g_spec_made;
     if (n == 1 || !(n & (n - 1))) VLOG("recompiler: %u shaders translated speculatively and their libraries made (%u kept or drawn already, %u not translated without a draw, %u too large)", n, (unsigned)g_spec_skipped, (unsigned)g_spec_failed, (unsigned)g_spec_huge);
